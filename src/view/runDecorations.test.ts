@@ -349,3 +349,48 @@ describeNative('resolveRunDecorations', () => {
     }
   });
 });
+
+/*
+ * Embeds and decorations: an embed is a character-level reservation, not a
+ * paragraph inset, so it must produce NO decoration of its own and must not
+ * perturb the 'indent' segmentation around it — an embed inside a list item
+ * indents with its item (see the note on `insetSegments`).
+ */
+describeNative('embeds', () => {
+  const claim = (node: { kind: string }) =>
+    node.kind === 'link' ? { width: 120, height: 40 } : undefined;
+
+  function projectWithEmbed(source: string): ProjectedRun {
+    const doc = parseDocument(source, EVERYTHING);
+    const run = segmentRuns(doc, { embed: claim }).find((r) => !r.standalone);
+    if (!run) throw new Error(`no prose run in ${JSON.stringify(source)}`);
+    return projectRun(run, doc, { embed: claim });
+  }
+
+  test('an embed emits no decoration and leaves list indents intact', () => {
+    const source = '- first [x](https://example.com/a) rest\n- second item\n';
+    const projected = projectWithEmbed(source);
+    const placeholderAt = projected.text.indexOf('\uFFFC');
+    expect(placeholderAt).toBeGreaterThan(-1);
+
+    const decorations = resolveRunDecorations(projected, defaultTheme);
+
+    // Nothing new: only the two items' indent entries.
+    expect(decorations.every((d) => d.kind === 'indent')).toBe(true);
+    // The placeholder is covered by its item's indent — it moves WITH the
+    // item rather than opting out of it the way a code-block island does.
+    expect(
+      decorations.some((d) => d.start <= placeholderAt && d.end > placeholderAt),
+    ).toBe(true);
+    // Disjointness holds with the embed in place (the Android sum guard).
+    const sorted = [...decorations].sort((a, b) => a.start - b.start);
+    for (let i = 1; i < sorted.length; i += 1) {
+      expect(sorted[i].start).toBeGreaterThanOrEqual(sorted[i - 1].end);
+    }
+    // And decorating never moves the text.
+    for (const decoration of decorations) {
+      expect(decoration.start).toBeGreaterThanOrEqual(0);
+      expect(decoration.end).toBeLessThanOrEqual(projected.text.length);
+    }
+  });
+});

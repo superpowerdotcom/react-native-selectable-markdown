@@ -94,11 +94,18 @@ Size RNSMRunTextMeasurer::measure(
    * The nine-argument overload (FabricUIManager.java:508-529), which forwards
    * to the ten-argument one with a null `attachmentsPositions`. That array is
    * RN's protocol for its OWN AttributedString attachments, positioned by the
-   * measurer so the shadow tree can lay child views into text. A run carries
-   * no view-shaped content — everything it renders is text with spans — so
-   * there is nothing to position through that channel. `measure` is private
-   * on the Java side — JNI does not care, and every in-tree measurements
-   * manager binds it the same way.
+   * measurer so the shadow tree can lay child views into text. Runs DO carry
+   * view-shaped content now — the `embeds` prop reserves space for overlaid
+   * consumer views — but their rects deliberately do not travel this channel:
+   * embed geometry is reported by the mounted view after layout
+   * (`SelectableRunHostView.reportEmbedRects` -> `onEmbedLayout`), because
+   * the overlay is a JS-positioned sibling, not a shadow-tree child, so the
+   * measurer has nobody to hand positions to. The reservations themselves
+   * still measure correctly through this call: `embeds` rides the raw props
+   * forwarded below, and the Kotlin side folds it into the measured
+   * spannable as ReplacementSpans. `measure` is private on the Java side —
+   * JNI does not care, and every in-tree measurements manager binds it the
+   * same way.
    *
    * `static` so the method id is resolved once per process rather than once
    * per measure. Yoga calls this several times per layout pass.

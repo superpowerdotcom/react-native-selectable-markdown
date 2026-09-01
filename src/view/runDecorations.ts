@@ -400,6 +400,14 @@ interface InsetSegment {
  *   paragraphs would assign-and-lose on iOS but SUM on Android. A code
  *   block or table inside a list item therefore renders flush, exactly like
  *   a top-level one — the same on both platforms.
+ *
+ * 'embed' marks are deliberately NOT islands and need no handling here at
+ * all: an embed is a character-level reservation (an attachment/replacement
+ * span on its one placeholder character), not a paragraph inset — it writes
+ * no paragraph style and no leading margin, so nothing exists for an
+ * 'indent' entry to sum with or assign over. An embed inside a list item
+ * SHOULD be indented with its item, which is exactly what leaving it inside
+ * the item's segment produces.
  */
 function insetSegments(projected: ProjectedRun): InsetSegment[] {
   const items: { start: number; end: number; level: number }[] = [];

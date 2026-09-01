@@ -11,7 +11,7 @@ import type {
 import type { ParsedDocument } from '../../document/nodes';
 import { mapSelectionToSource, projectRun } from '../mapSelection';
 import { segmentRuns } from '../runs';
-import type { RunSegment } from '../runs';
+import type { EmbedLookup, RunSegment } from '../runs';
 import {
   expectTiling,
   makeDoc,
@@ -574,5 +574,244 @@ describe('mapSelectionToSource', () => {
       end: 4,
     });
     expect(mapSelectionToSource(tailProjected, { start: 4, end: 5 })).toBeNull();
+  });
+});
+
+describe('embeds', () => {
+  const claimCitations: EmbedLookup = (node) =>
+    node.kind === 'link' && node.href.startsWith('cite://')
+      ? { width: 200, height: 80, text: '[1]' }
+      : undefined;
+
+  const source = 'Before card.\n\n[1](cite://a)\n\nAfter card.';
+  const before = plainParagraph(source, 'Before card.');
+  const link: LinkNode = {
+    kind: 'link',
+    href: 'cite://a',
+    blocked: true,
+    span: spanOf(source, '[1](cite://a)'),
+    children: [textNode(source, '1')],
+  };
+  const card: ParagraphNode = {
+    kind: 'paragraph',
+    span: link.span,
+    children: [link],
+  };
+  const after = plainParagraph(source, 'After card.');
+  const doc = makeDoc(source, [before, card, after]);
+
+  function projectWithEmbeds() {
+    const runs = segmentRuns(doc, { embed: claimCitations });
+    expect(runs).toHaveLength(1);
+    return projectRun(runs[0], doc, { embed: claimCitations });
+  }
+
+  it('projects an embedded node as exactly one U+FFFC placeholder', () => {
+    const projected = projectWithEmbeds();
+
+    expect(projected.text).toBe('Before card.\n\n￼\n\nAfter card.');
+    expectTiling(projected);
+  });
+
+  it('gives the embed one indivisible piece over the node’s whole span', () => {
+    const projected = projectWithEmbeds();
+    const placeholderAt = projected.text.indexOf('￼');
+    const piece = projected.pieces.find(
+      (candidate) => candidate.textStart === placeholderAt,
+    );
+
+    expect(piece).toEqual({
+      textStart: placeholderAt,
+      textEnd: placeholderAt + 1,
+      source: link.span,
+    });
+  });
+
+  it('marks the placeholder with kind embed and its ordinal id', () => {
+    const projected = projectWithEmbeds();
+    const placeholderAt = projected.text.indexOf('￼');
+
+    expect(
+      projected.marks.filter((mark) => mark.kind === 'embed'),
+    ).toEqual([
+      { kind: 'embed', start: placeholderAt, end: placeholderAt + 1, embedId: 0 },
+    ]);
+  });
+
+  it('records the node and content on projected.embeds', () => {
+    const projected = projectWithEmbeds();
+    const placeholderAt = projected.text.indexOf('￼');
+
+    expect(projected.embeds).toEqual([
+      {
+        embedId: 0,
+        start: placeholderAt,
+        end: placeholderAt + 1,
+        node: link,
+        content: { width: 200, height: 80, text: '[1]' },
+      },
+    ]);
+  });
+
+  it('projects with the same topLevel context segmentation saw', () => {
+    // Segmentation and projection share `embedContentFor`, and with the
+    // claim gated on `context.topLevel` the two must still agree: a claim
+    // that declines nested nodes projects the top-level block as a
+    // placeholder and leaves the nested instance as text.
+    const codeSource = '```\ntop\n```\n\n> quote\n>\n> ```\n> deep\n> ```';
+    const topCode = {
+      kind: 'codeBlock' as const,
+      literal: 'top\n',
+      fenced: true,
+      closed: true,
+      span: spanOf(codeSource, '```\ntop\n```'),
+    };
+    const deepCode = {
+      kind: 'codeBlock' as const,
+      literal: 'deep\n',
+      fenced: true,
+      closed: true,
+      span: spanOf(codeSource, '```\n> deep\n> ```'),
+    };
+    const quote = {
+      kind: 'blockquote' as const,
+      span: spanOf(codeSource, '> quote\n>\n> ```\n> deep\n> ```'),
+      children: [plainParagraph(codeSource, 'quote'), deepCode],
+    };
+    const codeDoc = makeDoc(codeSource, [topCode, quote]);
+    const claimTopLevelCode: EmbedLookup = (node, context) =>
+      node.kind === 'codeBlock' && context.topLevel
+        ? { width: 320, height: 60 }
+        : undefined;
+
+    const runs = segmentRuns(codeDoc, { embed: claimTopLevelCode });
+    expect(runs).toHaveLength(1);
+    const projected = projectRun(runs[0], codeDoc, { embed: claimTopLevelCode });
+
+    expect(projected.text).toBe('￼\n\nquote\n\ndeep\n');
+    expect(projected.embeds).toHaveLength(1);
+    expect(projected.embeds?.[0].node).toBe(topCode);
+  });
+
+  it('leaves projected.embeds absent when nothing is claimed', () => {
+    const runs = segmentRuns(doc);
+    const projected = projectRun(runs[0], doc);
+
+    expect(projected.embeds).toBeUndefined();
+    expect('embeds' in projected).toBe(false);
+  });
+
+  it('assigns ordinal embedIds across multiple embeds', () => {
+    const twoSource = '[1](cite://a) and [2](cite://b)';
+    const first: LinkNode = {
+      kind: 'link',
+      href: 'cite://a',
+      span: spanOf(twoSource, '[1](cite://a)'),
+      children: [textNode(twoSource, '1')],
+    };
+    const second: LinkNode = {
+      kind: 'link',
+      href: 'cite://b',
+      span: spanOf(twoSource, '[2](cite://b)'),
+      children: [textNode(twoSource, '2', twoSource.indexOf('[2]'))],
+    };
+    const para: ParagraphNode = {
+      kind: 'paragraph',
+      span: { start: 0, end: twoSource.length },
+      children: [first, textNode(twoSource, ' and '), second],
+    };
+    const twoDoc = makeDoc(twoSource, [para]);
+    const runs = segmentRuns(twoDoc, { embed: claimCitations });
+    const projected = projectRun(runs[0], twoDoc, { embed: claimCitations });
+
+    expect(projected.text).toBe('￼ and ￼');
+    expect(projected.embeds?.map((embed) => embed.embedId)).toEqual([0, 1]);
+    expect(projected.embeds?.[1].start).toBe(projected.text.lastIndexOf('￼'));
+    expectTiling(projected);
+  });
+
+  it('keeps a one-code-unit node’s placeholder piece unmerged', () => {
+    // The atomicity of an embed piece is contractual, not inferred from the
+    // display/source length inequality — a node whose span is exactly one
+    // code unit would otherwise read as linear and merge into its
+    // neighbours.
+    const tinySource = 'a&b';
+    const amp = textNode(tinySource, '&');
+    const para: ParagraphNode = {
+      kind: 'paragraph',
+      span: { start: 0, end: tinySource.length },
+      children: [textNode(tinySource, 'a'), amp, textNode(tinySource, 'b')],
+    };
+    const tinyDoc = makeDoc(tinySource, [para]);
+    const claim: EmbedLookup = (node) =>
+      node === amp ? { width: 10, height: 10 } : undefined;
+    const runs = segmentRuns(tinyDoc, { embed: claim });
+    const projected = projectRun(runs[0], tinyDoc, { embed: claim });
+
+    expect(projected.text).toBe('a￼b');
+    expect(projected.pieces).toEqual([
+      { textStart: 0, textEnd: 1, source: spanOf(tinySource, 'a') },
+      { textStart: 1, textEnd: 2, source: amp.span },
+      { textStart: 2, textEnd: 3, source: spanOf(tinySource, 'b') },
+    ]);
+  });
+
+  it('projects an embed-only block to a non-empty run', () => {
+    const soloSource = '[1](cite://a)';
+    const soloLink: LinkNode = {
+      kind: 'link',
+      href: 'cite://a',
+      span: spanOf(soloSource, soloSource),
+      children: [textNode(soloSource, '1')],
+    };
+    const soloPara: ParagraphNode = {
+      kind: 'paragraph',
+      span: soloLink.span,
+      children: [soloLink],
+    };
+    const soloDoc = makeDoc(soloSource, [soloPara]);
+    const runs = segmentRuns(soloDoc, { embed: claimCitations });
+    const projected = projectRun(runs[0], soloDoc, { embed: claimCitations });
+
+    expect(projected.text).toBe('￼');
+    expectTiling(projected);
+  });
+
+  it('falls through to normal projection for synthetic and incomplete nodes', () => {
+    const incomplete: LinkNode = { ...link, incomplete: true };
+    const withIncomplete: ParagraphNode = {
+      kind: 'paragraph',
+      span: incomplete.span,
+      children: [incomplete],
+    };
+    const streamDoc = makeDoc(source, [withIncomplete]);
+    const runs = segmentRuns(streamDoc, { embed: claimCitations });
+    const projected = projectRun(runs[0], streamDoc, { embed: claimCitations });
+
+    // An incomplete link projects its children bare — no placeholder.
+    expect(projected.text).toBe('1');
+    expect(projected.embeds).toBeUndefined();
+  });
+
+  it('maps a sweep across the card to a hull covering its whole source', () => {
+    const projected = projectWithEmbeds();
+    const span = mapSelectionToSource(projected, {
+      start: 0,
+      end: projected.text.length,
+    });
+
+    expect(span).toEqual({ start: 0, end: source.length });
+  });
+
+  it('maps a placeholder-only selection to the node’s whole span', () => {
+    const projected = projectWithEmbeds();
+    const placeholderAt = projected.text.indexOf('￼');
+
+    expect(
+      mapSelectionToSource(projected, {
+        start: placeholderAt,
+        end: placeholderAt + 1,
+      }),
+    ).toEqual(link.span);
   });
 });

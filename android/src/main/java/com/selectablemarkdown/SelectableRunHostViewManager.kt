@@ -142,6 +142,15 @@ class SelectableRunHostViewManager :
         view.setPressables(SelectableRunHostView.parsePressables(pressables))
     }
 
+    @ReactProp(name = "embeds")
+    override fun setEmbeds(view: SelectableRunHostView, embeds: ReadableArray?) {
+        // Same on-arrival discipline as `decorations`, and folded into the
+        // same one styled string in onAfterUpdateTransaction — a reservation
+        // is a ReplacementSpan in the spannable. A null prop (reset) parses
+        // to the empty spec: reserve nothing, report nothing.
+        view.setEmbeds(RunEmbeds.parse(embeds))
+    }
+
     @ReactProp(name = "selectionActions")
     override fun setSelectionActions(view: SelectableRunHostView, actions: ReadableArray?) {
         if (actions == null) {
@@ -221,8 +230,13 @@ class SelectableRunHostViewManager :
         } else {
             RunDecorations.Spec.EMPTY
         }
+        val embeds = if (props != null && props.hasKey("embeds")) {
+            RunEmbeds.parse(props.getArray("embeds"))
+        } else {
+            RunEmbeds.Spec.EMPTY
+        }
         val measured =
-            RunTextMeasure.measure(text, attributes, decorations, width, widthMode, height, heightMode)
+            RunTextMeasure.measure(text, attributes, decorations, embeds, width, widthMode, height, heightMode)
         return YogaMeasureOutput.make(
             PixelUtil.toDIPFromPixel(YogaMeasureOutput.getWidth(measured)),
             PixelUtil.toDIPFromPixel(YogaMeasureOutput.getHeight(measured)),
@@ -278,6 +292,8 @@ class SelectableRunHostViewManager :
             mapOf("registrationName" to "onSelectionAction")
         constants[InlinePressEvent.EVENT_NAME] =
             mapOf("registrationName" to "onInlinePress")
+        constants[EmbedLayoutEvent.EVENT_NAME] =
+            mapOf("registrationName" to "onEmbedLayout")
         return constants
     }
 

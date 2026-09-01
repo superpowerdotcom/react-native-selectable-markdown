@@ -6,7 +6,7 @@ import {
 } from '../engine/native/__tests__/support';
 import { projectRun } from '../selection/mapSelection';
 import { segmentRuns } from '../selection/runs';
-import type { RunSegment } from '../selection/runs';
+import type { EmbedLookup, RunSegment } from '../selection/runs';
 import {
   DEFAULT_SELECTION_ACTIONS,
   handleSelectionAction,
@@ -296,5 +296,148 @@ describeNative('DEFAULT_SELECTION_ACTIONS', () => {
 
   test('is frozen — shared across renders as an immutable default', () => {
     expect(Object.isFrozen(DEFAULT_SELECTION_ACTIONS)).toBe(true);
+  });
+});
+
+/*
+ * Embeds in the copy path. The claimed link projects as one U+FFFC
+ * placeholder; `markdown` maps through its indivisible piece to the node's
+ * whole source, and `plain` substitutes the declared text (or removes the
+ * placeholder when none was declared).
+ */
+describeNative('handleSelectionAction with embeds', () => {
+  const claim: EmbedLookup = (node) =>
+    node.kind === 'link' && node.href.startsWith('https://cite.example/')
+      ? { width: 200, height: 80, text: '[1]' }
+      : undefined;
+
+  function docWithEmbedRun(source: string, embed: EmbedLookup = claim) {
+    const doc = parseDocument(source);
+    const runs = segmentRuns(doc, { embed });
+    expect(runs).toHaveLength(1);
+    const run = runs[0];
+    const projected = projectRun(run, doc, { embed });
+    return { doc, run, projected };
+  }
+
+  test('copy-text substitutes the declared text for the placeholder', () => {
+    const source = 'See [one](https://cite.example/a) here.';
+    const { doc, run, projected } = docWithEmbedRun(source);
+    expect(projected.text).toBe('See ￼ here.');
+
+    const payload = handleSelectionAction(
+      doc,
+      run,
+      { start: 0, end: projected.text.length, action: 'copy-text' },
+      { projected, embed: claim },
+    );
+
+    expect(payload?.plain).toBe('See [1] here.');
+    expect(payload?.markdown).toBe(source);
+    expect(payload?.span).toEqual({ start: 0, end: source.length });
+  });
+
+  test('an embed without declared text is removed from plain', () => {
+    const source = 'See [one](https://cite.example/a) here.';
+    const noText: EmbedLookup = (node) =>
+      node.kind === 'link' && node.href.startsWith('https://cite.example/')
+        ? { width: 200, height: 80 }
+        : undefined;
+    const { doc, run, projected } = docWithEmbedRun(source, noText);
+
+    const payload = handleSelectionAction(
+      doc,
+      run,
+      { start: 0, end: projected.text.length, action: 'copy-text' },
+      { projected, embed: noText },
+    );
+
+    expect(payload?.plain).toBe('See  here.');
+    expect(payload?.markdown).toBe(source);
+  });
+
+  test('substitutes multiple embeds right-to-left, edges included', () => {
+    const source =
+      '[a](https://cite.example/a) mid [b](https://cite.example/b)';
+    const numbered: EmbedLookup = (() => {
+      let next = 0;
+      const byHref = new Map<string, string>();
+      return ((node) => {
+        if (
+          node.kind !== 'link' ||
+          !node.href.startsWith('https://cite.example/')
+        ) {
+          return undefined;
+        }
+        if (!byHref.has(node.href)) {
+          next += 1;
+          byHref.set(node.href, `[${next}]`);
+        }
+        return { width: 100, height: 40, text: byHref.get(node.href) };
+      }) as EmbedLookup;
+    })();
+    const { doc, run, projected } = docWithEmbedRun(source, numbered);
+    expect(projected.text).toBe('￼ mid ￼');
+
+    const payload = handleSelectionAction(
+      doc,
+      run,
+      { start: 0, end: projected.text.length, action: 'copy-text' },
+      { projected, embed: numbered },
+    );
+
+    expect(payload?.plain).toBe('[1] mid [2]');
+    expect(payload?.markdown).toBe(source);
+  });
+
+  test('a selection excluding the placeholder substitutes nothing', () => {
+    const source = 'See [one](https://cite.example/a) here.';
+    const { doc, run, projected } = docWithEmbedRun(source);
+
+    const payload = handleSelectionAction(
+      doc,
+      run,
+      { start: 0, end: 4, action: 'copy-text' },
+      { projected, embed: claim },
+    );
+
+    expect(payload?.plain).toBe('See ');
+    expect(payload?.markdown).toBe('See ');
+  });
+
+  test('a placeholder-only selection copies the node’s whole markdown', () => {
+    const source = 'See [one](https://cite.example/a) here.';
+    const { doc, run, projected } = docWithEmbedRun(source);
+    const placeholderAt = projected.text.indexOf('￼');
+
+    const payload = handleSelectionAction(
+      doc,
+      run,
+      { start: placeholderAt, end: placeholderAt + 1, action: 'copy-markdown' },
+      { projected, embed: claim },
+    );
+
+    expect(payload?.plain).toBe('[1]');
+    expect(payload?.markdown).toBe('[one](https://cite.example/a)');
+  });
+
+  test('the fallback projection with ctx.embed matches the precomputed one', () => {
+    const source = 'See [one](https://cite.example/a) here.';
+    const { doc, run, projected } = docWithEmbedRun(source);
+
+    const withProjected = handleSelectionAction(
+      doc,
+      run,
+      { start: 2, end: projected.text.length - 2, action: 'copy-markdown' },
+      { projected, embed: claim },
+    );
+    const withFallback = handleSelectionAction(
+      doc,
+      run,
+      { start: 2, end: projected.text.length - 2, action: 'copy-markdown' },
+      { embed: claim },
+    );
+
+    expect(withFallback).toEqual(withProjected);
   });
 });

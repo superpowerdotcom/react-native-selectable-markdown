@@ -389,6 +389,18 @@ const EXPECTED_DECORATION_MEMBERS = {
   rowPaddingV: 'Float',
 };
 
+// The embeds struct: all five members are required from JS, but codegen
+// guards every assignment the same way, so the sparse machinery applies
+// verbatim. The 0.0 float sentinel cannot collide — a 0pt embed reserves
+// nothing, and both hosts skip entries without a positive size.
+const EXPECTED_EMBED_MEMBERS = {
+  start: 'int',
+  end: 'int',
+  embedId: 'int',
+  width: 'Float',
+  height: 'Float',
+};
+
 /**
  * Asserts one generated array-element struct keeps the sparse sentinel
  * contract: expected members with expected sentinel types, no strays, no
@@ -544,6 +556,11 @@ if (propsH) {
     EXPECTED_DECORATION_MEMBERS,
     'both decoration decoders (RNSMAttributedText decorationsWithProps, RunDecorations.parse)',
   );
+  checkSparseStruct(
+    'SelectableRunHostEmbedsStruct',
+    EXPECTED_EMBED_MEMBERS,
+    'both embed decoders (RNSMAttributedText embedsWithProps, RunEmbeds.parse)',
+  );
 
   // The pressables struct. Deliberately boring — three required Int32s — so
   // none of the sentinel machinery above applies; what is asserted is that it
@@ -636,6 +653,15 @@ if (propsH) {
   );
   expectText(
     propsH,
+    'std::vector<SelectableRunHostEmbedsStruct> embeds{};',
+    'Props.h',
+    'The embedded ranges arrive as a vector whose default is empty — empty is\n' +
+      '    "reserve nothing", which is what a host mounted without the prop (or by\n' +
+      '    an older JS bundle) must render: the flat text it rendered before the\n' +
+      '    prop existed.',
+  );
+  expectText(
+    propsH,
     'bool selectable{true};',
     'Props.h',
     'WithDefault<boolean, true> must keep defaulting to true. A default of false\n' +
@@ -704,6 +730,24 @@ if (eventEmittersH) {
     'This is the exact signature the iOS Fabric component view calls for a\n' +
       '    press on a link range.',
   );
+  for (const member of ['int embedId;', 'Float x;', 'Float y;', 'Float width;', 'Float height;']) {
+    expectText(
+      eventEmittersH,
+      member,
+      'EventEmitters.h',
+      'The OnEmbedLayout payload is the rect-report contract (docs/SELECTION.md,\n' +
+        '    "Event: onEmbedLayout"): one embed per event, scalar members only —\n' +
+        '    an array payload is not verifiably supported by codegen across the\n' +
+        '    whole peer range.',
+    );
+  }
+  expectText(
+    eventEmittersH,
+    'void onEmbedLayout(OnEmbedLayout value) const;',
+    'EventEmitters.h',
+    'This is the exact signature the iOS Fabric component view calls after\n' +
+      '    layout for each embed whose rect moved.',
+  );
 }
 
 const eventEmittersCpp = read(iosSpec('EventEmitters.cpp'), 'EventEmitters.cpp');
@@ -721,6 +765,13 @@ if (eventEmittersCpp) {
     'dispatchEvent("inlinePress"',
     'EventEmitters.cpp',
     'Same three-way agreement as selectionAction, for the `topInlinePress`\n' +
+      '    registration: view config, Android event constants, and this dispatch.',
+  );
+  expectText(
+    eventEmittersCpp,
+    'dispatchEvent("embedLayout"',
+    'EventEmitters.cpp',
+    'Same three-way agreement as selectionAction, for the `topEmbedLayout`\n' +
       '    registration: view config, Android event constants, and this dispatch.',
   );
 }
@@ -833,6 +884,7 @@ if (managerInterface) {
     'void setAttributes(T view, @Nullable ReadableArray value);',
     'void setDecorations(T view, @Nullable ReadableArray value);',
     'void setPressables(T view, @Nullable ReadableArray value);',
+    'void setEmbeds(T view, @Nullable ReadableArray value);',
     'void setSelectable(T view, boolean value);',
     'void setSelectionActions(T view, @Nullable ReadableArray value);',
   ]) {
@@ -939,6 +991,13 @@ expectText(
   'This is the mapping that turns the native "inlinePress" event into the\n' +
     '    onInlinePress prop. Both native hosts dispatch topInlinePress.',
 );
+expectText(
+  viewConfig,
+  "topEmbedLayout:{registrationName:'onEmbedLayout'}",
+  'view config',
+  'This is the mapping that turns the native "embedLayout" event into the\n' +
+    '    onEmbedLayout prop. Both native hosts dispatch topEmbedLayout.',
+);
 // §3.2: nested colours are NOT processed by the generated view config, which is
 // why RunHost.toNativeAttribute calls processColor itself. `attributes: true`
 // is codegen saying "pass this through untouched".
@@ -953,6 +1012,7 @@ expectText(
 );
 expectText(viewConfig, 'selectionActions:true', 'view config', 'The ordered action list is passed through as-is.');
 expectText(viewConfig, 'pressables:true', 'view config', 'The tappable ranges are passed through as-is.');
+expectText(viewConfig, 'embeds:true', 'view config', 'The embedded ranges are passed through as-is.');
 expectText(
   viewConfig,
   'decorations:true',

@@ -178,6 +178,14 @@ function styleForMark(mark: RunMark, theme: MarkdownTheme): Omit<RunTextAttribut
     case 'thematicBreak':
     case 'listItem':
       return {};
+    // The embed range's ONLY styling is the geometry attribute
+    // `resolveRunAttributes` appends itself (transparent colour + the
+    // reserved line height) — appended outside the mark→style path on
+    // purpose, so neither this function nor an `attributeForMark` override
+    // can drop it: it is a measurement input, not a look. Contributing
+    // nothing here keeps the mark out of the overridable channel entirely.
+    case 'embed':
+      return {};
   }
 }
 
@@ -255,11 +263,62 @@ export function resolveRunAttributes(
   if (projected.text.length === 0) return [];
   const out: RunTextAttribute[] = [baseAttribute(projected.text.length, theme)];
   for (const mark of projected.marks) {
+    // Embed marks bypass the overridable mark→style path entirely — their
+    // one attribute is the geometry entry appended below, which neither the
+    // theme nor `attributeForMark` may drop or restyle.
+    if (mark.kind === 'embed') continue;
     const style = attributeForMark?.(mark) ?? styleForMark(mark, theme);
     // A mark whose kind contributes nothing is dropped rather than sent as
     // an empty attribute: the array crosses the bridge on every snapshot.
     if (Object.keys(style).length === 0) continue;
     out.push({ start: mark.start, end: mark.end, ...style });
+  }
+  // The embed geometry attributes, appended LAST so they sit innermost and
+  // win over any covering construct's styling. Two fields, both load-bearing:
+  //
+  // - `lineHeight: content.height` is how the reservation's HEIGHT reaches
+  //   both platforms: their line-height machinery CLAMPS lines (min AND max —
+  //   RNSMAttributedText's paragraph styles, Android's RunLineHeightSpan), so
+  //   without this entry a tall embed's attachment would be squashed into the
+  //   body leading — measured *and* drawn wrong, consistently. A block embed
+  //   is its own paragraph (block separators are '\n\n'), so the height lands
+  //   exactly on the embed's line; an inline embed grows only its own line on
+  //   Android and must fit the paragraph's leading on iOS (paragraph style
+  //   resolves from the paragraph's first character) — the documented
+  //   inline-chip constraint.
+  //
+  // - `color: 'transparent'` is version skew: a binary that predates the
+  //   `embeds` prop renders the U+FFFC placeholder as an actual glyph (tofu
+  //   on most fonts). Attributes predate embeds, so the transparent colour
+  //   DOES reach such a binary and the degradation is an invisible
+  //   one-character gap instead. On a current binary the attachment replaces
+  //   the glyph and foreground colour is inert.
+  if (projected.embeds !== undefined) {
+    for (const embed of projected.embeds) {
+      // Never SHRINK the line: both platforms' line-height machinery clamps
+      // in both directions (min AND max), so an inline chip declared shorter
+      // than its line would squash the prose around it — the reservation may
+      // only ever raise the line to fit. The floor is the tallest line
+      // height any earlier attribute puts on the placeholder, which is
+      // exactly what the native side would apply without this entry.
+      let floor = 0;
+      for (const attribute of out) {
+        if (
+          attribute.lineHeight !== undefined &&
+          attribute.start <= embed.start &&
+          attribute.end >= embed.end &&
+          attribute.lineHeight > floor
+        ) {
+          floor = attribute.lineHeight;
+        }
+      }
+      out.push({
+        start: embed.start,
+        end: embed.end,
+        color: 'transparent',
+        lineHeight: Math.max(embed.content.height, floor),
+      });
+    }
   }
   return out;
 }

@@ -2,7 +2,7 @@ import type { ParsedDocument } from '../document/nodes';
 import type { SourceSpan } from '../document/span';
 import { mapSelectionToSource, projectRun } from '../selection/mapSelection';
 import type { ProjectedRun, ProjectionGlyphs } from '../selection/mapSelection';
-import type { RunSegment } from '../selection/runs';
+import type { EmbedLookup, RunSegment } from '../selection/runs';
 
 /**
  * The copy actions the selection menu can offer. Identifiers cross the JS ↔
@@ -22,8 +22,13 @@ export interface SelectionCopyEvent {
   /**
    * The projected display text the user visually selected — exactly
    * `ProjectedRun.text.slice(start, end)`, synthetic glyphs (bullets,
-   * separators) included. Byte-for-byte what the platform's own Copy would
-   * yield.
+   * separators) included — with ONE amendment: each embed placeholder
+   * (U+FFFC) inside the slice is replaced by that embed's declared
+   * `EmbedContent.text`, or removed when none was declared. Without embeds
+   * this is byte-for-byte what the platform's own Copy would yield; with
+   * them, the system Copy still carries the raw placeholder (the platform's
+   * native behaviour for attachments) while this payload carries the text
+   * the consumer said the card stands for.
    */
   plain: string;
   /** The exact markdown source slice for the mapped span. */
@@ -49,6 +54,16 @@ export interface SelectionActionContext {
    * Unset means the projection defaults.
    */
   glyphs?: Partial<ProjectionGlyphs>;
+  /**
+   * The embed lookup the run was segmented and projected with. The same rule
+   * as `glyphs`, for the same reason: an embed claim replaces a node's whole
+   * projection with one placeholder character, so a fallback projection built
+   * without it has different offsets everywhere after the first claimed node
+   * — and would silently map the user's selection through the wrong piece
+   * table. `<SelectableMarkdown>` threads this for you; hand-rolled callers
+   * that pass an `embed` prop must too.
+   */
+  embed?: EmbedLookup;
 }
 
 /**
@@ -77,7 +92,9 @@ export function handleSelectionAction(
   if (!Number.isFinite(event.start) || !Number.isFinite(event.end)) {
     return null;
   }
-  const projected = ctx?.projected ?? projectRun(run, doc, { glyphs: ctx?.glyphs });
+  const projected =
+    ctx?.projected ??
+    projectRun(run, doc, { glyphs: ctx?.glyphs, embed: ctx?.embed });
   const start = Math.max(0, Math.min(event.start, event.end));
   const end = Math.min(
     projected.text.length,
@@ -109,9 +126,39 @@ export function handleSelectionAction(
     Math.max(0, Math.min(span.start, span.end)),
     Math.min(doc.source.length, Math.max(span.start, span.end)),
   );
-  const plain = projected.text.slice(start, end);
+  const plain = substituteEmbeds(projected, start, end);
   const action: SelectionAction =
     event.action === 'copy-text' ? 'copy-text' : 'copy-markdown';
 
   return { action, plain, markdown, span };
+}
+
+/**
+ * The display slice with each embed placeholder replaced by its declared
+ * text (or removed — see {@link SelectionCopyEvent.plain}). Substitutes
+ * RIGHT-TO-LEFT so earlier placeholders' offsets are still valid while later
+ * ones are being replaced; embeds are recorded in ascending placeholder
+ * order, so a reversed walk is the descending one.
+ */
+function substituteEmbeds(
+  projected: ProjectedRun,
+  start: number,
+  end: number,
+): string {
+  let plain = projected.text.slice(start, end);
+  const embeds = projected.embeds;
+  if (embeds === undefined) {
+    return plain;
+  }
+  for (let i = embeds.length - 1; i >= 0; i -= 1) {
+    const embed = embeds[i];
+    if (embed.start < start || embed.end > end) {
+      continue;
+    }
+    plain =
+      plain.slice(0, embed.start - start) +
+      (embed.content.text ?? '') +
+      plain.slice(embed.end - start);
+  }
+  return plain;
 }

@@ -452,3 +452,141 @@ describeNative('resolveRunAttributes', () => {
  * projection object alone, so these cases hand-build one — which also keeps
  * them running on a machine with no compiled addon.
  */
+describe('embed geometry attributes', () => {
+  const embedNode = { kind: 'link', span: { start: 4, end: 17 } };
+  const projectedWithEmbed: ProjectedRun = {
+    text: 'See ￼ here.',
+    pieces: [
+      { textStart: 0, textEnd: 4, source: { start: 0, end: 4 } },
+      { textStart: 4, textEnd: 5, source: { start: 4, end: 17 } },
+      { textStart: 5, textEnd: 11, source: { start: 17, end: 23 } },
+    ],
+    marks: [{ kind: 'embed', start: 4, end: 5, embedId: 0 }],
+    embeds: [
+      {
+        embedId: 0,
+        start: 4,
+        end: 5,
+        node: embedNode as never,
+        content: { width: 200, height: 80, text: '[1]' },
+      },
+    ],
+  };
+
+  test('appends a transparent, height-carrying attribute over the placeholder', () => {
+    const attributes = resolveRunAttributes(projectedWithEmbed, defaultTheme);
+
+    expect(attributes[attributes.length - 1]).toEqual({
+      start: 4,
+      end: 5,
+      color: 'transparent',
+      lineHeight: 80,
+    });
+  });
+
+  test('the geometry attribute sits after every mark attribute, so it wins innermost', () => {
+    const withHeading: ProjectedRun = {
+      ...projectedWithEmbed,
+      marks: [
+        { kind: 'heading', start: 0, end: 11, level: 1 },
+        ...projectedWithEmbed.marks,
+      ],
+    };
+    const attributes = resolveRunAttributes(withHeading, defaultTheme);
+    const geometryIndex = attributes.findIndex(
+      (attribute) => attribute.lineHeight === 80,
+    );
+    const headingIndex = attributes.findIndex(
+      (attribute) => attribute.fontWeight === defaultTheme.headings.weight,
+    );
+
+    expect(geometryIndex).toBeGreaterThan(headingIndex);
+  });
+
+  test('attributeForMark never sees the embed mark and cannot drop the geometry', () => {
+    const seen: string[] = [];
+    const attributes = resolveRunAttributes(
+      projectedWithEmbed,
+      defaultTheme,
+      (mark) => {
+        seen.push(mark.kind);
+        // "Suppress everything" — the geometry attribute must survive it.
+        return {};
+      },
+    );
+
+    expect(seen).not.toContain('embed');
+    expect(attributes).toContainEqual({
+      start: 4,
+      end: 5,
+      color: 'transparent',
+      lineHeight: 80,
+    });
+  });
+
+  test('a projection without embeds gains no geometry attribute', () => {
+    const bare: ProjectedRun = {
+      text: projectedWithEmbed.text,
+      pieces: projectedWithEmbed.pieces,
+      marks: [],
+    };
+    const attributes = resolveRunAttributes(bare, defaultTheme);
+
+    expect(attributes).toHaveLength(1);
+    expect(attributes[0].start).toBe(0);
+  });
+});
+
+describe('embed geometry line-height floor', () => {
+  const chipProjection = (height: number): ProjectedRun => ({
+    text: 'See ￼ here.',
+    pieces: [
+      { textStart: 0, textEnd: 4, source: { start: 0, end: 4 } },
+      { textStart: 4, textEnd: 5, source: { start: 4, end: 17 } },
+      { textStart: 5, textEnd: 11, source: { start: 17, end: 23 } },
+    ],
+    marks: [{ kind: 'embed', start: 4, end: 5, embedId: 0 }],
+    embeds: [
+      {
+        embedId: 0,
+        start: 4,
+        end: 5,
+        node: { kind: 'link', span: { start: 4, end: 17 } } as never,
+        content: { width: 40, height },
+      },
+    ],
+  });
+
+  test('a chip shorter than the line never shrinks it', () => {
+    // Line height clamps in BOTH directions on both platforms, so a 10pt
+    // chip must not squash the body line around it.
+    const attributes = resolveRunAttributes(chipProjection(10), defaultTheme);
+    const geometry = attributes[attributes.length - 1];
+    const bodyLineHeight =
+      defaultTheme.fonts.baseSize * defaultTheme.fonts.lineHeight;
+
+    expect(geometry.lineHeight).toBe(bodyLineHeight);
+  });
+
+  test('a chip inside a heading floors at the heading line height', () => {
+    const projected = chipProjection(10);
+    projected.marks = [
+      { kind: 'heading', start: 0, end: 11, level: 1 },
+      ...projected.marks,
+    ];
+    const attributes = resolveRunAttributes(projected, defaultTheme);
+    const geometry = attributes[attributes.length - 1];
+    const heading = attributes.find(
+      (attribute) => attribute.fontWeight === defaultTheme.headings.weight,
+    );
+
+    expect(geometry.lineHeight).toBe(heading?.lineHeight);
+  });
+
+  test('a card taller than the line raises it to the declared height', () => {
+    const attributes = resolveRunAttributes(chipProjection(200), defaultTheme);
+    const geometry = attributes[attributes.length - 1];
+
+    expect(geometry.lineHeight).toBe(200);
+  });
+});

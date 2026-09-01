@@ -39,5 +39,9 @@ export * from './view/runPressables';
 // And again for `RunHostProps.decorations` — `RunDecoration` is what
 // `NativeRunDecoration` in the codegen spec mirrors, field for field.
 export * from './view/runDecorations';
+// And for `RunHostProps.embeds` — `RunEmbed` is what `NativeRunEmbed` in the
+// codegen spec mirrors, minus the JS-only `node`/`text` fields that never
+// cross the bridge.
+export * from './view/runEmbeds';
 export * from './view/RunHost';
 export * from './view/SelectableMarkdown';

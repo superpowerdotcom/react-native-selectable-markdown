@@ -185,6 +185,7 @@ object RunAttributedText {
         text: String,
         spec: Spec,
         decorations: RunDecorations.Spec = RunDecorations.Spec.EMPTY,
+        embeds: RunEmbeds.Spec = RunEmbeds.Spec.EMPTY,
     ): Spannable {
         val out = SpannableString(text)
         if (text.isEmpty()) return out
@@ -240,6 +241,16 @@ object RunAttributedText {
             RunTextMeasure.configurePaint(paint, RunTextMeasure.baseTextSizeSp(text, spec))
             RunDecorations.applyLayoutSpans(out, decorations, paint)
         }
+
+        // Embed reservations last, though the position is symmetry rather
+        // than necessity: a ReplacementSpan supplies its metrics through
+        // `getSize` during measurement, so its insertion order relative to
+        // the LineHeightSpans above is immaterial — `chooseHeight` always
+        // runs after the glyph metrics are in. What DOES depend on order is
+        // among the LineHeightSpans themselves: the embed-height `lineHeight`
+        // attribute JS emits after the base one is what finally sizes the
+        // placeholder's line (see RunEmbedSpan for the whole story).
+        RunEmbeds.applySpans(out, embeds)
         return out
     }
 }

@@ -391,11 +391,87 @@ static void RNSMApplyRowPadding(
   }
 }
 
+/*
+ * The space an embed reserves at its U+FFFC placeholder. Draws nothing — the
+ * consumer's React view is overlaid at the rect the host reports through
+ * onEmbedLayout — so the only things this class contributes are its bounds
+ * (the reservation) and its equality.
+ */
+@interface RNSMEmbedAttachment : NSTextAttachment
+
+@property (nonatomic, readonly) NSInteger embedId;
+
+- (instancetype)initWithEmbedId:(NSInteger)embedId
+                         bounds:(CGRect)bounds NS_DESIGNATED_INITIALIZER;
+- (instancetype)initWithData:(nullable NSData *)contentData
+                      ofType:(nullable NSString *)uti NS_UNAVAILABLE;
+- (nullable instancetype)initWithCoder:(NSCoder *)coder NS_UNAVAILABLE;
+
+@end
+
+@implementation RNSMEmbedAttachment
+
+- (instancetype)initWithEmbedId:(NSInteger)embedId bounds:(CGRect)bounds
+{
+  if (self = [super initWithData:nil ofType:nil]) {
+    _embedId = embedId;
+    self.bounds = bounds;
+  }
+  return self;
+}
+
+/*
+ * Nothing to draw: no image, whatever the bounds. Without the override a
+ * contentless NSTextAttachment can render its "missing attachment" glyph,
+ * and the reservation must read as empty space under the overlaid card.
+ */
+- (nullable UIImage *)imageForBounds:(CGRect)imageBounds
+                       textContainer:(nullable NSTextContainer *)textContainer
+                      characterIndex:(NSUInteger)charIndex
+{
+  return nil;
+}
+
+/*
+ * VALUE EQUALITY, AND IT IS LOAD-BEARING. NSTextAttachment inherits pointer
+ * `isEqual:`, and the builder allocates a fresh attachment on every rebuild —
+ * which under streaming is every snapshot. The host's append fast path
+ * (SelectableRunHostView.apply) compares the new string's prefix against the
+ * storage with `isEqual(to:)`, which compares attribute values via `isEqual:`
+ * — so a pointer-identity attachment would fail that compare on every append
+ * and silently demote each one to a full swap: full relayout of the settled
+ * prefix plus a save/clamp/restore of the selection, the exact costs the fast
+ * path exists to remove, with rendering that stays perfectly correct. Two
+ * attachments are the same reservation iff they reserve the same rect for the
+ * same embed.
+ */
+- (BOOL)isEqual:(id)object
+{
+  if (self == object) {
+    return YES;
+  }
+  if (![object isKindOfClass:[RNSMEmbedAttachment class]]) {
+    return NO;
+  }
+  RNSMEmbedAttachment *other = (RNSMEmbedAttachment *)object;
+  return _embedId == other->_embedId && CGRectEqualToRect(self.bounds, other.bounds);
+}
+
+- (NSUInteger)hash
+{
+  CGRect bounds = self.bounds;
+  return (NSUInteger)_embedId ^ ((NSUInteger)bounds.size.width << 8) ^
+      ((NSUInteger)bounds.size.height << 16);
+}
+
+@end
+
 @implementation RNSMAttributedText
 
 + (NSAttributedString *)attributedStringWithText:(NSString *)text
                                       attributes:(nullable NSArray *)attributes
                                      decorations:(nullable NSArray *)decorations
+                                          embeds:(nullable NSArray *)embeds
 {
   NSMutableAttributedString *store = [[NSMutableAttributedString alloc] initWithString:text ?: @""];
   NSInteger length = (NSInteger)store.length;
@@ -550,6 +626,58 @@ static void RNSMApplyRowPadding(
     }
   }
 
+  /*
+   * The embed reservations, last: they read the font the attribute loop gave
+   * the placeholder (for the baseline offset below), and they touch nothing
+   * the decoration loop wrote. Every guard here degrades a bad entry to "no
+   * reservation" — never a crash, never an attachment over a real character.
+   */
+  for (id entry in embeds) {
+    if (![entry isKindOfClass:[NSDictionary class]]) {
+      continue;
+    }
+    NSDictionary *spec = (NSDictionary *)entry;
+    NSRange range;
+    if (!RNSMClampedRange(spec, length, &range) || range.length != 1) {
+      continue;
+    }
+    NSNumber *embedId = RNSMNumber(spec[@"embedId"]);
+    NSNumber *width = RNSMNumber(spec[@"width"]);
+    NSNumber *height = RNSMNumber(spec[@"height"]);
+    if (embedId == nil || width == nil || height == nil ||
+        width.doubleValue <= 0.0 || height.doubleValue <= 0.0) {
+      continue;
+    }
+    // The skew guard: only ever attach over the U+FFFC placeholder the
+    // projection emitted. Under prop skew a clamped range can land on prose,
+    // and an attachment there would visually swallow a real character.
+    if ([store.string characterAtIndex:range.location] != 0xFFFC) {
+      continue;
+    }
+    /*
+     * The attachment sits ON the baseline by default, leaving the line's
+     * descent below it unused — so a card as tall as its (min = max pinned)
+     * line would poke out the top by exactly the descent. Dropping the origin
+     * to the placeholder's font descender (a negative number) aligns the
+     * attachment's bottom with the descent floor instead, which keeps the
+     * whole reservation inside the line the JS-side lineHeight attribute
+     * sized for it.
+     */
+    id fontValue = [store attribute:NSFontAttributeName
+                            atIndex:range.location
+                     effectiveRange:nil];
+    CGFloat descender =
+        [fontValue isKindOfClass:[UIFont class]] ? ((UIFont *)fontValue).descender : 0.0;
+    RNSMEmbedAttachment *attachment = [[RNSMEmbedAttachment alloc]
+        initWithEmbedId:embedId.integerValue
+                 bounds:CGRectMake(
+                            0.0,
+                            descender,
+                            (CGFloat)width.doubleValue,
+                            (CGFloat)height.doubleValue)];
+    [store addAttribute:NSAttachmentAttributeName value:attachment range:range];
+  }
+
   return store;
 }
 
@@ -647,6 +775,30 @@ using namespace facebook::react;
   return decorations;
 }
 
++ (NSArray<NSDictionary *> *)embedsWithProps:(const SelectableRunHostProps &)props
+{
+  /*
+   * All five members are required from JS, so unlike the sparse structs above
+   * every key is written unconditionally — the builder's own guards (positive
+   * size, 1-unit range, U+FFFC underneath) are what absorb a defaulted or
+   * malformed entry. Its own method for the same reason decorationsWithProps
+   * is: the string builder and the Fabric component view both need the
+   * dictionary form, and one decoder means they cannot disagree.
+   */
+  NSMutableArray<NSDictionary *> *embeds =
+      [NSMutableArray arrayWithCapacity:props.embeds.size()];
+  for (const auto &embed : props.embeds) {
+    [embeds addObject:@{
+      @"start" : @(embed.start),
+      @"end" : @(embed.end),
+      @"embedId" : @(embed.embedId),
+      @"width" : @(embed.width),
+      @"height" : @(embed.height),
+    }];
+  }
+  return embeds;
+}
+
 + (NSAttributedString *)attributedStringWithProps:(const SelectableRunHostProps &)props
 {
   /*
@@ -717,7 +869,8 @@ using namespace facebook::react;
 
   return [self attributedStringWithText:text
                              attributes:attributes
-                            decorations:[self decorationsWithProps:props]];
+                            decorations:[self decorationsWithProps:props]
+                                 embeds:[self embedsWithProps:props]];
 }
 
 @end

@@ -35,6 +35,98 @@ export type BlockClass = 'flowing' | 'standalone';
 export type ClassifyBlock = (node: AnyNode) => BlockClass | undefined;
 
 /**
+ * What an embedded node contributes to the run: the layout space its overlay
+ * needs, and the text it stands for when a selection that swept across it is
+ * copied. The React element itself lives one layer up (`EmbedSpec` in the
+ * view) — nothing below the view layer renders.
+ */
+export interface EmbedContent {
+  /** Reserved size in points, declared up front — the reservation is
+   * layout-affecting and measured off the UI thread, so there is no
+   * measure-the-card-first feedback loop. Must be positive. */
+  width: number;
+  height: number;
+  /** What `plain` shows for this embed in a copy-text payload. Absent means
+   * the embed contributes nothing to `plain` (its placeholder is removed);
+   * `markdown` always carries the node's exact source either way. */
+  text?: string;
+}
+
+/**
+ * Where a node sits when an embed claim consults it. `topLevel` is true only
+ * for a direct child of the document — the one position whose reservation
+ * spans the full run width. A nested node (a code block inside a list item,
+ * a table inside a blockquote, any inline) is offered with `topLevel: false`
+ * so a consumer sizing an embed against the column width can decline it:
+ * the native hosts do not clamp a declared width against the line's leading
+ * margins, so a full-width claim inside an indented context overflows the
+ * host to the right.
+ */
+export interface EmbedClaimContext {
+  topLevel: boolean;
+}
+
+/** The two context values, frozen module constants: the lookup runs for
+ * every node of every projection, and the flag has exactly two states. */
+const TOP_LEVEL_CLAIM: EmbedClaimContext = Object.freeze({ topLevel: true });
+const NESTED_CLAIM: EmbedClaimContext = Object.freeze({ topLevel: false });
+
+/**
+ * Consumer-supplied embed claim. Return content to claim the node as an
+ * embed, or `undefined` to leave it alone. A claimed node FLOWS: its block
+ * merges with its neighbours into one run, the projection stands the node
+ * down to a single U+FFFC placeholder mapped to the node's whole source
+ * span, and the view overlays the consumer's element on the space the host
+ * reserves — so one gesture selects across it, and copying a sweep that
+ * covers it yields the node's exact markdown.
+ *
+ * Consulted before `classifyBlock` claims and before the built-in view-kind
+ * rules, for blocks and inlines alike — so an image or a blocked link can be
+ * claimed without also being forced standalone. Like `classifyBlock`, it
+ * must be pure, deterministic, and referentially stable: the whole document
+ * is resegmented and reprojected whenever the callback's identity changes.
+ * Purity includes the context argument: segmentation and projection may
+ * consult the same node from different walks, and the claim must not depend
+ * on anything but `(node, context)`.
+ *
+ * Nodes that cannot be embedded are left to normal projection regardless of
+ * a claim: `synthetic` nodes (their text is not in the source, so there is
+ * no span to map the placeholder to) and `incomplete` ones (a construct the
+ * stream is still repairing — its span is still moving, and an overlay on
+ * moving text is exactly the artifact this library exists to avoid).
+ */
+export type EmbedLookup = (
+  node: AnyNode,
+  context: EmbedClaimContext,
+) => EmbedContent | undefined;
+
+/**
+ * The one gate for "may this node be embedded at all", returning the claimed
+ * content when it may. Shared by segmentation and projection so the two
+ * cannot disagree about a claim. Rejects synthetic and incomplete nodes (see
+ * `EmbedLookup`) and claims without a positive size — `!(x > 0)` rather than
+ * `x <= 0` so a NaN from the consumer is rejected too.
+ */
+export function embedContentFor(
+  node: AnyNode,
+  embed?: EmbedLookup,
+  topLevel = false,
+): EmbedContent | undefined {
+  if (embed === undefined || node.synthetic === true || node.incomplete === true) {
+    return undefined;
+  }
+  const content = embed(node, topLevel ? TOP_LEVEL_CLAIM : NESTED_CLAIM);
+  if (content === undefined || !(content.width > 0) || !(content.height > 0)) {
+    return undefined;
+  }
+  return content;
+}
+
+function embeddable(node: AnyNode, embed?: EmbedLookup, topLevel = false): boolean {
+  return embedContentFor(node, embed, topLevel) !== undefined;
+}
+
+/**
  * Block kinds that merge into a shared prose run. Everything else
  * (code blocks, tables, thematic breaks, html blocks) is standalone.
  *
@@ -116,7 +208,19 @@ const VIEW_KINDS: ReadonlySet<AnyNode['kind']> = new Set<AnyNode['kind']>([
   'spoiler',
 ]);
 
-function containsStandalone(node: AnyNode, classify?: ClassifyBlock): boolean {
+function containsStandalone(
+  node: AnyNode,
+  classify?: ClassifyBlock,
+  embed?: EmbedLookup,
+): boolean {
+  // An embed claim beats everything, including a `classifyBlock` claim on the
+  // same node: the projection stands the whole subtree down to one
+  // placeholder, so nothing inside it can render a view — there is no reason
+  // to descend, and descending would let a nested image force standalone a
+  // block whose image the consumer just said flows.
+  if (embeddable(node, embed /* nested: this walk is always inside a block */)) {
+    return false;
+  }
   const claimed = classify?.(node);
   if (claimed !== undefined) {
     return claimed === 'standalone';
@@ -124,18 +228,28 @@ function containsStandalone(node: AnyNode, classify?: ClassifyBlock): boolean {
   if (VIEW_KINDS.has(node.kind)) {
     return true;
   }
-  return childrenOf(node).some((child) => containsStandalone(child, classify));
+  return childrenOf(node).some((child) => containsStandalone(child, classify, embed));
 }
 
 /**
- * Classifies one top-level block. A consumer claim wins outright; otherwise a
- * non-prose kind is standalone, and a prose kind is standalone when it
- * carries a standalone construct inside — a code block nested in a list item,
- * an image in a paragraph. Such a block cannot merge either: a run is one
- * text tree, and the nested construct has to keep its own renderer and
- * gestures.
+ * Classifies one top-level block. An embed claim wins first (an embedded
+ * block flows — that is the point of embedding); then a consumer claim wins
+ * outright; otherwise a non-prose kind is standalone, and a prose kind is
+ * standalone when it carries a standalone construct inside — a code block
+ * nested in a list item, an image in a paragraph. Such a block cannot merge
+ * either: a run is one text tree, and the nested construct has to keep its
+ * own renderer and gestures.
  */
-export function classifyBlock(block: Block, classify?: ClassifyBlock): BlockClass {
+export function classifyBlock(
+  block: Block,
+  classify?: ClassifyBlock,
+  embed?: EmbedLookup,
+): BlockClass {
+  // Top-level by contract — see the doc comment above; `segmentRuns` only
+  // ever calls this for direct children of the document.
+  if (embeddable(block, embed, true)) {
+    return 'flowing';
+  }
   const claimed = classify?.(block);
   if (claimed !== undefined) {
     return claimed;
@@ -143,7 +257,7 @@ export function classifyBlock(block: Block, classify?: ClassifyBlock): BlockClas
   if (!PROSE_KINDS.has(block.kind)) {
     return 'standalone';
   }
-  return childrenOf(block).some((child) => containsStandalone(child, classify))
+  return childrenOf(block).some((child) => containsStandalone(child, classify, embed))
     ? 'standalone'
     : 'flowing';
 }
@@ -166,10 +280,11 @@ export function classifyBlock(block: Block, classify?: ClassifyBlock): BlockClas
  */
 export function segmentRuns(
   doc: ParsedDocument,
-  opts?: { settledUntil?: number; classifyBlock?: ClassifyBlock },
+  opts?: { settledUntil?: number; classifyBlock?: ClassifyBlock; embed?: EmbedLookup },
 ): RunSegment[] {
   const settledUntil = opts?.settledUntil ?? Number.POSITIVE_INFINITY;
   const classify = opts?.classifyBlock;
+  const embed = opts?.embed;
   const runs: RunSegment[] = [];
 
   let pending: Block[] = [];
@@ -189,7 +304,10 @@ export function segmentRuns(
     // 1px border-colored hairline the decoration would have. Nothing is
     // lost selection-wise: a rule contributes no selectable text, and any
     // HR with a flowing neighbour still merges and keeps the sweep intact.
-    if (pending.every((block) => block.kind === 'thematicBreak')) {
+    // An EMBEDDED thematic break is exempt: it projects a placeholder
+    // character, so its run is not empty — and demoting it to standalone
+    // would hand it to `renderBlocks`, which ignores the embed claim.
+    if (pending.every((block) => block.kind === 'thematicBreak' && !embeddable(block, embed, true))) {
       for (const block of pending) {
         runs.push({
           span: { start: block.span.start, end: block.span.end },
@@ -215,7 +333,7 @@ export function segmentRuns(
 
   for (const block of doc.blocks) {
     const settled = block.span.end <= settledUntil;
-    if (classifyBlock(block, classify) === 'flowing') {
+    if (classifyBlock(block, classify, embed) === 'flowing') {
       if (pending.length > 0 && pendingSettled !== settled) {
         flushProse();
       }

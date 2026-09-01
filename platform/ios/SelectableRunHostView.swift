@@ -74,6 +74,13 @@ public final class SelectableRunHostView: UIView {
   /// owns the wire format, so this class emits values.
   @objc public var onInlinePress: ((Int, Int, Int) -> Void)?
 
+  /// Emitted per embed once layout has placed its reserved space, with the
+  /// embed's id and the rect in this view's coordinates — and re-emitted only
+  /// when the rect actually moved (see `reportEmbedRects`). A plain closure
+  /// for the same reason the other two are: the mounting layer owns the wire
+  /// format, so this class emits values.
+  @objc public var onEmbedLayout: ((Int, Double, Double, Double, Double) -> Void)?
+
   /// Menu titles for the action identifiers JS may send. Unknown
   /// identifiers (newer JS driving an older binary) are dropped rather than
   /// rendered as untitled items.
@@ -110,6 +117,26 @@ public final class SelectableRunHostView: UIView {
   /// overlap (links cannot nest), so the first containing range found is the
   /// only one.
   private var resolvedPressables: [Pressable] = []
+
+  /// One embedded range: `embeds` parsed on arrival. `id` is JS's identifier
+  /// for the embed (its index into the prop as sent), echoed back verbatim in
+  /// `onEmbedLayout`; `size` is the declared reservation, reported rather
+  /// than re-measured so the overlay is sized by the same numbers the
+  /// attachment reserved.
+  private struct Embed {
+    let range: NSRange
+    let id: Int
+    let size: CGSize
+  }
+
+  /// `embeds` parsed to well-formed entries, in prop order.
+  private var resolvedEmbeds: [Embed] = []
+
+  /// The last rect reported per embed id — the dedupe that keeps streaming
+  /// appends past a settled embed from re-announcing it every snapshot. Keyed
+  /// by id rather than index so a prop update that reorders entries still
+  /// compares each embed against its own last report.
+  private var lastEmbedRects: [Int: CGRect] = [:]
 
 
   /// One block-chrome instruction, parsed from the `decorations` prop. Only
@@ -266,6 +293,10 @@ public final class SelectableRunHostView: UIView {
   public override func layoutSubviews() {
     super.layoutSubviews()
     textView.frame = bounds
+    // A width change moves where every embed's line wraps to, with no text
+    // change to trigger a report — the dedupe in reportEmbedRects makes the
+    // no-move case one dictionary compare per embed.
+    reportEmbedRects()
   }
 
   // MARK: - Props
@@ -282,6 +313,37 @@ public final class SelectableRunHostView: UIView {
     didSet {
       resolvedDecorations = decorations.compactMap(Self.parseDecoration(_:))
       setNeedsDisplay()
+    }
+  }
+
+  /// Embedded ranges over `text`: an array of dictionaries with `start`/`end`
+  /// (always a 1-unit range over the U+FFFC placeholder JS projected),
+  /// `embedId`, `width`, `height`. The layout-affecting half — the invisible
+  /// attachment that reserves the declared size — was consumed by the string
+  /// builder on the layout thread, exactly like a decoration's insets: the
+  /// measured string arrives through State, built from these same props. Only
+  /// the parse-for-reporting half matters here: `reportEmbedRects` reads this
+  /// list to say where each reservation landed.
+  @objc public var embeds: NSArray = [] {
+    didSet {
+      resolvedEmbeds = embeds.compactMap { entry in
+        guard let dictionary = entry as? [String: Any],
+              let start = (dictionary["start"] as? NSNumber)?.intValue,
+              let end = (dictionary["end"] as? NSNumber)?.intValue,
+              let id = (dictionary["embedId"] as? NSNumber)?.intValue,
+              let width = (dictionary["width"] as? NSNumber)?.doubleValue,
+              let height = (dictionary["height"] as? NSNumber)?.doubleValue,
+              start >= 0, end == start + 1, width > 0, height > 0 else { return nil }
+        return Embed(
+          range: NSRange(location: start, length: 1),
+          id: id,
+          size: CGSize(width: width, height: height))
+      }
+      // A changed list invalidates every previous report: an id that no
+      // longer exists must not suppress a future report for a reused id, and
+      // an embed whose size changed must re-report even if its origin did
+      // not move.
+      lastEmbedRects.removeAll()
     }
   }
 
@@ -355,6 +417,9 @@ public final class SelectableRunHostView: UIView {
       // Appended text can move end-anchored decorations and always moves the
       // measured height.
       setNeedsDisplay()
+      // Settled embeds live in the untouched prefix, so their rects almost
+      // never move on an append — the dedupe makes this a per-embed compare.
+      reportEmbedRects()
       return
     }
 
@@ -381,6 +446,7 @@ public final class SelectableRunHostView: UIView {
     }
     // Text moved, so every decoration's geometry did too.
     setNeedsDisplay()
+    reportEmbedRects()
   }
 
   @objc public var selectable: Bool = true {
@@ -460,11 +526,64 @@ public final class SelectableRunHostView: UIView {
     textView.attributedText = NSAttributedString()
     textView.selectedRange = NSRange(location: 0, length: 0)
     textView.resignFirstResponder()
+    // The rect dedupe is NOT prop-derived — it is layout history — so unlike
+    // `resolvedEmbeds` (which stays, like `resolvedDecorations` and
+    // `pressables`: props survive recycling) it must go: a recycled host that
+    // kept it would silently skip reporting a rect the next run's overlay
+    // happens to share, and JS would position that overlay from a rect the
+    // previous run reported — the same stale-state failure class as the
+    // selection reset above.
+    lastEmbedRects.removeAll()
     // `resolvedDecorations` is deliberately NOT cleared — it is prop-derived,
     // like `pressables`, and the props survive recycling. The redraw is what
     // matters: with the text emptied, `draw(_:)` paints nothing (it guards on
     // text length), so no chrome from the previous run outlives it.
     setNeedsDisplay()
+  }
+
+  // MARK: - Embed rects
+
+  /// Report where each embed's reserved space landed, deduped against the
+  /// last report per id so streaming appends past a settled embed cost one
+  /// rect compare instead of one event per snapshot.
+  ///
+  /// Geometry comes off the SAME TextKit stack the view draws with, through
+  /// the same primitives the hit test uses: `glyphRange(forCharacterRange:)`
+  /// then `boundingRect(forGlyphRange:in:)`, which forces layout for the
+  /// range if needed. Container coordinates are view points here — the
+  /// container's `lineFragmentPadding` and the view's `textContainerInset`
+  /// are both zeroed in init — plus the text view's frame origin, exactly as
+  /// `lineBand` adds it for decorations.
+  ///
+  /// Every embed is re-verified against the CURRENT text (in range, still
+  /// U+FFFC underneath), the same skew discipline as the builder: a stale
+  /// entry reports nothing rather than a rect over prose.
+  private func reportEmbedRects() {
+    guard let emit = onEmbedLayout, !resolvedEmbeds.isEmpty else { return }
+    let layoutManager = textView.layoutManager
+    guard layoutManager.numberOfGlyphs > 0 else { return }
+    let full = (textView.text ?? "") as NSString
+    let origin = textView.frame.origin
+    for embed in resolvedEmbeds {
+      guard embed.range.location < full.length,
+            full.character(at: embed.range.location) == 0xFFFC else { continue }
+      let glyphRange = layoutManager.glyphRange(
+        forCharacterRange: embed.range, actualCharacterRange: nil)
+      guard glyphRange.length > 0 else { continue }
+      var rect = layoutManager.boundingRect(
+        forGlyphRange: glyphRange, in: textView.textContainer)
+      rect.origin.x += origin.x
+      rect.origin.y += origin.y
+      if let last = lastEmbedRects[embed.id],
+         abs(last.origin.x - rect.origin.x) <= 0.5,
+         abs(last.origin.y - rect.origin.y) <= 0.5,
+         abs(last.width - rect.width) <= 0.5,
+         abs(last.height - rect.height) <= 0.5 {
+        continue
+      }
+      lastEmbedRects[embed.id] = rect
+      emit(embed.id, rect.origin.x, rect.origin.y, rect.width, rect.height)
+    }
   }
 
   // MARK: - Decorations

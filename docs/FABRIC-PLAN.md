@@ -4,9 +4,11 @@ A design retrospective, not a live plan. It records how the Fabric
 (new-architecture) port was built and why, written against react-native
 0.75.4. The port shipped in full, including the goals §9 proposed deferring.
 
-Two things it treats as live were removed in 0.10.0, when the peer range moved
-to `react-native >= 0.82`: the old-architecture (Paper) path and the embed
-subsystem. Read any "both architectures" or `embeds` discussion as history.
+One thing it treats as live was removed in 0.10.0, when the peer range moved
+to `react-native >= 0.82`: the old-architecture (Paper) path. Read any "both
+architectures" discussion as history. The embed subsystem was removed in the
+same release and restored, Fabric-only, in 0.11.0, so its `embeds`
+discussion is current again.
 
 The `file.ext:NN-MM` citations are stale. Source comments cite this document
 by section number, which is why it stays and why the numbering never changes.

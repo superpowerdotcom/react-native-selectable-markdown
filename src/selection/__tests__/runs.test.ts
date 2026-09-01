@@ -11,7 +11,7 @@ import type {
   ThematicBreakNode,
 } from '../../document/nodes';
 import { classifyBlock, segmentRuns } from '../runs';
-import type { ClassifyBlock } from '../runs';
+import type { ClassifyBlock, EmbedLookup } from '../runs';
 import { makeDoc, plainParagraph, spanOf, textNode } from './fixtures';
 
 describe('segmentRuns', () => {
@@ -621,4 +621,197 @@ describe('segmentRuns', () => {
     });
   });
 
+  describe('embed seam', () => {
+    // The chat-app case the seam exists for: a blocked citation link renders
+    // as a card, and the card must FLOW so a selection sweeps across it —
+    // the inverse of the classifyBlock claim, which ends the run.
+    const claimCitations: EmbedLookup = (node) =>
+      node.kind === 'link' && node.href.startsWith('cite://')
+        ? { width: 200, height: 80 }
+        : undefined;
+
+    const source = 'Answer text.\n\n[1](cite://a)\n\nFollow-up.';
+    const answer = plainParagraph(source, 'Answer text.');
+    const link: LinkNode = {
+      kind: 'link',
+      href: 'cite://a',
+      blocked: true,
+      span: spanOf(source, '[1](cite://a)'),
+      children: [textNode(source, '1')],
+    };
+    const card: ParagraphNode = {
+      kind: 'paragraph',
+      span: link.span,
+      children: [link],
+    };
+    const followUp = plainParagraph(source, 'Follow-up.');
+    const doc = makeDoc(source, [answer, card, followUp]);
+
+    it('keeps a run whole across an embedded inline', () => {
+      const runs = segmentRuns(doc, { embed: claimCitations });
+
+      expect(runs).toHaveLength(1);
+      expect(runs[0].standalone).toBe(false);
+      expect(runs[0].blocks).toEqual([answer, card, followUp]);
+    });
+
+    it('keeps a run whole across an embedded image — the claim beats VIEW_KINDS', () => {
+      const imgSource = 'Before.\n\n![alt](img.png)\n\nAfter.';
+      const image: ImageNode = {
+        kind: 'image',
+        src: 'img.png',
+        alt: 'alt',
+        span: spanOf(imgSource, '![alt](img.png)'),
+      };
+      const withImage: ParagraphNode = {
+        kind: 'paragraph',
+        span: image.span,
+        children: [image],
+      };
+      const imgDoc = makeDoc(imgSource, [
+        plainParagraph(imgSource, 'Before.'),
+        withImage,
+        plainParagraph(imgSource, 'After.'),
+      ]);
+
+      // Unclaimed, the image forces its paragraph standalone…
+      expect(segmentRuns(imgDoc)).toHaveLength(3);
+      // …claimed as an embed, everything flows.
+      const runs = segmentRuns(imgDoc, {
+        embed: (node) =>
+          node.kind === 'image' ? { width: 120, height: 90 } : undefined,
+      });
+      expect(runs).toHaveLength(1);
+      expect(runs[0].standalone).toBe(false);
+    });
+
+    it('wins over a conflicting classifyBlock claim on the same node', () => {
+      const runs = segmentRuns(doc, {
+        embed: claimCitations,
+        classifyBlock: (node) =>
+          node.kind === 'link' ? 'standalone' : undefined,
+      });
+
+      expect(runs).toHaveLength(1);
+      expect(runs[0].standalone).toBe(false);
+    });
+
+    it('never embeds synthetic or incomplete nodes', () => {
+      const incomplete: LinkNode = { ...link, incomplete: true };
+      const withIncomplete: ParagraphNode = {
+        kind: 'paragraph',
+        span: incomplete.span,
+        children: [incomplete],
+      };
+      // An incomplete node falls through the embed claim to the normal rules,
+      // under which a link-bearing paragraph flows anyway — so the property
+      // observable here is via classifyBlock precedence: with the embed claim
+      // inert, a standalone classifyBlock claim on the link stands.
+      const runs = segmentRuns(makeDoc(source, [answer, withIncomplete, followUp]), {
+        embed: claimCitations,
+        classifyBlock: (node) =>
+          node.kind === 'link' ? 'standalone' : undefined,
+      });
+      expect(runs).toHaveLength(3);
+      expect(runs[1].standalone).toBe(true);
+    });
+
+    it('rejects claims without a positive size', () => {
+      const runs = segmentRuns(doc, {
+        embed: (node) =>
+          node.kind === 'link' ? { width: 0, height: 80 } : undefined,
+        classifyBlock: (node) =>
+          node.kind === 'link' ? 'standalone' : undefined,
+      });
+      // The zero-width claim is inert, so the classifyBlock claim decides.
+      expect(runs).toHaveLength(3);
+    });
+
+    it('behaves byte-identically to today when nothing is claimed', () => {
+      const withLookup = segmentRuns(doc, { embed: () => undefined });
+      expect(withLookup).toEqual(segmentRuns(doc));
+    });
+
+    it('still splits at the settled boundary', () => {
+      const runs = segmentRuns(doc, {
+        embed: claimCitations,
+        settledUntil: answer.span.end,
+      });
+
+      expect(runs).toHaveLength(2);
+      expect(runs[0].blocks).toEqual([answer]);
+      expect(runs[1].selectable).toBe(false);
+    });
+
+    it('does not demote an embedded lone thematic break to standalone', () => {
+      const hrSource = '---';
+      const rule: ThematicBreakNode = {
+        kind: 'thematicBreak',
+        span: spanOf(hrSource, '---'),
+      };
+      const hrDoc = makeDoc(hrSource, [rule]);
+
+      // Unclaimed, a lone rule demotes (an empty run cannot draw)…
+      expect(segmentRuns(hrDoc)[0].standalone).toBe(true);
+      // …embedded, it projects a placeholder character, so it may flow.
+      const runs = segmentRuns(hrDoc, {
+        embed: (node) =>
+          node.kind === 'thematicBreak'
+            ? { width: 300, height: 40 }
+            : undefined,
+      });
+      expect(runs).toHaveLength(1);
+      expect(runs[0].standalone).toBe(false);
+    });
+
+    it('offers topLevel only for direct children of the document', () => {
+      // A wide-code-block claim sized against the column width must be able
+      // to decline a nested instance: the native hosts do not clamp declared
+      // width against leading margins, so a full-width reservation inside a
+      // list item would overflow. `context.topLevel` is that signal.
+      const codeSource = '```\nwide\n```\n\n- item';
+      const topCode: CodeBlockNode = {
+        kind: 'codeBlock',
+        literal: 'wide\n',
+        fenced: true,
+        closed: true,
+        span: spanOf(codeSource, '```\nwide\n```'),
+      };
+      const nestedCode: CodeBlockNode = {
+        ...topCode,
+        span: spanOf(codeSource, 'item'),
+      };
+      const list: ListNode = {
+        kind: 'list',
+        ordered: false,
+        tight: true,
+        span: spanOf(codeSource, '- item'),
+        items: [
+          {
+            kind: 'listItem',
+            span: spanOf(codeSource, '- item'),
+            children: [nestedCode],
+          },
+        ],
+      };
+      const codeDoc = makeDoc(codeSource, [topCode, list]);
+
+      const offers: { kind: string; topLevel: boolean }[] = [];
+      const claimWideCode: EmbedLookup = (node, context) => {
+        if (node.kind !== 'codeBlock') return undefined;
+        offers.push({ kind: node.kind, topLevel: context.topLevel });
+        return context.topLevel ? { width: 320, height: 60 } : undefined;
+      };
+
+      const runs = segmentRuns(codeDoc, { embed: claimWideCode });
+
+      // The top-level block was offered as such and claimed (it flows with
+      // the list); the nested one was offered nested and declined.
+      expect(offers).toContainEqual({ kind: 'codeBlock', topLevel: true });
+      expect(offers).toContainEqual({ kind: 'codeBlock', topLevel: false });
+      expect(offers.some((offer) => offer.topLevel)).toBe(true);
+      expect(runs).toHaveLength(1);
+      expect(runs[0].standalone).toBe(false);
+    });
+  });
 });

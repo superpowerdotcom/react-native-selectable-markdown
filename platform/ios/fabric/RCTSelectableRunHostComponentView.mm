@@ -123,6 +123,26 @@ static bool RCTSelectableRunHostDecorationsEqual(
 }
 
 /*
+ * Same decoded-form comparison as decorations, for the same reason: one
+ * decoder (RNSMAttributedText embedsWithProps) already exists for the string
+ * builder, so the honest equality is on what it produces rather than a
+ * member list that rots when the spec gains a field.
+ */
+static bool RCTSelectableRunHostEmbedsEqual(
+    const SelectableRunHostProps &lhs,
+    const SelectableRunHostProps &rhs)
+{
+  if (lhs.embeds.size() != rhs.embeds.size()) {
+    return false;
+  }
+  if (lhs.embeds.empty()) {
+    return true;
+  }
+  return [[RNSMAttributedText embedsWithProps:lhs]
+      isEqualToArray:[RNSMAttributedText embedsWithProps:rhs]];
+}
+
+/*
  * Codegen emits no operator== for generated structs, so the prop diff below
  * compares by hand. Element-wise and in order, because order is identity
  * here: `pressableId` is JS's index into the array as sent.
@@ -206,6 +226,14 @@ static bool RCTSelectableRunHostPressablesEqual(
       [weakSelf emitInlinePressWithStart:start end:end pressableId:pressableId];
     };
     /*
+     * Weak for the identical reason. Like `pressables`, `embeds` needs no
+     * default sync above: the generated default (an empty vector) and the
+     * host's default (an empty array) agree.
+     */
+    _hostView.onEmbedLayout = ^(NSInteger embedId, double x, double y, double width, double height) {
+      [weakSelf emitEmbedLayoutWithId:embedId x:x y:y width:width height:height];
+    };
+    /*
      * `contentView` is framed for free from `updateLayoutMetrics:`
      * (RCTViewComponentView.mm:419-421), so this class needs no
      * `layoutSubviews` override — unlike the paper wrapper, which has one
@@ -270,6 +298,17 @@ static bool RCTSelectableRunHostPressablesEqual(
    */
   if (!RCTSelectableRunHostDecorationsEqual(oldViewProps, newViewProps)) {
     _hostView.decorations = [RNSMAttributedText decorationsWithProps:newViewProps];
+  }
+
+  /*
+   * `embeds` is read here for the same split reason as `decorations`: the
+   * layout-affecting half (the attachment) was consumed by the string builder
+   * on the layout thread, but the rect reports come from the host view, and
+   * the view needs the list to know which placeholders to report on. Same
+   * decoder as the builder used, so the two halves cannot disagree.
+   */
+  if (!RCTSelectableRunHostEmbedsEqual(oldViewProps, newViewProps)) {
+    _hostView.embeds = [RNSMAttributedText embedsWithProps:newViewProps];
   }
 
   [super updateProps:props oldProps:oldProps];
@@ -376,6 +415,31 @@ static bool RCTSelectableRunHostPressablesEqual(
           .start = static_cast<int>(start),
           .end = static_cast<int>(end),
           .pressableId = static_cast<int>(pressableId)});
+}
+
+- (void)emitEmbedLayoutWithId:(NSInteger)embedId
+                            x:(double)x
+                            y:(double)y
+                        width:(double)width
+                       height:(double)height
+{
+  /*
+   * The nil check matters for the same recycling reason as the two above: a
+   * layout report racing prepareForRecycle has nowhere to go, instead of
+   * somewhere wrong — the host's own reset() cleared its rect dedupe, so the
+   * next run re-reports through a live emitter.
+   */
+  if (!_eventEmitter) {
+    return;
+  }
+
+  static_cast<const SelectableRunHostEventEmitter &>(*_eventEmitter)
+      .onEmbedLayout(SelectableRunHostEventEmitter::OnEmbedLayout{
+          .embedId = static_cast<int>(embedId),
+          .x = static_cast<Float>(x),
+          .y = static_cast<Float>(y),
+          .width = static_cast<Float>(width),
+          .height = static_cast<Float>(height)});
 }
 
 @end

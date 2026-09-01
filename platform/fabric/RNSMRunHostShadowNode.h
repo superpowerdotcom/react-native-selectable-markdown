@@ -178,11 +178,16 @@ class RNSMRunHostShadowNode final : public ConcreteViewShadowNode<
    * `ParagraphShadowNode::layout` re-measures at the final size, but only
    * because it has to position attachments (inline views inside text), and
    * it guards that second measure behind the `preventDoubleTextMeasure`
-   * feature flag (ParagraphShadowNode.cpp:183-209). A run has NO attachments
-   * — everything it renders is text with styling — so there is nothing for
-   * layout() to position, the second measure would be pure cost on every
-   * commit, and we do not acquire a dependency on `react_featureflags` to
-   * decide about it.
+   * feature flag (ParagraphShadowNode.cpp:183-209). We DO have attachments
+   * now — an embed reserves its declared rect at a U+FFFC placeholder
+   * (RNSMEmbedAttachment on iOS, a ReplacementSpan on Android) — but nothing
+   * about them is positioned HERE: the reservation is part of the measured
+   * string itself, and where it landed is reported by the host VIEW after
+   * mount through the `onEmbedLayout` event, which is what JS positions the
+   * overlay from (docs/SELECTION.md, "Event: onEmbedLayout"). So there is
+   * still nothing for layout() to position, the second measure would still
+   * be pure cost on every commit, and we still do not acquire a dependency
+   * on `react_featureflags` to decide about it.
    */
   void layout(LayoutContext layoutContext) override;
 

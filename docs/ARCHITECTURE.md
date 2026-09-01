@@ -96,6 +96,7 @@ src/
     runAttributes.ts       marks + theme -> RunTextAttribute[] for the host
     runDecorations.ts      marks + theme -> block chrome the host paints
     runPressables.ts       link marks -> tappable ranges the host hit-tests
+    runEmbeds.ts           embed entries -> RunEmbed[] the host reserves space from
     selectionActions.ts    handleSelectionAction(): menu event -> onSelectionCopy payload
     theme.ts               grouped tokens, mergeTheme, defaultTheme/defaultDarkTheme
     renderers.tsx          default per-kind renderers + override types

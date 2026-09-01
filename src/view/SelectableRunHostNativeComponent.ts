@@ -233,6 +233,58 @@ type NativePressableRange = Readonly<{
 }>;
 
 /**
+ * One embedded range over `text`, mirroring `RunEmbed` in `./runEmbeds` —
+ * except that, exactly as with pressables, the semantics stay in JS. The host
+ * never learns what the embed *is*: it reserves `width` × `height` points of
+ * layout space at the U+FFFC placeholder character JS projected at
+ * `[start, end)` (an `NSTextAttachment` on iOS, a `ReplacementSpan` on
+ * Android — both applied inside the shared string builder, so measurement and
+ * drawing cannot disagree about the reservation), reports where that space
+ * landed through `onEmbedLayout`, and JS positions the consumer's React view
+ * over it. The node, the render function and the copy text never cross the
+ * bridge.
+ *
+ * The sentinel rules documented on `NativeRunTextAttribute` apply: no
+ * booleans, no string enums. `width`/`height` are required from JS and a
+ * `0.0` sentinel cannot collide — a 0pt embed reserves nothing and is
+ * meaningless, so hosts skip entries without a positive size, which is also
+ * what absorbs a malformed entry from a newer JS.
+ */
+type NativeRunEmbed = Readonly<{
+  /** UTF-16 offsets into `text`, end-exclusive; always `end === start + 1`,
+   * covering the single U+FFFC placeholder the projection emitted. Hosts
+   * must verify the character really is U+FFFC before attaching — under
+   * version skew a stale offset must degrade to "no reservation", never to
+   * swallowing a real character. */
+  start: Int32;
+  end: Int32;
+  /** JS's identifier for the embed — its index into the `embeds` array as
+   * sent, carried explicitly for the same reason `pressableId` is. */
+  embedId: Int32;
+  /** Declared size in points. Layout-affecting: the same values reach the
+   * measurer and the view through this one prop. */
+  width: Float;
+  height: Float;
+}>;
+
+/**
+ * Payload of `onEmbedLayout`: where one embed's reserved space landed, in the
+ * host view's coordinate space, points. Fired per embed (scalar payload — an
+ * array-of-objects event payload is not verifiably supported by codegen at
+ * the bottom of the peer range) after layout, and re-fired only when the rect
+ * actually moved: hosts dedupe against the last report per `embedId`, so
+ * streaming appends past a settled embed do not re-announce it every
+ * snapshot.
+ */
+type EmbedLayoutEvent = Readonly<{
+  embedId: Int32;
+  x: Float;
+  y: Float;
+  width: Float;
+  height: Float;
+}>;
+
+/**
  * Payload of `onInlinePress`: the pressable range the tap landed on, clamped
  * against the current `text` exactly like selection offsets, plus the
  * `pressableId` JS sent with it. The offsets are informational the same way
@@ -299,6 +351,18 @@ export interface NativeProps extends ViewProps {
    */
   pressables?: ReadonlyArray<NativePressableRange>;
   /**
+   * Embedded ranges over `text`: each reserves its declared rect at the
+   * U+FFFC placeholder JS projected there, so a consumer's React view can be
+   * overlaid while selection sweeps across the run uninterrupted. Unlike
+   * `pressables` this prop is layout-affecting, so `RunHost` sends it
+   * whenever embeds exist rather than gating on a listener. An older binary
+   * that predates this prop ignores it: the placeholder renders as an
+   * invisible one-character gap (its attribute range carries a transparent
+   * colour), no `onEmbedLayout` fires, and no overlay mounts — degraded, and
+   * selection mapping stays exact.
+   */
+  embeds?: ReadonlyArray<NativeRunEmbed>;
+  /**
    * Whether the platform selection UI is enabled for this run. Defaults to
    * true so that a host mounted without the prop is selectable, which is the
    * safe direction: the failure of the other default is a document nobody can
@@ -329,6 +393,9 @@ export interface NativeProps extends ViewProps {
   onSelectionAction?: DirectEventHandler<SelectionActionEvent>;
   /** Fired when a single tap lands inside one of `pressables`. */
   onInlinePress?: DirectEventHandler<InlinePressEvent>;
+  /** Fired per embed after layout with the reserved rect; re-fired only when
+   * the rect moved. */
+  onEmbedLayout?: DirectEventHandler<EmbedLayoutEvent>;
 }
 
 /**

@@ -33,8 +33,11 @@ into it; JS maps back to source through the run's piece table.
 
 A run is a maximal sequence of adjacent flowing blocks merged into one
 selectable unit. Every other block is `standalone: true` and gets its own
-selection scope. There is no third mode: a custom card is a standalone
-block, and the sweep stops at it.
+selection scope. A third mode sits between them: an **embedded** node (the
+`embed` prop) flows through its run as one U+FFFC placeholder with a
+consumer-rendered view overlaid on space the host reserves; see
+"Event: `onEmbedLayout`" below. An embed claim is consulted before
+everything that follows and always means *flowing*.
 
 `classifyBlock` (`src/selection/runs.ts`) decides, in order:
 
@@ -72,6 +75,7 @@ contract is normative and lives in `src/selection/mapSelection.ts`:
 | Soft break (a wrapped source line) | `' '` (one space) |
 | Thematic break | empty (chrome only) |
 | Blockquote | no quote glyph, children only |
+| Embedded node (an `embed` claim) | `￼` (U+FFFC, one character, mapped to the node's whole span) |
 
 Separators are fixed constants. Bullet and task glyphs are the defaults of
 `theme.glyphs`; `projectRun` accepts `{ glyphs }` overrides and the view
@@ -127,6 +131,16 @@ integration, view recycling and measure/draw agreement are reviewed, not
 executed: this repository has no example app, simulator or Android SDK.
 `FABRIC-PLAN.md` §8 and §9 list what is proven and the cut line.
 
+Embeds inherit that split. The mapping side is executed: projection, piece
+atomicity, copy payloads, and the corpus-scale embed sweep in the projection
+oracle. Everything rendered is reviewed only: the reservation inside a
+line-height-pinned line, selection over the placeholder, `onEmbedLayout`
+delivery and its dedupe, recycling of embed state, overlay z-order against
+the selection highlight (the highlight paints in the text view, the card
+above it), gesture arbitration on the card, VoiceOver/TalkBack on U+FFFC, and
+RTL x-coordinates. That is the first list to work through when an example
+app exists.
+
 Custom menu items need iOS 16 (`textView(_:editMenuForTextIn:suggestedActions:)`).
 From the podspec floor (13.4) to 15.x, `selectionActions` is accepted, no
 custom item renders, `onSelectionAction` never fires, and the system Copy
@@ -140,6 +154,7 @@ works.
 | `attributes` | `object[]` | Styled ranges `{ start, end }` plus any of `fontFamily`, `fontSize`, `lineHeight`, `fontWeight`, `fontStyle`, `textDecorationLine`, `color`, `backgroundColor`. Sparse, ordered outermost-first so the innermost wins. Colours are `processColor` integers. |
 | `decorations` | `object[]` | Block chrome `{ start, end, kind }` plus styling, from `resolveRunDecorations`. Geometric kinds, never moves a character. Older binaries ignore it. |
 | `pressables` | `object[]` | Tappable ranges `{ start, end, pressableId }`, non-overlapping. `[]` when no `onInlinePress` listener exists. Older binaries ignore it. |
+| `embeds` | `object[]` | Embedded ranges `{ start, end, embedId, width, height }`, each the single U+FFFC placeholder an `embed` claim projected (`end === start + 1`). The host reserves `width` × `height` points there — an `NSTextAttachment` on iOS, a `ReplacementSpan` on Android, both applied inside the shared string builder so measurement and drawing agree — and reports the rect through `onEmbedLayout`. The height also rides `attributes` as a `lineHeight` over the placeholder, never smaller than the covering attributes already give the line. Host guards: positive size, 1-unit range, the character really is U+FFFC; a stale entry reserves nothing. Layout-affecting, so sent whenever embeds exist, not gated on a listener. Older binaries ignore it: the placeholder is an invisible one-character gap (transparent colour via `attributes`), no overlay mounts, mapping stays exact. |
 | `selectable` | `boolean` | Whether platform selection UI is enabled. Driven by the tail policy. |
 | `selectionActions` | `string[]` | Ordered identifiers (`'copy-text'`, `'copy-markdown'`) for custom menu items. Default both. `[]` when no `onSelectionAction` listener exists. Unknown identifiers are ignored. |
 | `testID` | `string?` | Standard RN test handle. |
@@ -236,6 +251,52 @@ Host guarantees, both platforms:
 
 Version skew degrades both ways: an older binary never emits, an older JS
 sends no `pressables`.
+
+## Event: `onEmbedLayout`
+
+Fired per embed after layout, with the reserved rect in the host view's
+coordinate space, so JS can position the consumer's view over it. One event
+per embed with a scalar payload: an array-of-objects payload is not
+verifiably supported by codegen, and per-embed events avoid cross-id
+coalescing (`canCoalesce()` is `false`, like the other events; the dedupe
+lives in the host).
+
+```ts
+interface EmbedLayoutEvent {
+  embedId: number; // JS's identifier for the embed, echoed verbatim
+  x: number;       // reserved rect, host-view points
+  y: number;
+  width: number;
+  height: number;
+}
+```
+
+Host guarantees, both platforms:
+
+1. Rects come from the layout the host draws with: iOS
+   `glyphRange(forCharacterRange:)` + `boundingRect(forGlyphRange:in:)` on
+   the shared TextKit stack; Android the `TextView`'s own `Layout`, anchored
+   on the line top rather than the baseline.
+2. A rect is re-emitted only when it moved (> 0.5pt in any component), per
+   `embedId`. Streaming appends past a settled embed re-announce nothing.
+3. The range is one unit and the character is U+FFFC, verified before
+   reporting exactly as before reserving.
+4. `embedId` is echoed verbatim. JS bounds-checks it against the list it
+   sent and drops rects reported against a previous projection (ids are
+   per-projection ordinals).
+
+The host never learns what an embed is. JS keeps the node, the render
+function and the copy text; the host gets ranges, sizes and ids and hands
+back geometry — the `pressables` division of knowledge.
+
+The overlay is a **sibling** of the host, absolutely positioned by
+`SelectableMarkdown` inside a relatively positioned wrapper, never a child:
+the native component is a leaf on both platforms. So a card appears one
+frame after its run first lays out, into space that was reserved natively
+from the first frame — no reflow. While the run is the unsettled streaming
+tail no overlay mounts at all; the reservation still does, so the card
+appears without a reflow when the run settles. A long-press on the card
+starts no selection; the sweep starts on the prose around it.
 
 ## `handleSelectionAction`
 
@@ -341,6 +402,13 @@ event emitter (the host must not cache it). Android does the same in
 `ViewManager.prepareToRecycleView`, on top of the detach-time discipline
 (action mode finished, custom callback uninstalled).
 
+Embed state joins that guarantee: both hosts clear their per-embed
+rect-dedupe ledgers on recycle (and whenever `embeds` changes), because a
+host that considered the previous run's rects already reported would never
+re-report for the new one. JS is defensive independently: rects belong to
+the projection they were reported against, and an unknown `embedId` is
+dropped.
+
 Recycling is only reachable in a running app, so it is reviewed, not run.
 
 ## Tail policy (streaming)
@@ -363,7 +431,12 @@ as an empty-selection change, so it does not recurse.
 
 Code blocks, tables and rules flow through prose runs, so one gesture selects
 across them. A block is a separate scope only when a nested image or
-spoiler, or a `classifyBlock` claim, makes it standalone.
+spoiler, or a `classifyBlock` claim, makes it standalone. An `embed` claim
+runs the other way: it keeps a custom-rendered view *inside* the run (one
+placeholder character, reserved space, overlaid view), so a citation card no
+longer costs the sweep. Selecting across an embed is atomic — the
+placeholder is one character whose piece maps to the node's whole source
+span, so any sweep that covers the card copies the card's exact markdown.
 
 ### What a standalone block does and does not get
 
@@ -374,17 +447,19 @@ whose renderers set `selectable` themselves. Inside a run that prop is inert:
 a nested `<Text>` is `RCTVirtualText`, whose view config does not list
 `selectable`, so it cannot override the Android tail policy.
 
-| | Prose run | Standalone prose block | Code block (claimed) | Table (claimed) |
-| --- | --- | --- | --- | --- |
-| Selectable | yes | yes | yes | yes, per cell |
-| Own selection scope | yes | yes | yes | yes, per cell |
-| System Copy | yes | yes | yes | yes |
-| `selectionActions` / `onSelectionCopy` | yes | no | no | no |
+| | Prose run | Embedded node | Standalone prose block | Code block (claimed) | Table (claimed) |
+| --- | --- | --- | --- | --- | --- |
+| Selectable | yes | yes, atomically in its run | yes | yes | yes, per cell |
+| Own selection scope | yes | no, flows through its run | yes | yes | yes, per cell |
+| System Copy | yes | yes (yields U+FFFC for the card) | yes | yes | yes |
+| `selectionActions` / `onSelectionCopy` | yes | yes, via its run | no | no | no |
 
 "Copy Markdown" is a prose-run feature, which covers code blocks, tables and
-rules by default. Blocks that end up standalone copy their displayed text
-through the platform Copy. Routing standalone blocks through a host of their
-own is roadmap work.
+rules by default, and embedded views with them. Blocks that end up standalone
+copy their displayed text through the platform Copy. Routing standalone
+blocks through a host of their own is roadmap work. An `embed` claim is the
+middle way: the card keeps its own touches inside its own bounds while the
+run around and under it keeps selection.
 
 ## Sizing
 

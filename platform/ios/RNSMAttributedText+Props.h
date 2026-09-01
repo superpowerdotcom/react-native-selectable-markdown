@@ -66,6 +66,16 @@ NS_ASSUME_NONNULL_BEGIN
 + (NSArray<NSDictionary *> *)decorationsWithProps:
     (const facebook::react::SelectableRunHostProps &)props;
 
+/**
+ * The `embeds` prop decoded into the same dictionary wire the string builder
+ * consumes, one decoder for both of its consumers: the builder above (which
+ * attaches the reservation to each placeholder) and the Fabric component
+ * view, which hands the array to the Swift host for rect reporting through
+ * `onEmbedLayout`.
+ */
++ (NSArray<NSDictionary *> *)embedsWithProps:
+    (const facebook::react::SelectableRunHostProps &)props;
+
 @end
 
 NS_ASSUME_NONNULL_END

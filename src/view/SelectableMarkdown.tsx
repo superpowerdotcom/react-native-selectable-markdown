@@ -1,12 +1,4 @@
-import {
-  memo,
-  useCallback,
-  useEffect,
-  useMemo,
-  useReducer,
-  useRef,
-  useState,
-} from 'react';
+import { memo, useCallback, useEffect, useMemo, useReducer, useState } from 'react';
 import type { ReactNode } from 'react';
 import { View, useColorScheme } from 'react-native';
 import type { AnyNode, Block, ParsedDocument } from '../document/nodes';
@@ -16,16 +8,26 @@ import type { EngineOptions } from '../engine/options';
 import { projectRun } from '../selection/mapSelection';
 import type { ProjectedRun } from '../selection/mapSelection';
 import { segmentRuns } from '../selection/runs';
-import type { ClassifyBlock, RunSegment } from '../selection/runs';
+import type {
+  ClassifyBlock,
+  EmbedClaimContext,
+  EmbedContent,
+  RunSegment,
+} from '../selection/runs';
 import { trimTrailingPlaceholders } from '../stream/placeholders';
 import type { SessionSnapshot, StreamSession } from '../stream/StreamSession';
 import { RunHost } from './RunHost';
-import type { InlinePressEvent, SelectionActionEvent } from './RunHost';
+import type {
+  EmbedLayoutEvent,
+  InlinePressEvent,
+  SelectionActionEvent,
+} from './RunHost';
 import { openUrl, renderBlocks, resolveRenderers } from './renderers';
 import type { RenderContext, RendererMap, RendererOverrides } from './renderers';
 import { resolveRunAttributes } from './runAttributes';
 import type { MarkAttribute } from './runAttributes';
 import { resolveRunDecorations } from './runDecorations';
+import { resolveRunEmbeds } from './runEmbeds';
 import { resolveRunPressables } from './runPressables';
 import {
   DEFAULT_SELECTION_ACTIONS,
@@ -97,6 +99,37 @@ export interface SelectableMarkdownProps {
    * document is resegmented whenever it changes.
    */
   classifyBlock?: ClassifyBlock;
+  /**
+   * Claims nodes as EMBEDS: custom-rendered UIs that participate in
+   * cross-paragraph selection instead of ending the run the way a
+   * `classifyBlock: 'standalone'` claim does. A claimed node's block flows;
+   * the node projects as a single placeholder character mapped to its whole
+   * source span; the native host reserves the declared `width` × `height`
+   * at that character; and the returned `render` element is overlaid on the
+   * reserved space once the host reports where it landed. One selection
+   * gesture sweeps across the card; copying the sweep yields the node's
+   * exact markdown, and copy-text substitutes the declared `text`.
+   *
+   * Consulted for every node, blocks and inlines alike, BEFORE
+   * `classifyBlock` and before the built-in view-kind rules — so a claimed
+   * image or blocked link flows too. Return `undefined` to leave a node
+   * alone. Synthetic and still-streaming (`incomplete`) nodes are never
+   * embedded regardless of a claim, and while a run is the unsettled
+   * streaming tail its overlays are not mounted (the space is still
+   * reserved, so nothing reflows when they appear).
+   *
+   * Sizing is declared, not measured: `height` becomes the placeholder
+   * line's height through the attribute channel, which is what makes the
+   * measured run and the drawn run agree. A block-level embed (its own
+   * paragraph) may be any height; an inline embed must fit within its
+   * line's height on iOS — declare chips, not towers.
+   *
+   * Must be pure, deterministic, and referentially stable (module scope, or
+   * `useCallback`): the whole document is resegmented AND reprojected
+   * whenever the callback's identity changes, because a claim changes the
+   * projected text itself.
+   */
+  embed?: EmbedRenderer;
   /**
    * Which custom actions the platform selection menu offers, in order.
    * Default: both. The system Copy item always remains on both platforms.
@@ -171,6 +204,37 @@ export interface InlineLinkPress {
   end: number;
 }
 
+/**
+ * What an embed claim declares: the reservation (`EmbedContent`) plus the
+ * element overlaid on it. `render` receives the claimed node and the same
+ * `RenderContext` the block renderers get; it runs only in the view layer —
+ * segmentation and projection see the object purely as `EmbedContent`, which
+ * is what lets the `embed` prop double as the `EmbedLookup` threaded to
+ * `segmentRuns`/`projectRun` without a second callback to keep in sync.
+ */
+export interface EmbedSpec extends EmbedContent {
+  render: (node: AnyNode, ctx: RenderContext) => ReactNode;
+}
+
+/** The `embed` prop's shape. Structurally an `EmbedLookup` — every
+ * `EmbedSpec` is an `EmbedContent`. The context tells a claim whether the
+ * node is a direct child of the document (`topLevel`) — the one position a
+ * full-column-width reservation is safe in; see `EmbedClaimContext`. */
+export type EmbedRenderer = (
+  node: AnyNode,
+  context: EmbedClaimContext,
+) => EmbedSpec | undefined;
+
+/** One reported embed rect, in the run host's coordinate space. */
+interface EmbedRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+const NO_EMBED_RECTS: ReadonlyMap<number, EmbedRect> = new Map();
+
 const EMPTY_DOCUMENT: ParsedDocument = { source: '', blocks: [] };
 
 function useSessionSnapshot(session?: StreamSession): SessionSnapshot | null {
@@ -202,6 +266,7 @@ interface RunViewProps {
   onSelectionCopy?: (payload: SelectionCopyEvent) => void;
   onLinkPress?: (press: InlineLinkPress) => void;
   attributeForMark?: MarkAttribute;
+  embed?: EmbedRenderer;
 }
 
 function RunView(props: RunViewProps): ReactNode {
@@ -216,6 +281,7 @@ function RunView(props: RunViewProps): ReactNode {
     onSelectionCopy,
     onLinkPress,
     attributeForMark,
+    embed,
   } = props;
 
   const ctx: RenderContext = useMemo(
@@ -228,6 +294,9 @@ function RunView(props: RunViewProps): ReactNode {
   // the rest of the theme only styles it. A colour change must restyle
   // without reprojecting; a stale projection under new glyphs would corrupt
   // every attribute, decoration and pressable range built from it. The
+  // `embed` callback joins the key for the same reason: a claim replaces a
+  // node's projection with a placeholder character, so a different lookup is
+  // different projected text.
   const { bullet, taskChecked, taskUnchecked } = theme.glyphs;
   const projected = useMemo(
     () =>
@@ -235,8 +304,9 @@ function RunView(props: RunViewProps): ReactNode {
         ? null
         : projectRun(run, doc, {
             glyphs: { bullet, taskChecked, taskUnchecked },
+            embed,
           }),
-    [run, doc, bullet, taskChecked, taskUnchecked],
+    [run, doc, bullet, taskChecked, taskUnchecked, embed],
   );
 
   // Theme resolution for the native host. Memoized separately from the
@@ -265,6 +335,52 @@ function RunView(props: RunViewProps): ReactNode {
     [projected],
   );
 
+  // The run's embedded ranges, for the native host and the overlay below.
+  // Derived from the projection alone, like pressables.
+  const runEmbeds = useMemo(
+    () => (projected ? resolveRunEmbeds(projected) : undefined),
+    [projected],
+  );
+
+  // Reported rects, keyed by embedId and OWNED BY the projection they were
+  // reported against: embedIds are per-projection ordinals, so a rect that
+  // arrived for a previous projection must never position an overlay over
+  // the current one. Tying ownership to `projected`'s identity drops stale
+  // rects at read time, with no effect and no extra render on a swap.
+  const [embedRects, setEmbedRects] = useState<{
+    owner: ProjectedRun | null;
+    rects: ReadonlyMap<number, EmbedRect>;
+  }>({ owner: null, rects: NO_EMBED_RECTS });
+  const rects =
+    embedRects.owner === projected ? embedRects.rects : NO_EMBED_RECTS;
+
+  const onNativeEmbedLayout = useCallback(
+    (event: EmbedLayoutEvent) => {
+      // Bounds-check the id against the list this projection sent — the
+      // pressableId discipline: a report can race a prop swap by a frame.
+      if (
+        !projected?.embeds ||
+        !Number.isInteger(event.embedId) ||
+        event.embedId < 0 ||
+        event.embedId >= projected.embeds.length
+      ) {
+        return;
+      }
+      setEmbedRects((previous) => {
+        const rects = new Map(
+          previous.owner === projected ? previous.rects : NO_EMBED_RECTS,
+        );
+        rects.set(event.embedId, {
+          x: event.x,
+          y: event.y,
+          width: event.width,
+          height: event.height,
+        });
+        return { owner: projected, rects };
+      });
+    },
+    [projected],
+  );
 
   // The native half of link presses. `pressableId` is the index RunHost
   // assigned when it sent the ranges — which is the index into this same
@@ -316,12 +432,16 @@ function RunView(props: RunViewProps): ReactNode {
         // The same glyphs `projected` was built with, so the payload's
         // `plain` shows the markers the user saw on screen.
         glyphs: theme.glyphs,
+        // And the same embed lookup, for the same reason — `projected` is
+        // supplied so the fallback reprojection should never run, but if it
+        // ever does it must not run with different offsets.
+        embed,
       });
       if (payload) {
         onSelectionCopy(payload);
       }
     },
-    [onSelectionCopy, projected, doc, run, theme.glyphs],
+    [onSelectionCopy, projected, doc, run, theme.glyphs, embed],
   );
 
   if (run.standalone) {
@@ -330,19 +450,72 @@ function RunView(props: RunViewProps): ReactNode {
     );
   }
 
-  return (
+  const host = (
     <RunHost
       attributes={attributes}
       decorations={decorations}
+      embeds={runEmbeds}
+      onEmbedLayout={runEmbeds?.length ? onNativeEmbedLayout : undefined}
       onInlinePress={pressables?.length ? onNativeInlinePress : undefined}
       onSelectionAction={onSelectionCopy ? onNativeSelectionAction : undefined}
       pressables={pressables}
       selectable={run.selectable}
       selectionActions={selectionActions}
-      style={{ marginBottom: gap }}
+      style={runEmbeds?.length ? undefined : { marginBottom: gap }}
       text={projected?.text ?? ''}
       unsettledTail={unsettledTail}
     />
+  );
+
+  // Runs without embeds keep the exact structure they always had — no
+  // wrapper, margin on the host. A run WITH embeds gains a relatively
+  // positioned wrapper (the margin moves onto it, so layout is unchanged)
+  // holding one absolutely positioned overlay per embed whose rect the host
+  // has reported. The overlay is a SIBLING of the host, not a child: the
+  // native component is a leaf on both architectures and cannot mount React
+  // children. `pointerEvents="box-none"` keeps the positioning wrapper from
+  // swallowing touches around the card; the card itself owns its own area —
+  // which also means a long-press ON the card starts no selection, the
+  // documented trade for it being tappable.
+  //
+  // While the run is the unsettled streaming tail no overlay mounts at all:
+  // repair can rewrite the tail's text every tick, and a card sliding around
+  // over moving prose is the artifact this library exists to avoid. The
+  // reservation is native either way, so nothing reflows when the run
+  // settles and the card appears.
+  if (!runEmbeds?.length || !projected?.embeds) {
+    return host;
+  }
+  return (
+    <View style={{ position: 'relative', marginBottom: gap }}>
+      {host}
+      {!unsettledTail &&
+        projected.embeds.map((entry) => {
+          const rect = rects.get(entry.embedId);
+          if (!rect) {
+            return null;
+          }
+          const spec = entry.content as Partial<EmbedSpec>;
+          if (typeof spec.render !== 'function') {
+            return null;
+          }
+          return (
+            <View
+              key={`embed:${entry.embedId}`}
+              pointerEvents="box-none"
+              style={{
+                position: 'absolute',
+                left: rect.x,
+                top: rect.y,
+                width: rect.width,
+                height: rect.height,
+              }}
+            >
+              {spec.render(entry.node, ctx)}
+            </View>
+          );
+        })}
+    </View>
   );
 }
 
@@ -400,7 +573,8 @@ function runPropsEqual(prev: RunViewProps, next: RunViewProps): boolean {
     sameActionList(prev.selectionActions, next.selectionActions) &&
     prev.onSelectionCopy === next.onSelectionCopy &&
     prev.onLinkPress === next.onLinkPress &&
-    prev.attributeForMark === next.attributeForMark
+    prev.attributeForMark === next.attributeForMark &&
+    prev.embed === next.embed
   );
 }
 
@@ -416,6 +590,7 @@ export function SelectableMarkdown(props: SelectableMarkdownProps): ReactNode {
     colorScheme,
     renderers,
     classifyBlock,
+    embed,
     selectionActions,
     onSelectionCopy,
     onLinkPress,
@@ -474,8 +649,8 @@ export function SelectableMarkdown(props: SelectableMarkdownProps): ReactNode {
   }, [doc, streaming]);
 
   const runs = useMemo(
-    () => segmentRuns(visibleDoc, { settledUntil, classifyBlock }),
-    [visibleDoc, settledUntil, classifyBlock],
+    () => segmentRuns(visibleDoc, { settledUntil, classifyBlock, embed }),
+    [visibleDoc, settledUntil, classifyBlock, embed],
   );
 
   // The gap below a PROSE run that abuts another PROSE run is the height of
@@ -507,6 +682,7 @@ export function SelectableMarkdown(props: SelectableMarkdownProps): ReactNode {
           <MemoRunView
             attributeForMark={attributeForMark}
             doc={visibleDoc}
+            embed={embed}
             gap={gap}
             key={`run:${run.span.start}`}
             onLinkPress={onLinkPress}

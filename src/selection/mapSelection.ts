@@ -1,11 +1,38 @@
 import type { AnyNode, Block, Inline, ParsedDocument } from '../document/nodes';
 import type { SourceSpan } from '../document/span';
-import type { RunSegment } from './runs';
+import type { EmbedContent, EmbedLookup, RunSegment } from './runs';
+import { embedContentFor } from './runs';
 
 export interface ProjectedRun {
   text: string;
   pieces: RunPiece[];
   marks: RunMark[];
+  /**
+   * The run's embedded nodes, in placeholder order (which is also `embedId`
+   * order — the id is the index into this array). Present only when the run
+   * was projected with an `embed` lookup that claimed something, so every
+   * projection without embeds keeps its exact previous shape.
+   */
+  embeds?: ProjectedRunEmbed[];
+}
+
+/**
+ * One embedded node as the projection recorded it: where its placeholder
+ * sits, which node it stands for, and the content the lookup declared —
+ * captured at projection time, so the lookup is consulted exactly once per
+ * node and everything downstream (attributes, the wire prop, copy-text
+ * substitution) reads the same values.
+ */
+export interface ProjectedRunEmbed {
+  /** The index of this entry — carried explicitly so a consumer holding one
+   * entry can still say which `embedId` it is. */
+  embedId: number;
+  /** UTF-16 offsets of the placeholder into `ProjectedRun.text`;
+   * `end === start + 1` always (one U+FFFC). */
+  start: number;
+  end: number;
+  node: AnyNode;
+  content: EmbedContent;
 }
 
 export interface RunPiece {
@@ -54,6 +81,10 @@ export interface RunMark {
    * how it looks or whether tapping it does anything.
    */
   href?: string;
+  /** The embed's identifier when `kind` is 'embed' — its index into
+   * `ProjectedRun.embeds`. Absent otherwise, same absent-not-undefined rule
+   * as `level` and `href`. */
+  embedId?: number;
 }
 
 export type MarkKind =
@@ -129,7 +160,23 @@ export type MarkKind =
    */
   | 'listMarker'
   | 'math'
-  | 'html';
+  | 'html'
+  /**
+   * An embedded node (`EmbedLookup` claimed it): exactly ONE character of
+   * projected text — the U+FFFC placeholder — whose piece maps to the node's
+   * whole source span as an indivisible unit. THE ONE MARK WHOSE TEXT IS A
+   * PLACEHOLDER, NOT PROSE: the character exists so the run has something to
+   * select and the host has somewhere to reserve the embed's space; the view
+   * overlays the consumer's element on top, and copy-text substitutes the
+   * declared `EmbedContent.text` for it. Carries `embedId`.
+   */
+  | 'embed';
+
+/** The placeholder an embedded node projects: U+FFFC OBJECT REPLACEMENT
+ * CHARACTER — the character both platforms' text systems already use to
+ * stand for an inline attachment. Exported for consumers that post-process
+ * projected or copied text themselves. */
+export const EMBED_PLACEHOLDER = '￼';
 
 // Deterministic display glyphs and separators. These are part of the
 // projection contract: the native host renders exactly this text, and
@@ -210,6 +257,16 @@ export interface ProjectRunOptions {
    * glyphs corrupts every downstream offset.
    */
   glyphs?: Partial<ProjectionGlyphs>;
+  /**
+   * The embed lookup the run was segmented with. IT JOINS THE PROJECTION KEY
+   * EXACTLY AS GLYPHS DO: a claim replaces a node's whole projection with one
+   * placeholder character, so projecting the same run with a different lookup
+   * (or none) moves every offset after the first claimed node. Anything that
+   * caches a `ProjectedRun` must key on this callback's identity, and every
+   * reprojection of the same run — including the fallback projection inside
+   * `handleSelectionAction` — must be handed the same lookup.
+   */
+  embed?: EmbedLookup;
 }
 
 /**
@@ -239,12 +296,14 @@ export function projectRun(
         ),
       }
     : DEFAULT_GLYPHS;
-  const projector = new RunProjector(doc.source, glyphs);
+  const projector = new RunProjector(doc.source, glyphs, options?.embed);
   run.blocks.forEach((block, index) => {
     if (index > 0) {
       projector.emit(BLOCK_SEPARATOR, null);
     }
-    projector.block(block);
+    // `run.blocks` are direct children of the document — the only calls that
+    // offer the embed lookup a top-level claim.
+    projector.block(block, true);
   });
   return projector.finish();
 }
@@ -253,6 +312,13 @@ class RunProjector {
   private text = '';
   private readonly pieces: RunPiece[] = [];
   private readonly marks: RunMark[] = [];
+  private readonly embeds: ProjectedRunEmbed[] = [];
+  /** The piece the last embed pushed, so `emit`'s linear merge can refuse to
+   * grow it: an embed's piece is atomic BY CONTRACT, not by the length
+   * inequality that usually keeps a piece indivisible — a claimed node whose
+   * source span is exactly one code unit would otherwise read as linear and
+   * merge into adjacent prose. */
+  private embedPiece: RunPiece | null = null;
   /** Current list nesting depth while emitting (0 = not inside a list).
    * Carried onto each 'listItem' mark as its `level`. */
   private listDepth = 0;
@@ -260,6 +326,7 @@ class RunProjector {
   constructor(
     private readonly source: string,
     private readonly glyphs: ProjectionGlyphs,
+    private readonly embedLookup?: EmbedLookup,
   ) {}
 
   finish(): ProjectedRun {
@@ -269,7 +336,48 @@ class RunProjector {
     const marks = this.marks
       .slice()
       .sort((a, b) => a.start - b.start || b.end - a.end);
-    return { text: this.text, pieces: this.pieces, marks };
+    const projected: ProjectedRun = { text: this.text, pieces: this.pieces, marks };
+    // Optional and absent when empty, so a projection without embeds keeps
+    // its exact previous shape (marks and pieces are deep-compared in tests
+    // and serialized in debugging output).
+    if (this.embeds.length > 0) {
+      projected.embeds = this.embeds;
+    }
+    return projected;
+  }
+
+  /**
+   * Projects a claimed node as one U+FFFC placeholder and returns true, or
+   * returns false to let normal projection proceed. The gate is
+   * `embedContentFor` — the same call segmentation makes, so the two cannot
+   * disagree about a claim — plus a real span for the placeholder to map to.
+   *
+   * The piece is pushed DIRECTLY, not through `emit`: an embed's piece must
+   * be exactly one piece covering exactly the placeholder, never merged into
+   * a neighbour, because `mapSelectionToSource` treats it as an indivisible
+   * unit (display length ≠ source length) — that is what makes a sweep
+   * across the card yield the node's whole markdown. The mark is pushed
+   * directly too: `marked()` exists for ranges a body emits, and this range
+   * is known outright.
+   */
+  private tryEmbed(node: AnyNode, topLevel = false): boolean {
+    const content = embedContentFor(node, this.embedLookup, topLevel);
+    if (content === undefined) {
+      return false;
+    }
+    const span = this.realSpan(node);
+    if (span === null) {
+      return false;
+    }
+    const start = this.text.length;
+    this.text += EMBED_PLACEHOLDER;
+    const piece: RunPiece = { textStart: start, textEnd: this.text.length, source: span };
+    this.pieces.push(piece);
+    this.embedPiece = piece;
+    const embedId = this.embeds.length;
+    this.marks.push({ kind: 'embed', start, end: this.text.length, embedId });
+    this.embeds.push({ embedId, start, end: this.text.length, node, content });
+    return true;
   }
 
   /**
@@ -300,7 +408,7 @@ class RunProjector {
     const textStart = this.text.length;
     this.text += chunk;
     const last = this.pieces[this.pieces.length - 1];
-    if (last) {
+    if (last && last !== this.embedPiece) {
       if (last.source === null && source === null) {
         last.textEnd = this.text.length;
         return;
@@ -322,7 +430,10 @@ class RunProjector {
     this.pieces.push({ textStart, textEnd: this.text.length, source });
   }
 
-  block(node: Block): void {
+  block(node: Block, topLevel = false): void {
+    if (this.tryEmbed(node, topLevel)) {
+      return;
+    }
     switch (node.kind) {
       case 'paragraph':
         this.inlines(node.children);
@@ -452,6 +563,9 @@ class RunProjector {
   }
 
   private inline(node: Inline): void {
+    if (this.tryEmbed(node)) {
+      return;
+    }
     switch (node.kind) {
       case 'text':
         this.literal(node, node.value);

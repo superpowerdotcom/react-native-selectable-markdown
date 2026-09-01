@@ -8,9 +8,23 @@ import {
 import type { NativeSyntheticEvent, StyleProp, ViewStyle } from 'react-native';
 import type { RunTextAttribute } from './runAttributes';
 import type { RunDecoration } from './runDecorations';
+import type { RunEmbed } from './runEmbeds';
 import type { RunPressable } from './runPressables';
 import { DEFAULT_SELECTION_ACTIONS } from './selectionActions';
 import type { SelectionAction } from './selectionActions';
+
+export interface EmbedLayoutEvent {
+  /** The identifier `RunHost` sent with the range: its index into the
+   * `embeds` prop as passed, echoed back verbatim by the host. Handlers must
+   * bounds-check it — a report can race a prop swap by a frame, exactly like
+   * `pressableId`. */
+  embedId: number;
+  /** The reserved rect in the host view's coordinate space, points. */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
 
 export interface InlinePressEvent {
   /** The pressed range, UTF-16 offsets into the run's projected display
@@ -85,6 +99,22 @@ interface NativePressableRange {
   pressableId: number;
 }
 
+/**
+ * `RunEmbed` with the JS-only fields stripped — the wire shape of the
+ * `embeds` prop. The host reserves the rect and echoes the id through
+ * `onEmbedLayout`; the node and the copy text never cross the bridge, same
+ * division of knowledge as `pressables` and its hrefs.
+ */
+interface NativeRunEmbedRange {
+  /** UTF-16 offsets into `text`, end-exclusive; end === start + 1. */
+  start: number;
+  end: number;
+  /** Index into the `embeds` prop this component was given. */
+  embedId: number;
+  width: number;
+  height: number;
+}
+
 interface NativeRunHostProps {
   text: string;
   /**
@@ -101,10 +131,18 @@ interface NativeRunHostProps {
    */
   decorations: readonly NativeRunDecoration[];
   pressables: readonly NativePressableRange[];
+  /**
+   * Embedded ranges over `text`. Unlike `pressables` this channel is
+   * LAYOUT-AFFECTING — the reservation moves where glyphs sit and how tall
+   * the run measures — so it is always sent when embeds exist, not gated on
+   * an event listener.
+   */
+  embeds: readonly NativeRunEmbedRange[];
   selectable: boolean;
   selectionActions: readonly SelectionAction[];
   onSelectionAction?: (e: NativeSyntheticEvent<SelectionActionEvent>) => void;
   onInlinePress?: (e: NativeSyntheticEvent<InlinePressEvent>) => void;
+  onEmbedLayout?: (e: NativeSyntheticEvent<EmbedLayoutEvent>) => void;
   style?: StyleProp<ViewStyle>;
   testID?: string;
 }
@@ -127,6 +165,10 @@ const NO_DECORATIONS: readonly never[] = Object.freeze([]);
  * `never[]` so the one frozen array serves both the `RunPressable` prop
  * default and the `NativePressableRange` wire value. */
 const NO_PRESSABLES: readonly never[] = Object.freeze([]);
+
+/** Shared empty embed list; `never[]` for the same double duty as
+ * NO_PRESSABLES. */
+const NO_EMBEDS: readonly never[] = Object.freeze([]);
 
 /**
  * `processColor` results, keyed by the colour string that produced them.
@@ -323,6 +365,16 @@ export interface RunHostProps {
    * so the host never intercepts a tap it has nothing to do with.
    */
   pressables?: readonly RunPressable[];
+  /**
+   * Embedded ranges over `text` for the native host, from
+   * `resolveRunEmbeds`. Layout-affecting (the host reserves each embed's
+   * declared rect at its placeholder character), so the list is sent
+   * whenever it is non-empty — presence does not depend on an
+   * `onEmbedLayout` listener, though without one no overlay can ever be
+   * positioned. A binary that predates the prop ignores it and the
+   * placeholder renders as an invisible gap (see the codegen spec).
+   */
+  embeds?: readonly RunEmbed[];
   selectable: boolean;
   /**
    * Which custom items the platform selection menu offers, in order.
@@ -341,6 +393,13 @@ export interface RunHostProps {
    * press through their own `<Text onPress>`.
    */
   onInlinePress?: (e: InlinePressEvent) => void;
+  /**
+   * Fired by the native host, per embed, after layout with the reserved
+   * rect (re-fired only when the rect moved). `embedId` is the range's index
+   * into `embeds`, which is how the caller gets back to the node and render
+   * function it kept: only offsets and sizes cross the bridge.
+   */
+  onEmbedLayout?: (e: EmbedLayoutEvent) => void;
   /**
    * View-level style for the run's box — margins, padding, background.
    *
@@ -382,11 +441,13 @@ export function RunHost(props: RunHostProps): ReactNode {
     attributes = NO_ATTRIBUTES,
     decorations = NO_DECORATIONS,
     pressables = NO_PRESSABLES,
+    embeds = NO_EMBEDS,
     selectable,
     selectionActions = DEFAULT_SELECTION_ACTIONS,
     unsettledTail = false,
     onSelectionAction,
     onInlinePress,
+    onEmbedLayout,
     style,
     testID,
   } = props;
@@ -431,6 +492,21 @@ export function RunHost(props: RunHostProps): ReactNode {
     [pressables],
   );
 
+  // The node and copy text are dropped here the way pressables drop the
+  // href: the host gets ranges, sizes and ids, nothing else. Memoized like
+  // the rest — the array is re-sent on every streamed snapshot.
+  const nativeEmbeds = useMemo<readonly NativeRunEmbedRange[]>(
+    () =>
+      embeds.map((embed) => ({
+        start: embed.start,
+        end: embed.end,
+        embedId: embed.embedId,
+        width: embed.width,
+        height: embed.height,
+      })),
+    [embeds],
+  );
+
   const Native = loadNativeHost();
   if (!Native) {
     // THERE IS NO FALLBACK, DELIBERATELY, AND IT THROWS RATHER THAN RENDERING
@@ -467,6 +543,13 @@ export function RunHost(props: RunHostProps): ReactNode {
     <Native
       attributes={nativeAttributes}
       decorations={nativeDecorations}
+      // Always sent, unlike pressables: the reservation is layout-affecting,
+      // so gating it on the listener would make the run measure differently
+      // depending on whether anyone positions overlays.
+      embeds={nativeEmbeds}
+      onEmbedLayout={
+        onEmbedLayout ? (event) => onEmbedLayout(event.nativeEvent) : undefined
+      }
       onInlinePress={
         onInlinePress ? (event) => onInlinePress(event.nativeEvent) : undefined
       }

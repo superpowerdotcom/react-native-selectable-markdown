@@ -45,7 +45,7 @@ import { buildCopyPayload } from '../../src/selection/copy';
 import { mapSelectionToSource, projectRun } from '../../src/selection/mapSelection';
 import type { ProjectedRun } from '../../src/selection/mapSelection';
 import { segmentRuns } from '../../src/selection/runs';
-import type { RunSegment } from '../../src/selection/runs';
+import type { EmbedLookup, RunSegment } from '../../src/selection/runs';
 
 const FIXTURE_DIR = path.resolve(__dirname, '..', 'fixtures');
 const SPEC_PATH = path.resolve(__dirname, '..', 'vendor', 'spec.json');
@@ -272,4 +272,139 @@ describeNative('projection oracle: no soft break projects a newline', () => {
       expect(checked).toBeGreaterThan(100);
     },
   );
+});
+
+/**
+ * THE EMBED SWEEP: the same three invariants the main oracle holds — piece
+ * tiling, in-bounds mapping, copy-slice identity — re-asserted over the
+ * corpus reprojected with a synthetic embed claim on every link. An embed
+ * replaces a whole subtree's projection with one U+FFFC placeholder mapped
+ * non-linearly to the node's span, which is exactly the kind of change the
+ * hand-built fixtures cannot stress: the corpus holds links inside emphasis,
+ * headings, list items, tables, blockquotes — the nestings nobody thinks to
+ * write down, and the ones where a mis-tiled placeholder piece or a hull that
+ * leaks past the node's span would actually hide.
+ *
+ * Links are the claim target because they are the construct the feature
+ * exists for (citation cards) and the corpus is full of them in every
+ * position. The oracle's own three tests keep running with NO claim, so this
+ * block is purely additive.
+ */
+describeNative.each([
+  ['llmChat', presets.llmChat],
+  ['everything', presets.everything],
+] as [string, EngineOptions][])('projection oracle: embeds (%s)', (_name, baseOptions) => {
+  // `blockedLinks: 'node'` is the configuration the feature exists for (the
+  // README's citation story), and it is also what makes this sweep dense:
+  // most corpus links carry relative or exotic hrefs the default URL policy
+  // strips at parse time — under the plain presets only a handful of link
+  // NODES exist to claim. Keeping them as blocked nodes turns nearly every
+  // corpus link into an embed.
+  const options: EngineOptions = {
+    ...baseOptions,
+    urlPolicy: { ...baseOptions.urlPolicy, blockedLinks: 'node' },
+  };
+  const claimLinks: EmbedLookup = (node) =>
+    node.kind === 'link' ? { width: 160, height: 48, text: '[ref]' } : undefined;
+
+  function embedRuns(
+    doc: ParsedDocument,
+  ): { run: RunSegment; projected: ProjectedRun }[] {
+    return segmentRuns(doc, { embed: claimLinks })
+      .filter((run) => !run.standalone)
+      .map((run) => ({ run, projected: projectRun(run, doc, { embed: claimLinks }) }));
+  }
+
+  it('embed-bearing runs keep tiling, and every embed owns one placeholder piece', () => {
+    let embeds = 0;
+    for (const { label, source } of corpus) {
+      const doc = parseDocument(source, options);
+      for (const { projected } of embedRuns(doc)) {
+        let cursor = 0;
+        for (const piece of projected.pieces) {
+          if (piece.textStart !== cursor || piece.textEnd <= piece.textStart) {
+            throw new Error(
+              `${label}: embed piece table does not tile — expected the next piece ` +
+                `to start at ${cursor}, got ${JSON.stringify(piece)}`,
+            );
+          }
+          cursor = piece.textEnd;
+        }
+        if (cursor !== projected.text.length) {
+          throw new Error(
+            `${label}: embed piece table covers ${cursor} of ${projected.text.length}`,
+          );
+        }
+        for (const embed of projected.embeds ?? []) {
+          embeds++;
+          if (embed.end !== embed.start + 1) {
+            throw new Error(`${label}: embed range is not one character`);
+          }
+          if (projected.text[embed.start] !== '￼') {
+            throw new Error(
+              `${label}: embed placeholder at ${embed.start} is ` +
+                `${JSON.stringify(projected.text[embed.start])}, not U+FFFC`,
+            );
+          }
+          const piece = projected.pieces.find(
+            (candidate) => candidate.textStart === embed.start,
+          );
+          if (
+            !piece ||
+            piece.textEnd !== embed.end ||
+            piece.source === null ||
+            piece.source.start !== embed.node.span.start ||
+            piece.source.end > doc.source.length
+          ) {
+            throw new Error(
+              `${label}: embed at ${embed.start} does not own one piece over its ` +
+                `node span — got ${JSON.stringify(piece)}`,
+            );
+          }
+          const mark = projected.marks.find(
+            (candidate) =>
+              candidate.kind === 'embed' && candidate.start === embed.start,
+          );
+          if (!mark || mark.embedId !== embed.embedId) {
+            throw new Error(`${label}: embed at ${embed.start} has no matching mark`);
+          }
+        }
+      }
+    }
+    // Vacuity guard: the corpus really does hold links in prose runs.
+    expect(embeds).toBeGreaterThan(100);
+  });
+
+  it('selections over embed-bearing runs map in bounds and copy the exact slice', () => {
+    let mapped = 0;
+    for (const { label, source } of corpus) {
+      const doc = parseDocument(source, options);
+      for (const { projected } of embedRuns(doc)) {
+        if (!projected.embeds) continue;
+        const offsets = selectionOffsets(projected.text.length);
+        for (const start of offsets) {
+          for (const end of offsets) {
+            if (end <= start) continue;
+            const span = mapSelectionToSource(projected, { start, end });
+            if (span === null) continue;
+            mapped++;
+            if (span.start < 0 || span.end > doc.source.length || span.start >= span.end) {
+              throw new Error(
+                `${label}: embed selection [${start},${end}) mapped out of bounds: ` +
+                  JSON.stringify(span),
+              );
+            }
+            const payload = buildCopyPayload(doc, span, { options });
+            if (payload.markdown !== doc.source.slice(span.start, span.end)) {
+              throw new Error(
+                `${label}: embed copy payload is not the source slice for ` +
+                  JSON.stringify(span),
+              );
+            }
+          }
+        }
+      }
+    }
+    expect(mapped).toBeGreaterThan(5_000);
+  });
 });

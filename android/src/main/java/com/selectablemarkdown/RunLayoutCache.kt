@@ -27,8 +27,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * THE KEY CAPTURES EVERYTHING THE BUILD READS, and that list is load-bearing:
  *
- *  - `text` and the two spec lists — the inputs `RunAttributedText.build`
- *    styles. `Attribute` and `Decoration` are data classes, so
+ *  - `text` and the three spec lists — the inputs `RunAttributedText.build`
+ *    styles. `Attribute`, `Decoration` and `Embed` are data classes, so
  *    `List.equals` is a deep value comparison and no equals/hashCode had to
  *    be added to the `Spec` wrappers (the key holds the lists, not the
  *    wrappers).
@@ -98,11 +98,16 @@ internal object RunLayoutCache {
      * `localeTag` is in the key because the paint's `textLocale` (set in
      * `configurePaint` from `Locale.getDefault()`) moves line-break and
      * metric decisions for CJK scripts: a locale change with an unchanged
-     * key would serve a layout measured under the previous locale. */
+     * key would serve a layout measured under the previous locale.
+     * `embeds` is in the key because `build` bakes each reservation into a
+     * `RunEmbedSpan`: an embed whose declared size changed under unchanged
+     * text would otherwise be served the previous size's spannable for as
+     * long as the LRU kept it. */
     internal data class Key(
         val text: String,
         val attributes: List<RunAttributedText.Attribute>,
         val decorations: List<RunDecorations.Decoration>,
+        val embeds: List<RunEmbeds.Embed>,
         val density: Float,
         val scaledDensity: Float,
         val localeTag: String,
@@ -225,12 +230,14 @@ internal object RunLayoutCache {
         text: String,
         attributes: RunAttributedText.Spec,
         decorations: RunDecorations.Spec,
+        embeds: RunEmbeds.Spec,
     ): Key {
         val metrics = DisplayMetricsHolder.getWindowDisplayMetrics()
         return Key(
             text,
             attributes.attributes,
             decorations.decorations,
+            embeds.embeds,
             metrics.density,
             metrics.scaledDensity,
             Locale.getDefault().toLanguageTag(),
@@ -293,6 +300,7 @@ internal object RunLayoutCache {
                 key.text,
                 RunAttributedText.Spec(key.attributes),
                 RunDecorations.Spec(key.decorations),
+                RunEmbeds.Spec(key.embeds),
             )
         }
         synchronized(spannables) { spannables[key] }?.let { return it }
@@ -300,6 +308,7 @@ internal object RunLayoutCache {
             key.text,
             RunAttributedText.Spec(key.attributes),
             RunDecorations.Spec(key.decorations),
+            RunEmbeds.Spec(key.embeds),
         )
         // Built under inputs that no longer match the key (metrics or locale
         // moved mid-build): hand it back uncached rather than poison the map.

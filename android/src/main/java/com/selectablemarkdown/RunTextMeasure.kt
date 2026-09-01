@@ -238,6 +238,7 @@ internal object RunTextMeasure {
         text: String,
         spec: RunAttributedText.Spec,
         decorations: RunDecorations.Spec,
+        embeds: RunEmbeds.Spec,
         width: Float,
         widthMode: YogaMeasureMode,
         height: Float,
@@ -256,7 +257,7 @@ internal object RunTextMeasure {
         // on every prop batch — arrive here with identical inputs and
         // identical constraints, and the second lookup turns that whole case
         // into a map get.
-        val key = RunLayoutCache.key(text, spec, decorations)
+        val key = RunLayoutCache.key(text, spec, decorations, embeds)
         RunLayoutCache.measurement(key, width, widthMode, height, heightMode)?.let { return it }
 
         val paint = checkNotNull(scratchPaint.get())

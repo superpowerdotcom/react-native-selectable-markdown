@@ -116,7 +116,14 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
     private var pendingText: String = ""
     private var pendingAttributes: RunAttributedText.Spec = RunAttributedText.Spec.EMPTY
     private var pendingDecorations: RunDecorations.Spec = RunDecorations.Spec.EMPTY
+    private var pendingEmbeds: RunEmbeds.Spec = RunEmbeds.Spec.EMPTY
     private var textDirty = false
+
+    /** Last rect reported per embedId, in dp — the dedupe that keeps
+     * streaming appends past a settled embed from re-announcing it on every
+     * snapshot. Values only ever compared against the next report. */
+    private val lastEmbedRects = HashMap<Int, android.graphics.RectF>()
+
     /** Reused per draw pass; a run redraws on every scroll frame under a
      * selection, and allocating in onDraw is the canonical Android jank. */
     private val decorationPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
@@ -296,6 +303,22 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         invalidate()
     }
 
+    /**
+     * Guarded by value like `setAttributes` (same Fabric re-delivery
+     * reason), and layout-affecting like `setDecorations`: each reservation
+     * is a ReplacementSpan in the styled string, so a changed list must
+     * rebuild the text. The rect dedupe map is cleared on a real change
+     * because embedIds are per-list ordinals — id 0 of the new list is not
+     * id 0 of the old one, and a stale "already reported" entry would
+     * swallow the first report the new list deserves.
+     */
+    fun setEmbeds(spec: RunEmbeds.Spec) {
+        if (spec.embeds == pendingEmbeds.embeds) return
+        pendingEmbeds = spec
+        lastEmbedRects.clear()
+        textDirty = true
+    }
+
     /** Applied once per prop batch, from the view manager. */
     fun commitProps() {
         if (!textDirty) return
@@ -327,12 +350,20 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         // value from the same two props (RunTextMeasure.baseTextSizeSp).
         RunTextMeasure.updateTextViewBaseSize(textView, pendingText, pendingAttributes)
         textView.text = RunLayoutCache.styledText(
-            RunLayoutCache.key(pendingText, pendingAttributes, pendingDecorations)
+            RunLayoutCache.key(pendingText, pendingAttributes, pendingDecorations, pendingEmbeds)
         )
         // The chrome is positioned off the text layout, so this ViewGroup's
         // own display list is stale the moment the text moves — and a child
         // invalidation alone does not rebuild the parent's.
         invalidate()
+        // Embed rects are read off the TextView's Layout, which does not
+        // exist until the layout pass the setText above requested. onLayout
+        // is the primary report point; the post is the belt for commits the
+        // framework decides not to relayout (the dedupe map makes a double
+        // report free).
+        if (pendingEmbeds.embeds.isNotEmpty()) {
+            post { reportEmbedRects() }
+        }
     }
 
     fun setSelectable(value: Boolean) {
@@ -471,6 +502,98 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
                 pressable.id,
             )
         )
+    }
+
+    // ---- Embed rect reporting ------------------------------------------------
+
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        super.onLayout(changed, left, top, right, bottom)
+        // The primary report point: by the time a FrameLayout's own onLayout
+        // runs, the child TextView has been measured and laid out, so its
+        // internal Layout — the geometry source below — exists and is
+        // current. commitProps posts a second call for commits the framework
+        // decides need no relayout; the dedupe map makes the overlap free.
+        reportEmbedRects()
+    }
+
+    /**
+     * Reports where each embed's reserved space landed, in this host's
+     * coordinate space, dp, through `onEmbedLayout`. Re-fired only when a
+     * rect actually moved (> 0.5dp on any edge) — streaming appends past a
+     * settled embed recommit the view constantly, and a settled embed's
+     * geometry never moves (a settled run only ever grows at its end), so
+     * without the dedupe JS would be re-told the same rect every snapshot.
+     *
+     * GEOMETRY IS ANCHORED ON THE LINE, NOT THE BASELINE. The reservation is
+     * ascent-shaped in `RunEmbedSpan`, but the final line extents belong to
+     * the embed-height `RunLineHeightSpan` JS sends over the same character,
+     * and its surplus branch re-centres the extra room around the baseline —
+     * so `getLineBaseline - height` can point above the line's top. The top
+     * of the placeholder's line IS the top of the reserved band, whatever
+     * the baseline did.
+     *
+     * The horizontal edge takes the smaller of the two `getPrimaryHorizontal`
+     * answers: in an RTL paragraph the placeholder's leading edge is its
+     * RIGHT edge, and the overlay is positioned by physical left.
+     */
+    private fun reportEmbedRects() {
+        val embeds = pendingEmbeds.embeds
+        if (embeds.isEmpty()) return
+        val layout = textView.layout ?: return
+        val text = textView.text ?: return
+        val length = text.length
+
+        val reactContext = context as ReactContext
+        val dispatcher =
+            UIManagerHelper.getEventDispatcherForReactTag(reactContext, id) ?: return
+        val surfaceId = UIManagerHelper.getSurfaceId(this)
+
+        val textLeft = (textView.left + textView.totalPaddingLeft - textView.scrollX).toFloat()
+        val textTop = (textView.top + textView.totalPaddingTop - textView.scrollY).toFloat()
+
+        for (embed in embeds) {
+            // The same guards `RunEmbeds.applySpans` applied to the string:
+            // an entry that reserved nothing must report nothing.
+            if (embed.start >= length || embed.end > length) continue
+            if (text[embed.start] != RunEmbeds.PLACEHOLDER) continue
+
+            val line = layout.getLineForOffset(embed.start)
+            val xPx = textLeft + minOf(
+                layout.getPrimaryHorizontal(embed.start),
+                layout.getPrimaryHorizontal(embed.end),
+            )
+            val yPx = textTop + layout.getLineTop(line)
+
+            val x = PixelUtil.toDIPFromPixel(xPx)
+            val y = PixelUtil.toDIPFromPixel(yPx)
+            // Size is the declared reservation, echoed back in the unit it
+            // arrived in rather than round-tripped through pixels: the span
+            // reserved exactly this box, and JS positions an overlay it
+            // already knows the size of.
+            val rect = android.graphics.RectF(x, y, x + embed.widthDp, y + embed.heightDp)
+            val last = lastEmbedRects[embed.embedId]
+            if (last != null &&
+                kotlin.math.abs(last.left - rect.left) <= 0.5f &&
+                kotlin.math.abs(last.top - rect.top) <= 0.5f &&
+                kotlin.math.abs(last.right - rect.right) <= 0.5f &&
+                kotlin.math.abs(last.bottom - rect.bottom) <= 0.5f
+            ) {
+                continue
+            }
+            lastEmbedRects[embed.embedId] = rect
+
+            dispatcher.dispatchEvent(
+                EmbedLayoutEvent(
+                    surfaceId,
+                    id,
+                    embed.embedId,
+                    x,
+                    y,
+                    embed.widthDp,
+                    embed.heightDp,
+                )
+            )
+        }
     }
 
     // ---- Decorations ---------------------------------------------------------
@@ -667,6 +790,12 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         pendingText = ""
         pendingAttributes = RunAttributedText.Spec.EMPTY
         pendingDecorations = RunDecorations.Spec.EMPTY
+        // Embeds and their report ledger go together: a recycled host that
+        // kept either could report the PREVIOUS run's rects against the next
+        // run's embedIds — the embed cousin of the stale-selection failure
+        // this method exists to prevent.
+        pendingEmbeds = RunEmbeds.Spec.EMPTY
+        lastEmbedRects.clear()
         textDirty = false
         selectionActions = listOf(ACTION_COPY_TEXT, ACTION_COPY_MARKDOWN)
         // A fresh host has no tappable ranges; a recycled one keeping the

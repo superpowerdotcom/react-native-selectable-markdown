@@ -34,7 +34,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 /**
  * Builds the rendered string from the projected run text plus JS's styled
- * ranges and block decorations.
+ * ranges, block decorations and embed reservations.
  *
  * THE ONE BUILDER, AND THE ONLY ENTRY POINT. There used to be two-, three-
  * and four-argument overloads that filled the trailing arguments with nil
@@ -70,13 +70,36 @@ NS_ASSUME_NONNULL_BEGIN
  * All of it moves where glyphs sit and never which glyphs exist, so the
  * UTF-16 offset contract is untouched.
  *
- * Malformed entries in either array are skipped rather than
+ * `embeds` is an array of dictionaries with `start`/`end` (always a 1-unit
+ * range over a U+FFFC placeholder the projection emitted), `embedId`,
+ * `width`, `height`. Each valid entry attaches an invisible NSTextAttachment
+ * sized `width` x `height` to the placeholder character, which is how the
+ * reservation reaches layout — and because this builder is shared, how it
+ * reaches measurement identically.
+ *
+ * ATTRIBUTE-ONLY, ZERO INSERTION. The attachment is added with
+ * `addAttribute:` to a character JS already put in the text; nothing here
+ * ever calls `attributedStringWithAttachment:`, which would insert a second
+ * U+FFFC and break the offset contract at the top of this header. An entry
+ * whose range is not exactly one U+FFFC character — prop skew, a stale
+ * offset — degrades to "no reservation", never to attaching over a real
+ * character.
+ *
+ * The reservation's HEIGHT is honoured only because JS also sends a
+ * `lineHeight` attribute equal to `height` over the same character: the
+ * line-height pass pins min = max, so without it the attachment would be
+ * clamped into the body leading (see the lineHeight comment in the .mm).
+ * The two travel in one prop batch, derived from one `EmbedContent`, so
+ * they cannot disagree.
+ *
+ * Malformed entries in any array are skipped rather than
  * trapped: a range from a newer JS bundle than this binary understands must
  * degrade to unstyled text, never to a crash in a render pass.
  */
 + (NSAttributedString *)attributedStringWithText:(NSString *)text
                                       attributes:(nullable NSArray *)attributes
-                                     decorations:(nullable NSArray *)decorations;
+                                     decorations:(nullable NSArray *)decorations
+                                          embeds:(nullable NSArray *)embeds;
 
 @end
 

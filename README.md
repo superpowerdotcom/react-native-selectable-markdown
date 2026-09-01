@@ -207,13 +207,34 @@ const renderers: RendererOverrides = {
 
 Inside a selection run, links are native tappable ranges and the `link` renderer does not run. Taps arrive at `onLinkPress({ href, blocked, start, end })`. Without a handler, live links open through `Linking.openURL` and blocked ones do nothing.
 
-`classifyBlock` marks a block `'standalone'` so it gets its own selection scope and renderer. Use it for blocks that own a competing gesture. Images and spoilers are standalone already. Give it a stable identity; the document is resegmented when it changes.
+A renderer override changes what a node draws, not which selection run it lives in. To keep a real card *inside* the sweep, claim it through `embed`: the node projects as one placeholder character, the host reserves your declared size there and reports where it landed, and your element is overlaid on that space. Selecting across the card copies its exact markdown; `copy-text` substitutes the `text` you declare.
+
+```tsx
+import type { EmbedRenderer } from 'react-native-selectable-markdown';
+
+// Module scope or useCallback: a changed claim resegments and reprojects.
+const embed: EmbedRenderer = (node, { topLevel }) =>
+  node.kind === 'link' && /^cards:/.test(node.href)
+    ? {
+        width: topLevel ? 320 : 160, // declared, not measured: sizing is layout-affecting
+        height: 88,
+        text: '[cards]', // what copy-text shows for the card
+        render: (node) => <CitationCards href={node.href} />,
+      }
+    : undefined;
+
+<SelectableMarkdown source={md} options={options} embed={embed} />
+```
+
+A block-level embed may be any height; an inline one shares a line with prose, so keep it chip-sized (on iOS a line cannot outgrow its paragraph's leading). `topLevel` is false for a node nested under a list item or blockquote, where a full-column reservation would overflow the leading margin. The card owns taps inside its bounds, so a long-press on it starts no selection.
+
+`classifyBlock` marks a block `'standalone'` so it gets its own selection scope and renderer. Use it for blocks that own a competing gesture and should end the sweep rather than flow through it. Images and spoilers are standalone already. Give it a stable identity; the document is resegmented when it changes.
 
 ```tsx
 import type { ClassifyBlock } from 'react-native-selectable-markdown';
 
 const classifyBlock: ClassifyBlock = (node) =>
-  node.kind === 'link' && /^cards:/.test(node.href) ? 'standalone' : undefined;
+  node.kind === 'link' && /^widget:/.test(node.href) ? 'standalone' : undefined;
 ```
 
 ## Architecture
@@ -244,7 +265,7 @@ selection offsets ──► mapSelectionToSource ──► exact source span ─
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/PERFORMANCE.md](docs/PERFORMANCE.md): measurements, cost model, roadmap.
 - [docs/FABRIC-PLAN.md](docs/FABRIC-PLAN.md): design retrospective of the new-architecture port.
 
-## Status (0.10.x)
+## Status (0.11.x)
 
 | Area | Where it stands |
 | --- | --- |
@@ -253,6 +274,7 @@ selection offsets ──► mapSelectionToSource ──► exact source span ─
 | Selection and copy | Exact source ranges, property-tested. Code blocks, tables and rules flow through runs; images and spoilers are standalone. |
 | Copy menu | Copy Text and Copy Markdown. Custom items need iOS 16+; iOS 13.4 to 15 gets the system menu only. |
 | Selection host | Fabric only (`react-native >= 0.82`). CI compiles the C++ against real renderer headers and the Swift against the iOS SDK, but there is no example app yet, so on-device behaviour is reviewed rather than exercised. |
+| Embeds | The `embed` prop: a claimed node flows through its run as one placeholder, the host reserves its declared size and reports the rect (`onEmbedLayout`), JS overlays the element. Removed in 0.10.0, restored in 0.11.0. Reviewed on-device like the host itself. |
 | Android selection preservation | Not implemented, and the largest known gap. Each streamed text swap drops the selection. iOS preserves it. |
 | Benchmarks | Node harnesses in `bench/`. On-device numbers are planned. |
 | Example app | Planned. |

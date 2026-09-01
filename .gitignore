@@ -1,0 +1,10 @@
+node_modules/
+dist/
+build/
+.gradle/
+.cxx/
+*.o
+*.tgz
+conformance/report-native.json
+npm-debug.log*
+.DS_Store

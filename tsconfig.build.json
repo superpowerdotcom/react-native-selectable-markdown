@@ -1,0 +1,42 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/**/__tests__/**",
+    "conformance",
+    "bench",
+    // The codegen spec must never be transpiled. React Native's babel plugin
+    // rewrites the default export into a static view config only when it sees
+    // an `ExportDefaultDeclaration` whose callee is `codegenNativeComponent`
+    // (@react-native/babel-plugin-codegen/index.js:155-160), and tsc's
+    // CommonJS emit turns that into `exports.default = ...`, which the visitor
+    // never matches. Nothing throws: the default export stays the runtime
+    // `codegenNativeComponent`, which returns `requireNativeComponent`
+    // (Libraries/Utilities/codegenNativeComponent.js:67-70) — dead under
+    // bridgeless. The component then resolves to nothing and every run drops
+    // to the <Text selectable> fallback, losing onSelectionAction and both
+    // custom menu items, with no error anywhere. `npm run check:codegen`
+    // reproduces that degradation as a negative control so it stays visible.
+    //
+    // EXCLUDING IT HERE IS NOT ENOUGH ON ITS OWN. `exclude` only filters the
+    // `include` glob: a file reached by an `import` — even an `import type` —
+    // is pulled back into the program and emitted anyway (verified with tsc
+    // 5.5). So nothing that IS built may import this module statically: the
+    // only way to reach it from `RunHost` is a call-expression `require`,
+    // which tsc does not follow. `check:codegen` builds this config into a
+    // scratch directory and fails if the spec reappears in the output.
+    "src/view/SelectableRunHostNativeComponent.ts"
+  ]
+}

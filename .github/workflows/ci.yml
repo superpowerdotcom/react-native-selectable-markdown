@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+      # Gate: React Native's codegen still turns the component spec into the
+      # C++ the Fabric port decodes — sparse fromRawValue, SharedColor
+      # sentinels, an ordered std::vector<std::string> for selectionActions —
+      # and the spec still produces a static view config while a transpiled
+      # copy still does not. Several of those failures are silent at runtime
+      # rather than loud at compile time, which is why they are gated here.
+      # Pure Node: no NDK, no Xcode, no simulator, so it runs on every runner.
+      - run: npm run check:codegen
+
+      # ---- the parser itself: a HARD GATE ---------------------------------
+      # md4c is compiled from platform/cpp by a plain clang/g++ invocation
+      # (scripts/build-node-addon.mjs) into the Node test addon, and it is the
+      # only markdown parser this package has — there is no JavaScript engine
+      # behind it any more. That is what turned this step from advisory into a
+      # gate. While a second, pure-TypeScript parser existed, a runner with no
+      # C++ toolchain could still prove the library and merely skip the native
+      # measurements, so `--if-available` cost only numbers. Now a runner that
+      # skips this build runs *zero* markdown-parsing checks: jest quietly
+      # reports ten of twenty-six suites as skipped, the conformance run has
+      # nothing to score, and the job goes green having tested no parse. A
+      # missing compiler on ubuntu-latest is not a tolerable runner property,
+      # it is a broken job, so it fails here where the cause is named rather
+      # than passing silently downstream.
+      #
+      # This must come BEFORE `npm test`: the src/engine/native/ suites load
+      # build/selectable-markdown.node, and jest picks them up automatically.
+      - name: Fetch the Node C headers for the native addon
+        # setup-node's tarball usually already carries include/node; this is
+        # the other place the build script looks. Advisory on purpose: if this
+        # download fails but the headers are already present, the build below
+        # succeeds anyway — and if they are genuinely missing, that build is
+        # the step that should go red, with a message about headers.
+        continue-on-error: true
+        run: npx --yes node-gyp install
+      - name: Build the native parser (test addon)
+        # No --if-available: see above. A compile error, a link error, an
+        # undefined-symbol violation and an unequipped machine all fail this
+        # step. The incident comment in the build script explains why the
+        # symbol guard in particular is a build-breaking condition.
+        run: node scripts/build-node-addon.mjs
+
+      # Gates: unit suites, the every-character-prefix streaming oracle,
+      # copy-fidelity properties, and the tail-repair corpus.
+      - run: npm test
+      - run: npm run build
+      # Gate: the packed tarball is what a consumer actually installs, and
+      # dist/ is never committed — this proves it still carries a working
+      # entrypoint, the podspec, and the native sources.
+      - run: npm run verify:pack
+      # Reports, does not gate: the CommonMark 0.31.2 pass rate over all 652
+      # spec examples. There used to be two of these steps, one per engine;
+      # with a single parser there is a single score, and `npm run conformance`
+      # is the whole of it (the runner refuses an `--engine` flag rather than
+      # accepting one that could no longer mean anything). It stays ungated
+      # deliberately: the score is a published number that moves when md4c is
+      # upgraded, and a spec example that regresses should be read and
+      # decided on, not auto-blocked. The step summary carries the number so a
+      # change shows up in the PR without anyone opening the log.
+      - name: CommonMark conformance
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/conformance.log"
+          npm run conformance | tee "$log"
+          {
+            echo "### CommonMark 0.31.2 — md4c"
+            echo ''
+            echo '```'
+            grep '^overall:' "$log" || echo 'no overall line — see the job log'
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+  # ---- the native gates, which the `test` job above cannot run ------------
+  #
+  # Split into their own jobs rather than appended to `test` for two reasons:
+  # they need different runners (one of them needs macOS and Xcode), and a
+  # failure here should name itself in the checks list rather than appear as
+  # "test failed" twenty minutes in.
+  #
+  # These were the only gates in the repository that ran nowhere automated.
+  # `platform/fabric/*.cpp`, the component descriptor, the state and the three
+  # Android alias headers were compiled by exactly one person on one Mac, and
+  # the Swift — the selection host itself — was compiled by nobody at all and
+  # shipped with four compile errors.
+
+  fabric-cpp:
+    name: Fabric C++ (real RN headers)
+    # Two runners because no single one can see both platform header sets:
+    # React Native's iOS renderer headers include <CoreGraphics/CoreGraphics.h>
+    # (react/renderer/graphics/platform/ios/.../Float.h), which only an Apple
+    # SDK provides, so the script skips the iOS pass — out loud — anywhere but
+    # macOS. The macOS leg compiles both header sets; the ubuntu leg re-runs
+    # the Android pass under Linux clang/libstdc++ and is the fast signal.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      # Boost is the only dependency scripts/check-fabric-cpp.mjs will not
+      # fetch for itself. `findBoost()` probes /usr/include and the homebrew
+      # roots, so either package is found with no configuration; folly, fmt,
+      # glog, double-conversion and fbjni are downloaded at the versions React
+      # Native pins. clang++ and a JDK (for <jni.h>, which the Android pass
+      # reaches through fbjni) are already on both runners.
+      - name: Install boost
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install boost
+          else
+            sudo apt-get update && sudo apt-get install -y libboost-dev
+          fi
+      # Gate: every .cpp this package ships to a consumer's compiler is
+      # compiled against the genuine React Native 0.75.4 renderer headers — on
+      # BOTH platform header sets on the macOS leg, on the Android set here on
+      # ubuntu — including the Android include-order seam that decides whether
+      # runs measure at all.
+      - run: npm run check:fabric-cpp
+      # Gate: the checker can still fail. Five deliberately broken translation
+      # units must each be rejected, and rejected for the stated reason —
+      # against the iOS headers on macOS, the Android headers on ubuntu.
+      - run: npm run check:fabric-cpp:selftest
+
+  swift:
+    name: Swift (real RN headers + iOS SDK)
+    # macOS because Xcode is macOS-only, and there is no other way to compile
+    # platform/ios/*.swift. RNSM_REQUIRE_SWIFT turns the script's "no Xcode,
+    # skipping" path into a failure: on this runner a skip would mean the
+    # image changed under us, and a silently skipped gate is worse than none.
+    runs-on: macos-latest
+    env:
+      RNSM_REQUIRE_SWIFT: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      # Gate: the selection host type-checks against React Native's real
+      # UIView (React) category, RCTViewManager and RCTUIManager, at the
+      # podspec's own deployment target and Swift version.
+      - run: npm run check:swift
+      - run: npm run check:swift:selftest

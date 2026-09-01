@@ -1,0 +1,95 @@
+name: Release
+
+# Tag-triggered only — `git tag v0.1.0 && git push origin v0.1.0`. Nothing
+# here runs on an ordinary push or pull request.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # attach the packed tarball to the GitHub release
+      id-token: write # npm publish --provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      # The podspec reads its version out of package.json, so a tag that
+      # disagrees with it ships a pod CocoaPods cannot resolve.
+      - name: Check the tag matches package.json
+        run: |
+          declared=$(node -p "require('./package.json').version")
+          if [ "$GITHUB_REF_NAME" != "v$declared" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $declared (expected v$declared)"
+            exit 1
+          fi
+
+      - run: npm ci
+
+      # THE SAME GATES CI RUNS, NOT A SUBSET. A tag can be pushed at any
+      # commit — including one CI never saw, or one CI saw fail — and this
+      # workflow is the last thing between the code and the npm registry.
+      # Running only `npm test` here meant a release could ship a type error,
+      # a codegen shape change that silently disables the component, or C++
+      # that no longer compiles against React Native's headers.
+      #
+      # Everything below runs on this ubuntu runner. Two gates need macOS and
+      # are deliberately not repeated here, because adding a job the publish
+      # depends on doubles the time between pushing a tag and having an
+      # artifact: the Swift gate (Xcode), and the iOS half of check:fabric-cpp
+      # (React Native's iOS renderer headers need an Apple SDK, so on this
+      # runner the script skips that pass out loud and gates the Android
+      # pass). CI runs both on macOS on every push to main and every pull
+      # request, which is where those regressions should be caught.
+      - run: npm run typecheck
+      - run: npm run check:codegen
+      - run: sudo apt-get update && sudo apt-get install -y libboost-dev
+      - run: npm run check:fabric-cpp
+      - run: npm run check:fabric-cpp:selftest
+
+      # HARD GATE, AND IT MUST COME BEFORE `npm test` — the same reasoning as
+      # ci.yml. `describeNative` in src/engine/native/__tests__/support.ts is
+      # `describe.skip` when the addon is missing, so a runner without it runs
+      # *zero* markdown-parsing checks and still goes green. `support.ts` does
+      # spawn the build on demand, but with `--if-available`, which exits 0
+      # when no compiler is present. Building here without that flag is what
+      # makes a missing toolchain fail loudly instead of silently emptying the
+      # suite the release is gated on.
+      - run: node scripts/build-node-addon.mjs
+      - run: npm test
+
+      # dist/ is never committed: `npm pack` runs prepare/prepack, which build
+      # it, and verify:pack proves the resulting tarball is consumable.
+      - run: npm run verify:pack
+      - run: npm pack
+
+      # The prebuilt tarball is the fast pin for consumers who cannot use the
+      # registry — installing it needs no toolchain and no build step, unlike
+      # a `github:` dependency.
+      - name: Attach the tarball to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" ./*.tgz --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" ./*.tgz --generate-notes --verify-tag
+          fi
+
+      # Skipped, not failed, when no NPM_TOKEN secret is configured — the
+      # GitHub release above is still a complete, installable artifact.
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN is not set — skipping npm publish."
+            exit 0
+          fi
+          npm publish --provenance --access public

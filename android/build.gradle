@@ -1,0 +1,200 @@
+// The Kotlin plugin has to be on the buildscript classpath before it can be
+// applied, and a library cannot assume the host app put it there. React
+// Native's own app template does (root build.gradle declares
+// `org.jetbrains.kotlin:kotlin-gradle-plugin` and an ext.kotlinVersion), but
+// brownfield apps that added React Native to an existing Gradle build
+// routinely do not — and the failure mode is a "Plugin with id
+// 'org.jetbrains.kotlin.android' not found" that names this file without
+// explaining it. Declaring it here is idempotent: Gradle unions buildscript
+// classpaths across projects, and the version below comes from the root
+// project whenever it has an opinion, so this adds a coordinate rather than a
+// competing version.
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        // Only the Kotlin plugin. The Android Gradle Plugin is deliberately
+        // NOT declared: every host that can build an RN app already has it,
+        // and naming a version here would be a chance to force the wrong one
+        // onto the whole build.
+        //
+        // The version is spelled out rather than routed through safeExtGet
+        // below because a buildscript block is evaluated before the rest of
+        // the file exists.
+        def kotlinVersion = rootProject.ext.has('kotlinVersion')
+            ? rootProject.ext.get('kotlinVersion')
+            : '1.9.24'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlinVersion"
+    }
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'org.jetbrains.kotlin.android'
+// React Native's own Gradle plugin. Unlike the Kotlin plugin above it needs no
+// buildscript entry: every React Native app puts it on the root buildscript
+// classpath (the app template's root build.gradle declares
+// `com.facebook.react:react-native-gradle-plugin`, and settings.gradle applies
+// `com.facebook.react.settings`), so applying it here only instantiates it for
+// this project. It is idempotent about the root project too — ReactPlugin
+// creates the shared `privateReact` extension only if it is not already there
+// (ReactPlugin.kt:47-52), so a library applying it before or after the app
+// module lands on the same object either way.
+//
+// IT CANNOT BE DEFENDED THE WAY THE KOTLIN PLUGIN ABOVE IS, and the reason is
+// worth knowing before someone tries. React Native's Gradle plugin is not
+// published to a Maven repository at all: an app gets it through
+// `includeBuild("../node_modules/@react-native/gradle-plugin")` in its
+// settings.gradle, so there is no coordinate to add to the buildscript block
+// and no version we could name that would resolve. A host that has React
+// Native's Android side but never applied `com.facebook.react` anywhere fails
+// here with "Plugin with id 'com.facebook.react' not found". That host is
+// already outside React Native's own integration instructions, and the failure
+// at least names the plugin — which is more than the alternative, where the
+// codegen tasks never run and the generated interface below is simply absent.
+//
+// WHAT APPLYING IT BUYS. ReactPlugin.kt:91-93 runs configureCodegen(isLibrary
+// = true) for every com.android.library that applies it, and the onlyIf guards
+// on both codegen tasks (:177, :201) pass for libraries REGARDLESS OF
+// ARCHITECTURE. So the generated SelectableRunHostManagerInterface is on the
+// classpath in old-architecture apps too, which is what lets
+// SelectableRunHostViewManager implement it unconditionally — the single
+// compile-time link between src/view/SelectableRunHostNativeComponent.ts and
+// the Kotlin setters. Rename a prop in the spec without renaming the setter
+// and this module stops compiling, instead of shipping a prop that silently
+// never arrives.
+apply plugin: 'com.facebook.react'
+
+def safeExtGet(prop, fallback) {
+    rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
+}
+
+react {
+    // The name the generated artifacts are keyed on: the C++ target becomes
+    // react_codegen_SelectableMarkdownSpec, the JNI headers land under
+    // react/renderer/components/SelectableMarkdownSpec/, and the app's
+    // generated autolinking.cpp writes both of those names verbatim.
+    //
+    // THE PACKAGE.JSON WINS OVER THIS, AND THAT IS THE POINT OF THE DIRECTORY
+    // MOVE. GenerateCodegenArtifactsTask.resolveTaskParameters() (:56-64) takes
+    // `parsedPackageJson?.codegenConfig?.name ?: libraryName.get()` from
+    // whichever package.json findPackageJsonFile located — this package's,
+    // because the Gradle project sits one directory below it. These three
+    // values are deliberately the same as the ones in package.json's
+    // codegenConfig; they are what applies if that file is ever found but its
+    // codegenConfig key is removed, and they document the contract in the file
+    // a native developer actually opens. If they ever disagree with
+    // package.json, package.json is what shipped.
+    libraryName = 'SelectableMarkdownSpec'
+    codegenJavaPackageName = 'com.selectablemarkdown'
+    // Likewise overridden: configureCodegen sets jsRootDir from
+    // `File(packageJson.parentFile, codegenConfig.jsSrcsDir)` when that key is
+    // present (ReactPlugin.kt:169-174), i.e. <pkg>/src/view. The value here is
+    // the wider fallback — the whole TypeScript tree, which the schema
+    // generator will happily scan for `export default codegenNativeComponent<`
+    // and find exactly the one spec file.
+    jsRootDir = file('../src')
+}
+
+// The host app decides which ABIs it ships; RN's app template declares that
+// in gradle.properties as `reactNativeArchitectures`. Following it keeps this
+// library from building (and packaging) three ABIs an app has already opted
+// out of — an NDK build of md4c per ABI is the slowest part of a clean build.
+// The fallback is the full RN set, which is what a library published to npm
+// has to assume.
+def reactNativeArchitectures() {
+    def value = project.findProperty('reactNativeArchitectures')
+    return value ? value.toString().split(',') : ['armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64']
+}
+
+android {
+    namespace 'com.selectablemarkdown'
+    compileSdk safeExtGet('compileSdkVersion', 34)
+
+    defaultConfig {
+        minSdkVersion safeExtGet('minSdkVersion', 23)
+        targetSdkVersion safeExtGet('targetSdkVersion', 34)
+
+        externalNativeBuild {
+            cmake {
+                // JSI's headers use RTTI and throw; both are on by default in
+                // the current NDK, but they are stated here because turning
+                // either off produces link/abort failures deep inside jsi
+                // rather than an error pointing at this file. Everything else
+                // (C++17, -O2, warnings) lives in CMakeLists.txt so the iOS
+                // and Node consumers of the same sources get identical flags.
+                cppFlags '-frtti', '-fexceptions'
+                // c++_shared, not c++_static: React Native's own .so files
+                // are linked against the shared STL, and two STL copies in
+                // one process is a documented way to crash on exceptions
+                // thrown across a library boundary.
+                arguments '-DANDROID_STL=c++_shared'
+                abiFilters(*reactNativeArchitectures())
+            }
+        }
+    }
+
+    // Consumes React Native's prefab (jsi/fbjni headers + .so) out of the
+    // react-android AAR. Without it, find_package(ReactAndroid) in
+    // CMakeLists.txt has nothing to find and the native build fails there.
+    buildFeatures {
+        prefab true
+    }
+
+    // Points AGP at the CMake project above. The CMake version is the one
+    // bundled with the Android SDK; pinned via ext so a host app that
+    // standardizes on another version can override it in one place.
+    //
+    // src/main/jni/CMakeLists.txt is deliberately NOT listed here and must not
+    // be added. That file is the Fabric seam, and it is consumed by the
+    // *application's* CMake project, not by this one: the CLI reports it as
+    // `cmakeListsPath` (react-native.config.js), the app's generated
+    // Android-autolinking.cmake add_subdirectory()s it, and everything it
+    // declares ends up in libappmodules.so. Building it here as well would
+    // compile the shadow node a second time, into a library that links neither
+    // rrc_view nor react_render_core, and the first error would be a wall of
+    // undefined React Native symbols with nothing pointing at the cause.
+    externalNativeBuild {
+        cmake {
+            path 'CMakeLists.txt'
+            version safeExtGet('cmakeVersion', '3.22.1')
+        }
+    }
+
+    packagingOptions {
+        // Prefab dependencies are copied into this module's jniLibs output,
+        // so without these excludes the AAR would ship a second copy of
+        // React Native's own libraries. At best that inflates the APK; at
+        // worst the app loads a jsi/STL that does not match the one React
+        // Native itself loaded. The host app is the single provider of all
+        // of these.
+        excludes += [
+            '**/libc++_shared.so',
+            '**/libfbjni.so',
+            '**/libjsi.so',
+            '**/libreactnative.so',
+            '**/libreact_nativemodule_core.so',
+        ]
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+repositories {
+    google()
+    mavenCentral()
+}
+
+dependencies {
+    // Version is resolved by the host app's React Native gradle plugin.
+    implementation 'com.facebook.react:react-android'
+}

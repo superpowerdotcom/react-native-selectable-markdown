@@ -369,24 +369,30 @@ describe('the release guard refuses a BREAKING change under a tagged version', (
   });
 
   it('is the verdict this repository actually gets, on its own files', () => {
-    // Run against the real CHANGELOG.md, package.json and git tags — the state
-    // the audit left behind is a pending BREAKING under an unbumped 0.11.0, and
-    // the guard has to be the one that says so rather than a fixture-only
-    // check. Written as an equivalence so it keeps testing the wiring after the
-    // maintainer bumps and moves the entries.
-    const changelog = fs.readFileSync(path.join(repoRoot, 'CHANGELOG.md'), 'utf8');
-    const unreleased = changelog.slice(
-      changelog.indexOf('## [Unreleased]'),
-      changelog.indexOf('## [', changelog.indexOf('## [Unreleased]') + 1),
-    );
+    // Run against the real CHANGELOG.md, package.json and git tags, so the
+    // guard — not a fixture-only check — is what judges this tree. Written as
+    // an equivalence so it keeps testing the wiring as the maintainer bumps
+    // and moves entries. The changelog is not assumed to exist: without it the
+    // guard cannot tell whether a break is pending and refuses, and that
+    // refusal is the verdict this repository gets while the file is absent.
+    const changelogPath = path.join(repoRoot, 'CHANGELOG.md');
     const version = (JSON.parse(
       fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'),
     ) as { version: string }).version;
     const tags = run('git', ['tag', '--list', 'v*']).stdout.split('\n').map((t) => t.trim());
-    const shouldFail = unreleased.includes('BREAKING') && tags.includes(`v${version}`);
+
+    let shouldFail = true;
+    if (fs.existsSync(changelogPath)) {
+      const changelog = fs.readFileSync(changelogPath, 'utf8');
+      const start = changelog.indexOf('## [Unreleased]');
+      const next = start === -1 ? -1 : changelog.indexOf('\n## ', start + 1);
+      const unreleased = start === -1 ? '' : changelog.slice(start, next === -1 ? undefined : next);
+      shouldFail = unreleased.includes('BREAKING') && tags.includes(`v${version}`);
+    }
 
     const ran = runNode([path.join(scriptsDir, 'check-unreleased-breaking.mjs')]);
     expect(ran.status).toBe(shouldFail ? 1 : 0);
+    if (!fs.existsSync(changelogPath)) expect(ran.stderr).toContain('does not exist');
   });
 
   it('runs in release.yml preflight and in scripts/release.mjs', () => {

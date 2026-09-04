@@ -460,8 +460,10 @@ function resolveCompiler(envVar, candidates) {
  * spells something differently; do not widen it into a pattern.
  */
 const KNOWN_C_RUNTIME = new Set([
-  // string.h / strings.h
-  'memchr', 'memcmp', 'memcpy', 'memmove', 'memset', 'bzero',
+  // string.h / strings.h. `bcmp` never appears in our sources: LLVM's
+  // SimplifyLibCalls rewrites `memcmp(a, b, n) == 0` into `bcmp(a, b, n)`
+  // on targets whose libc has it (glibc — hence Linux CI, never macOS).
+  'memchr', 'memcmp', 'bcmp', 'memcpy', 'memmove', 'memset', 'bzero',
   'strchr', 'strrchr', 'strcmp', 'strncmp', 'strcpy', 'strncpy',
   'strlen', 'strnlen', 'strstr', 'strdup',
   // stdlib.h

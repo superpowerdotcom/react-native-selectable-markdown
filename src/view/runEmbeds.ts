@@ -28,9 +28,11 @@ export interface RunEmbed {
    * `end === start + 1` (one U+FFFC). */
   start: number;
   end: number;
-  /** The identifier the host echoes back through `onEmbedLayout` — the index
-   * of this entry in the resolved list, which is also its index in
-   * `ProjectedRun.embeds`. */
+  /** The identifier the host echoes back through `onEmbedLayout` — this
+   * entry's index in `ProjectedRun.embeds`, which is what an event is
+   * resolved against. Not necessarily its index in the resolved list: an
+   * unreservable claim is dropped from that list without renumbering the
+   * ones around it. */
   embedId: number;
   /** Declared reservation in points. */
   width: number;
@@ -44,17 +46,60 @@ export interface RunEmbed {
 }
 
 /**
+ * Whether a declared size can actually be reserved: positive AND FINITE on
+ * both axes.
+ *
+ * Finiteness is the half that used to be missing everywhere. `!(x > 0)`
+ * rejects NaN, zero and negatives — which is what `embedContentFor` advertises
+ * — but `Infinity > 0` is true, so an infinite dimension passed every layer:
+ * iOS built a `CGRectMake(0, descender, inf, inf)` attachment and handed it to
+ * TextKit, Android saturated `PixelUtil.toPixelFromDIP(inf).toInt()` to
+ * `Int.MAX_VALUE` for a replacement span, and the geometry attribute below
+ * sent `lineHeight: Infinity` across the bridge. None of that is the "degrade
+ * a bad entry to no reservation" the guards promise.
+ *
+ * Shared by the wire list and the geometry attribute (`runAttributes.ts`) so
+ * the two cannot disagree about which claims are reservable: an entry that is
+ * dropped here must not leave a line-height reservation behind for a card that
+ * will never be drawn.
+ */
+export function isReservableEmbedSize(size: {
+  width: number;
+  height: number;
+}): boolean {
+  return (
+    Number.isFinite(size.width) &&
+    size.width > 0 &&
+    Number.isFinite(size.height) &&
+    size.height > 0
+  );
+}
+
+/**
  * The embedded ranges of a projected run, in placeholder order — which is
- * `embedId` order by construction, so `out[id].embedId === id` and an
- * `onEmbedLayout` event indexes this list directly (bounds-checked, the
- * `pressableId` discipline).
+ * `embedId` order, and the id travels as a FIELD, not as an array index: an
+ * `onEmbedLayout` event is resolved against `ProjectedRun.embeds` (bounds-
+ * checked, the `pressableId` discipline) and the overlay map is keyed by id,
+ * so nothing here indexes this list positionally.
+ *
+ * Which is what lets an unreservable entry be dropped rather than sent: a
+ * claim whose declared size is not positive and finite would be refused by
+ * both hosts' own guards anyway (`continue` in the iOS embed loop, `return
+ * null` in `RunEmbeds.kt`), and dropping it in JS makes the outcome the same
+ * on every layer — no reservation, no reported rect, and therefore no overlay
+ * — instead of depending on which layer noticed first. Ids of the surviving
+ * entries are untouched, so a drop never renumbers anything.
  */
 export function resolveRunEmbeds(projected: ProjectedRun): RunEmbed[] {
   if (projected.embeds === undefined) {
     return [];
   }
-  return projected.embeds.map((embed) => {
-    const out: RunEmbed = {
+  const out: RunEmbed[] = [];
+  for (const embed of projected.embeds) {
+    if (!isReservableEmbedSize(embed.content)) {
+      continue;
+    }
+    const entry: RunEmbed = {
       start: embed.start,
       end: embed.end,
       embedId: embed.embedId,
@@ -63,8 +108,9 @@ export function resolveRunEmbeds(projected: ProjectedRun): RunEmbed[] {
       node: embed.node,
     };
     if (embed.content.text !== undefined) {
-      out.text = embed.content.text;
+      entry.text = embed.content.text;
     }
-    return out;
-  });
+    out.push(entry);
+  }
+  return out;
 }

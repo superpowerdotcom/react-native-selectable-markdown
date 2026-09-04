@@ -1,0 +1,34 @@
+{
+  // The second half of `npm run build`: the same sources, emitted as ES
+  // modules into dist/esm.
+  //
+  // WHY A SECOND BUILD AT ALL. tsconfig.json says `"module": "commonjs"` and
+  // tsconfig.build.json does not override it, so dist/ is CommonJS — which is
+  // what Node's `require` and every `main`-resolving bundler want, and what
+  // this package will keep shipping there. But a CommonJS barrel cannot be
+  // tree-shaken per export: webpack, Rollup and Vite (the bundlers
+  // scripts/emit-dist-spec-shim.mjs exists to serve, i.e. react-native-web)
+  // can only drop a module nothing imports, so `sideEffects: false` on its own
+  // left an app that imports `parseDocument` carrying the streaming, selection
+  // and view layers as well. The `import` condition in package.json's
+  // `exports` points at this output instead, and those bundlers can then drop
+  // what the app does not reference.
+  //
+  // WHAT MAKES THE OUTPUT LOADABLE. tsc does not rewrite import specifiers, so
+  // this emit alone would produce ES modules full of extensionless relative
+  // imports that Node's ESM resolver rejects, in a directory Node reads as
+  // CommonJS. scripts/finish-esm-build.mjs closes both: it writes
+  // dist/esm/package.json (`"type": "module"`, and `sideEffects: false` again,
+  // because a bundler reads the NEAREST package.json for that hint) and adds
+  // the explicit `.js` extension every relative specifier needs. The build
+  // fails if any specifier is left without one.
+  //
+  // "module": "es2020" rather than esnext so the emit cannot start using
+  // syntax (import assertions, `import.meta` forms) that a consumer's older
+  // bundler has never seen; the source targets es2020 everywhere else too.
+  "extends": "./tsconfig.build.json",
+  "compilerOptions": {
+    "module": "es2020",
+    "outDir": "dist/esm"
+  }
+}

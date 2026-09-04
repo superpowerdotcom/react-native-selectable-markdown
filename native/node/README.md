@@ -35,8 +35,10 @@ and arch so an arm64 Node and a Rosetta Node coexist.
 failures (compile, link, undefined symbol) still exit non-zero. Jest's
 `describeNative` uses it, so without a compiler the native suites report as
 skipped. CI does not pass it: a runner that skips this build skips every
-markdown-parsing check (19 of the 31 Jest suites, plus the whole conformance
-run), so there a missing compiler is a failed job.
+markdown-parsing check — 426 of the 1451 Jest tests, spread over 22 of the 46
+suites and taking 10 of them out entirely, plus the whole conformance run — so
+there a missing compiler is a failed job. (Measured 2026-09-03 against a tree
+with no addon; nothing asserts those counts, so a new test file moves them.)
 
 ### The undefined-symbol guard
 
@@ -53,14 +55,19 @@ succeeded and the process crashed on the first entity. A new libc name goes in
 ```js
 import { parse, protocolVersion } from './native/node/index.mjs';
 
-const buffer = parse('# hello *world*', 0, 0);
+const buffer = parse('# hello *world*', 0, 1);
 const header = new Uint32Array(buffer, 0, 12);
 // header[0] === 0x31444d53 ("SMD1"), header[1] === protocolVersion
 ```
 
 `index.mjs` builds the addon on first import if it is missing. It does not
 rebuild on source changes; re-run the build script after editing C++.
-`parse(source, extensionBits, htmlPolicy)` mirrors the platform bindings:
-`extensionBits` is an OR of the `kExt*` constants and `htmlPolicy` is `0`
-(strip) or `1` (raw), both defined in `Protocol.h` and mirrored in
-`src/engine/native/protocol.ts`. Wrong argument types throw a `TypeError`.
+`parse(source, extensionBits, htmlPolicy)` mirrors the platform bindings.
+`extensionBits` is an OR of the `kExt*` constants, defined in `Protocol.h`
+and mirrored in `src/engine/native/protocol.ts`. `htmlPolicy` is a reserved
+wire slot that `configFromBits` reads and discards. md4c is always asked to
+parse HTML, so `0` (`kHtmlStrip`) and `1` (`kHtmlRaw`) return byte-identical
+buffers; pass `1`, which is what the package sends. Whether HTML is stripped
+or kept is decided later, by `EngineOptions.html` in the decoder. Wrong
+argument types throw a `TypeError`; the `htmlPolicy` value itself is not
+validated.

@@ -2,15 +2,19 @@
  * RNSMRunHostShadowNode — the measuring Fabric shadow node for
  * <SelectableRunHost>.
  *
- * WHY THE WHOLE PORT EXISTS. Old-architecture leaf views get no measure
- * function from React Native, so the iOS host measures itself in
- * `layoutSubviews` and reports back through
- * `RCTUIManager.setIntrinsicContentSize(_:forView:)`
- * (platform/ios/SelectableRunHostView.swift:96-102, 315-328) — *after* the
- * frame has already been laid out at the wrong height. Every run renders at
- * least one frame at the wrong size, and during streaming, where the tail
- * run's text changes on every snapshot, it does so continuously. That is the
- * prose-jumping artifact the rest of this library is built to eliminate.
+ * WHY THE WHOLE PORT EXISTS, IN THE PAST TENSE, BECAUSE THE PATH IT REPLACED
+ * IS GONE. Old-architecture leaf views got no measure function from React
+ * Native, so the iOS host used to measure itself in `layoutSubviews` and
+ * report back through `RCTUIManager.setIntrinsicContentSize(_:forView:)` —
+ * *after* the frame had already been laid out at the wrong height. Every run
+ * rendered at least one frame at the wrong size, and during streaming, where
+ * the tail run's text changes on every snapshot, it did so continuously. That
+ * was the prose-jumping artifact the rest of this library is built to
+ * eliminate. Neither that reporting path nor the view manager that carried it
+ * exists in this package any more — the `react-native >= 0.82` floor removed
+ * the old architecture entirely, and `grep setIntrinsicContentSize platform/`
+ * now matches nothing. The long form is docs/FABRIC-PLAN.md "Why do this at
+ * all", which tells the same story without live line numbers.
  * `measureContent` below runs on the layout thread before the frame is
  * committed, so the first frame is the correct frame.
  *

@@ -25,6 +25,9 @@ export type ThemeFontWeight =
  * Flat token object; consumer overrides are deep-merged over the defaults
  * one group deep (`colors`, `fonts`, `spacing`, `code`, `quote`, `table`,
  * `headings`, `rule`, `glyphs`).
+ *
+ * One group deep is not the whole rule: four tokens also feed a token in
+ * another group when that one is not itself overridden. See `mergeTheme`.
  */
 export interface MarkdownTheme {
   colors: {
@@ -67,10 +70,11 @@ export interface MarkdownTheme {
     quoteText: string;
     /** @deprecated Use `quote.barColor`. Still accepted as an INPUT: when
      * set without an explicit `quote.barColor` override, `quote.barColor`
-     * inherits it. Optional and absent from `defaultTheme`, because nothing
-     * reads it — a required field with a shipped default is a value a
-     * consumer can read and believe describes the rendered bar. It does not:
-     * `quote.barColor` is what renders. */
+     * inherits it. Optional and absent from `defaultTheme` and
+     * `defaultDarkTheme`, because nothing reads it — a shipped default here
+     * would be a value a consumer can read and believe describes the rendered
+     * bar. It would not: `quote.barColor` is what renders, and an override of
+     * that alone would leave this one saying the old colour. */
     quoteBar?: string;
     border: string;
     tableHeaderBackground: string;
@@ -125,7 +129,22 @@ export interface MarkdownTheme {
      * used to ship as 8 while the vertical padding that actually renders,
      * `table.cellPaddingV`, is 6. */
     tableCellPadding?: number;
+    /** Height of the box the built-in `image` renderer draws in, on BOTH
+     * paths: the standalone `<Image>`'s height, and the height an image
+     * embed reserves inside a run (`images: 'embed'`, the default). One
+     * token for both so the reservation and the picture drawn over it agree
+     * by construction. */
     imageHeight: number;
+    /** Width an image EMBED reserves inside a run — points, not a
+     * percentage, because a reservation is declared up front and measured
+     * off the UI thread (see `EmbedContent`). The standalone renderer still
+     * draws at `width: '100%'`, so this token only applies under
+     * `images: 'embed'`. It defaults deliberately narrow (280, which fits
+     * the narrowest phone column): the hosts do not clamp a declared width
+     * against the line's leading margins, so an image nested in a list item
+     * or a table cell would otherwise overflow to the right. Set it to your
+     * column width when the document is full-bleed. */
+    imageWidth: number;
     /** Padding around the whole rendered document. */
     containerPadding: number;
   };
@@ -231,6 +250,7 @@ const baseTokens = {
     listIndent: 18,
     codePadding: 12,
     imageHeight: 200,
+    imageWidth: 280,
     containerPadding: 0,
   },
   code: {
@@ -271,7 +291,6 @@ export const defaultTheme: MarkdownTheme = {
     codeText: '#24292f',
     codeBackground: '#f4f5f7',
     quoteText: '#57606a',
-    quoteBar: '#c9ced6',
     border: '#d8dde3',
     tableHeaderBackground: '#f0f2f5',
     spoilerMask: '#40454c',
@@ -299,7 +318,6 @@ export const defaultDarkTheme: MarkdownTheme = {
     codeText: '#e6edf3',
     codeBackground: '#161b22',
     quoteText: '#8b949e',
-    quoteBar: '#3d444d',
     border: '#30363d',
     tableHeaderBackground: '#161b22',
     spoilerMask: '#484f58',
@@ -319,6 +337,130 @@ export function headingFontSize(
   return Math.round(theme.fonts.baseSize * (theme.headings.scale[level - 1] ?? 1));
 }
 
+const IS_DEV = typeof __DEV__ === 'boolean' ? __DEV__ : true;
+
+/**
+ * Every token each group of `MarkdownTheme` declares, for the DEV check
+ * below. A value, because the check runs at runtime; kept honest by
+ * `UnlistedThemeKey`, which stops being `never` — failing the typecheck and
+ * naming the token — the moment a group grows a key this table lacks.
+ */
+const THEME_KEYS = {
+  colors: [
+    'text',
+    'heading',
+    'link',
+    'blockedLink',
+    'listMarker',
+    'strong',
+    'muted',
+    'codeText',
+    'codeBackground',
+    'quoteText',
+    'quoteBar',
+    'border',
+    'tableHeaderBackground',
+    'spoilerMask',
+    'spoilerRevealedBackground',
+  ],
+  fonts: ['body', 'mono', 'baseSize', 'lineHeight', 'strongWeight', 'strongFamily'],
+  spacing: [
+    'blockGap',
+    'listIndent',
+    'quoteIndent',
+    'codePadding',
+    'tableCellPadding',
+    'imageHeight',
+    'imageWidth',
+    'containerPadding',
+  ],
+  code: ['fontSize', 'borderRadius', 'paddingVertical'],
+  quote: [
+    'background',
+    'barColor',
+    'barWidth',
+    'borderRadius',
+    'indent',
+    'paddingVertical',
+  ],
+  table: [
+    'borderWidth',
+    'borderRadius',
+    'cellPaddingH',
+    'cellPaddingV',
+    'rowRuleThickness',
+    'headerWeight',
+  ],
+  headings: ['scale', 'weight', 'lineHeight'],
+  rule: ['thickness', 'inset'],
+  glyphs: ['bullet', 'taskChecked', 'taskUnchecked'],
+} as const satisfies {
+  [K in keyof MarkdownTheme]: readonly (keyof MarkdownTheme[K])[];
+};
+
+type UnlistedThemeKey = {
+  [K in keyof MarkdownTheme]: Exclude<
+    keyof MarkdownTheme[K],
+    (typeof THEME_KEYS)[K][number]
+  >;
+}[keyof MarkdownTheme];
+
+type AssertNever<T extends never> = T;
+
+/* Type-only assertion, no runtime cost: if this line ever fails to compile,
+ * the error names the token `THEME_KEYS` is missing. */
+type _ThemeKeysAreExhaustive = AssertNever<UnlistedThemeKey>;
+
+const warnedThemeKeys = new Set<string>();
+
+function warnThemeKeyOnce(label: string, message: string): void {
+  if (warnedThemeKeys.has(label)) {
+    return;
+  }
+  warnedThemeKeys.add(label);
+  console.warn(`[react-native-selectable-markdown] ${message}`);
+}
+
+/**
+ * DEV-only guard against a token that does not exist. `mergeGroup` copies
+ * every own key of an override through, so `fonts: { family: 'Inter' }` lands
+ * on the merged theme, is read by nothing, and the font silently never
+ * changes. TypeScript already rejects it as an excess property against
+ * `PartialTheme`; an untyped JS theme, or one whose error was suppressed, had
+ * no signal at all until this.
+ *
+ * Warn-once per token, the pattern `renderNode` uses for unknown node kinds:
+ * `mergeTheme` re-runs whenever the theme's identity changes, so a consumer
+ * passing an object literal inline would otherwise get a line per render.
+ */
+function warnUnknownThemeKeys(overrides: PartialTheme): void {
+  for (const group of Object.keys(overrides) as (keyof MarkdownTheme)[]) {
+    const known = THEME_KEYS[group] as readonly string[] | undefined;
+    if (!known) {
+      warnThemeKeyOnce(
+        String(group),
+        `Unknown theme group "${String(group)}"; it is ignored. ` +
+          `Groups: ${Object.keys(THEME_KEYS).join(', ')}.`,
+      );
+      continue;
+    }
+    const groupOverrides = overrides[group] as Record<string, unknown> | undefined;
+    if (!groupOverrides) {
+      continue;
+    }
+    for (const key of Object.keys(groupOverrides)) {
+      if (known.includes(key)) {
+        continue;
+      }
+      warnThemeKeyOnce(
+        `${group}.${key}`,
+        `Unknown theme token "${group}.${key}"; it is ignored. ` +
+          `Known ${group} tokens: ${known.join(', ')}.`,
+      );
+    }
+  }
+}
+
 function mergeGroup<T extends object>(base: T, overrides?: Partial<T>): T {
   if (!overrides) {
     return base;
@@ -333,12 +475,37 @@ function mergeGroup<T extends object>(base: T, overrides?: Partial<T>): T {
   return merged;
 }
 
+/**
+ * Layers `overrides` over `base`, one group deep — every group of `base` is
+ * copied and each supplied key replaces its counterpart.
+ *
+ * FOUR TOKENS ALSO CROSS GROUPS, each only when the token it feeds is not
+ * itself overridden, so an explicit override always wins:
+ *
+ * - `code.borderRadius` → `table.borderRadius`. Tables used to round with the
+ *   code radius; a theme that squares its code blocks still squares its
+ *   tables.
+ * - `spacing.quoteIndent` → `quote.indent` (deprecated input).
+ * - `spacing.tableCellPadding` → `table.cellPaddingH` and `cellPaddingV`
+ *   (deprecated input; feeds whichever of the two is not overridden).
+ * - `colors.quoteBar` → `quote.barColor` (deprecated input).
+ *
+ * The three deprecated tokens are inputs only: no default theme ships one, so
+ * a merged theme never carries a stale copy of a colour or metric that some
+ * other token is what actually renders.
+ *
+ * Overrides are read from `overrides` alone, never from `base`: a base theme's
+ * own `code.borderRadius` does not re-link its table radius after the fact.
+ */
 export function mergeTheme(
   overrides?: PartialTheme,
   base: MarkdownTheme = defaultTheme,
 ): MarkdownTheme {
   if (!overrides) {
     return base;
+  }
+  if (IS_DEV) {
+    warnUnknownThemeKeys(overrides);
   }
   let quote = mergeGroup(base.quote, overrides.quote);
   const quoteIndent = overrides.spacing?.quoteIndent;

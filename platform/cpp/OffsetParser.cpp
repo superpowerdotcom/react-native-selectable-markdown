@@ -22,7 +22,13 @@ unsigned toMd4cFlags(const ParserConfig& config) {
   if (ext.strikethrough) flags |= MD_FLAG_STRIKETHROUGH;
   if (ext.tasklists) flags |= MD_FLAG_TASKLISTS;
   if (ext.autolinks) {
-    flags |= MD_FLAG_PERMISSIVEURLAUTOLINKS | MD_FLAG_PERMISSIVEWWWAUTOLINKS;
+    /* All three halves of GFM's autolink extension (spec 6.9), which is what
+     * `extensions.autolinks` advertises: `https://x`, `www.x` and a bare
+     * `user@host.tld`. MD_FLAG_PERMISSIVEAUTOLINKS is exactly this trio, but
+     * it is spelled out so a new md4c flag folded into that alias cannot
+     * enable itself here on the next vendor bump. */
+    flags |= MD_FLAG_PERMISSIVEURLAUTOLINKS | MD_FLAG_PERMISSIVEWWWAUTOLINKS |
+             MD_FLAG_PERMISSIVEEMAILAUTOLINKS;
   }
   if (ext.math) flags |= MD_FLAG_LATEXMATHSPANS;
   if (ext.underline) flags |= MD_FLAG_UNDERLINE;
@@ -240,7 +246,29 @@ struct SaxState {
     }
   }
 
+  /* One entry per distinct value in a run. md4c hands the text callback the
+   * same static "\n" for every soft break, hard break, code-block line and
+   * HTML-block line, so a thousand-line document used to intern a thousand
+   * identical 1-byte entries plus their index slots — by far the largest
+   * entry class in ordinary markdown, not the "rare synthesized text" the
+   * table was designed for. Comparing against the previous entry collapses
+   * that whole class to one, which is also what lets the decoder's string
+   * cache (StringTable in src/engine/native/decode.ts) ever hit: it is keyed
+   * by index, so identical values at distinct indices always missed.
+   *
+   * Only the previous entry, not a hash of the whole table: every duplicate
+   * class that shows up in a real document is consecutive (breaks, code
+   * lines), so this catches them for one length compare and no allocation,
+   * where a hash set would cost a hash of every href and title to catch
+   * duplicates that do not occur. */
   int32_t intern(const char* text, size_t length) {
+    if (!out->strings.empty()) {
+      const std::string& last = out->strings.back();
+      if (last.size() == length &&
+          (length == 0 || std::memcmp(last.data(), text, length) == 0)) {
+        return static_cast<int32_t>(out->strings.size() - 1);
+      }
+    }
     out->strings.emplace_back(text, length);
     return static_cast<int32_t>(out->strings.size() - 1);
   }
@@ -373,11 +401,9 @@ void fillBlockDetail(NodeEvent& event, MD_BLOCKTYPE type, void* detail,
       event.stringA = state.internAttribute(d->lang);
       break;
     }
-    case MD_BLOCK_TABLE: {
-      const auto* d = static_cast<const MD_BLOCK_TABLE_DETAIL*>(detail);
-      event.columnCount = d->col_count;
-      break;
-    }
+    /* No MD_BLOCK_TABLE arm, deliberately: its detail is a column count, and
+     * the decoder builds a table from the cell events it actually receives,
+     * so a second copy of the count could only ever disagree with them. */
     case MD_BLOCK_TH:
     case MD_BLOCK_TD: {
       const auto* d = static_cast<const MD_BLOCK_TD_DETAIL*>(detail);
@@ -478,16 +504,20 @@ int textCallback(MD_TEXTTYPE type, const MD_CHAR* text, MD_SIZE size,
   event.text = mapTextType(type);
 
   uint32_t start = 0;
-  if (state.anchor(text, size, &start)) {
+  const bool anchored = state.anchor(text, size, &start);
+  if (anchored) {
     event.byteStart = start;
     event.byteEnd = start + static_cast<uint32_t>(size);
     state.fold(event.byteStart, event.byteEnd);
-  } else if (text != nullptr && size > 0) {
-    /* md4c normally points into the source; keep a copy for the rare text
-     * that does not, so no content is dropped. */
-    event.stringA = state.intern(text, size);
   }
 
+  /* Exactly one table entry per event, and only when the event needs one.
+   * These arms are mutually exclusive on purpose: a NUL and an entity put
+   * their DECODED form in stringA, so interning the raw bytes as well — which
+   * is what the anchoring `else if` above used to do — stranded one entry in
+   * the table for every one of them, unreachable from any event (a NUL-heavy
+   * document paid ~5 bytes of payload and index per NUL for nothing, and the
+   * decoder allocated a cache slot to match). */
   if (type == MD_TEXT_NULLCHAR) {
     /* Range covers the NUL byte; display text is the replacement char. */
     event.stringA = state.intern("\xEF\xBF\xBD", 3);
@@ -498,6 +528,12 @@ int textCallback(MD_TEXTTYPE type, const MD_CHAR* text, MD_SIZE size,
     decoded.reserve(size);
     appendDecodedEntity(text, size, &decoded);
     event.stringA = state.intern(decoded.data(), decoded.size());
+  } else if (!anchored && text != nullptr && size > 0) {
+    /* md4c normally points into the source; keep a copy for the rare text
+     * that does not, so no content is dropped. This is also the common case
+     * for line breaks and code-block lines, which md4c reports as a static
+     * "\n" — `intern` collapses those into one shared entry. */
+    event.stringA = state.intern(text, size);
   }
 
   state.out->events.push_back(event);

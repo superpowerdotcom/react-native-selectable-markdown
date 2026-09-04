@@ -1,8 +1,16 @@
+import type { ParsedDocument } from '../document/nodes';
+import type { Engine } from '../engine/Engine';
+import type { BufferScheduler } from '../stream/StreamSession';
+import { StreamSession } from '../stream/StreamSession';
 import {
   bindMessageEvents,
   getOrCreateSession,
+  resolveSessionInit,
+  settleUnboundSession,
+  type BufferedSessionSink,
   type SessionSink,
   type TextMessageEvents,
+  type UseAgUiSessionOptions,
 } from './useAgUiSession';
 
 type DeltaCb = (messageId: string, delta: string) => void;
@@ -74,6 +82,30 @@ function makeSink(): RecordingSink {
       sink.appended.push(delta);
     },
     finalize(reason?: 'end' | 'aborted' | 'failed') {
+      sink.finalizeReasons.push(reason);
+    },
+  };
+  return sink;
+}
+
+/** `makeSink` plus the coalescing entry point, logged in arrival order. */
+interface RecordingBufferedSink extends BufferedSessionSink {
+  calls: string[];
+  finalizeReasons: (string | undefined)[];
+}
+
+function makeBufferedSink(): RecordingBufferedSink {
+  const sink: RecordingBufferedSink = {
+    calls: [],
+    finalizeReasons: [],
+    append(delta: string) {
+      sink.calls.push(`append:${delta}`);
+    },
+    appendBuffered(delta: string) {
+      sink.calls.push(`appendBuffered:${delta}`);
+    },
+    finalize(reason?: 'end' | 'aborted' | 'failed') {
+      sink.calls.push(`finalize:${reason ?? ''}`);
       sink.finalizeReasons.push(reason);
     },
   };
@@ -230,5 +262,290 @@ describe('getOrCreateSession', () => {
     expect(a).not.toBe(b);
     expect(created).toBe(2);
     expect(sessions.size).toBe(2);
+  });
+});
+
+describe('bindMessageEvents coalescing', () => {
+  it('routes deltas through appendBuffered when coalescing is asked for', () => {
+    const events = new FakeEvents();
+    const sink = makeBufferedSink();
+    bindMessageEvents(events, 'm1', sink, { coalesce: true });
+
+    events.emitDelta('m1', 'Hello');
+    events.emitDelta('m1', ' world');
+    events.emitMessageEnd('m1');
+
+    // Settling needs no explicit flush: finalize drains the pending buffer.
+    expect(sink.calls).toEqual([
+      'appendBuffered:Hello',
+      'appendBuffered: world',
+      'finalize:end',
+    ]);
+  });
+
+  it('appends synchronously without coalescing, and with coalesce: false', () => {
+    const events = new FakeEvents();
+    const off = makeBufferedSink();
+    const explicit = makeBufferedSink();
+    bindMessageEvents(events, 'm1', off);
+    bindMessageEvents(events, 'm1', explicit, { coalesce: false });
+
+    events.emitDelta('m1', 'a');
+
+    expect(off.calls).toEqual(['append:a']);
+    expect(explicit.calls).toEqual(['append:a']);
+  });
+
+  it('falls back to append when the sink has no buffered entry point', () => {
+    const events = new FakeEvents();
+    const plain = makeSink();
+    // The overloads make this a type error for a typed caller; the runtime
+    // check is what keeps an untyped one appending instead of throwing.
+    bindMessageEvents(events, 'm1', plain as unknown as BufferedSessionSink, {
+      coalesce: true,
+    });
+
+    events.emitDelta('m1', 'a');
+
+    expect(plain.appended).toEqual(['a']);
+  });
+});
+
+describe('resolveSessionInit', () => {
+  it('reads a bare EngineOptions argument as parse options', () => {
+    const options = { smartPunctuation: true };
+
+    expect(resolveSessionInit(options)).toEqual({ options, coalesce: false });
+  });
+
+  it('passes an init object through', () => {
+    const engine: Engine = { name: 'x', parse: () => ({ source: '', blocks: [] }) };
+
+    expect(resolveSessionInit({ engine })).toEqual({ engine, coalesce: false });
+  });
+
+  it('resolves to an empty init with no argument', () => {
+    expect(resolveSessionInit()).toEqual({ coalesce: false });
+  });
+
+  it('coalesces by default when the init carries a buffering field', () => {
+    const smoother = () => () => 4;
+
+    expect(resolveSessionInit({ smoother }).coalesce).toBe(true);
+    expect(resolveSessionInit({ holdBackChars: 3 }).coalesce).toBe(true);
+    expect(resolveSessionInit({ holdIdleMs: 40 }).coalesce).toBe(true);
+    expect(resolveSessionInit({ bufferScheduler: () => () => {} }).coalesce).toBe(
+      true,
+    );
+    expect(resolveSessionInit({ idleScheduler: () => () => {} }).coalesce).toBe(
+      true,
+    );
+  });
+
+  it('honours an explicit coalesce over the inference', () => {
+    const smoother = () => () => 4;
+
+    expect(resolveSessionInit({ smoother, coalesce: false }).coalesce).toBe(false);
+    expect(resolveSessionInit({ coalesce: true }).coalesce).toBe(true);
+  });
+
+  it('does not infer coalescing from repair or now, which work either way', () => {
+    // `repair` threads into every commit's tail repair, synchronous appends
+    // included, and `now` is only the smoother's clock. Neither implies
+    // buffering, so neither may switch the delta route.
+    expect(resolveSessionInit({ repair: { hideUriLikeLabels: true } }).coalesce).toBe(
+      false,
+    );
+    expect(resolveSessionInit({ now: () => 0 }).coalesce).toBe(false);
+  });
+
+  it('warns in DEV about an init that also carries parse options, and drops them', () => {
+    const engine: Engine = {
+      name: 'x',
+      parse: () => ({ source: '', blocks: [] }),
+    };
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      // What an untyped (JS) caller writes: `{ ...presets.llmChat, engine }`.
+      // TypeScript rejects the literal outright, so this cast is the only
+      // way to reach the branch — and it is exactly what a JS host reaches.
+      const mixed = {
+        engine,
+        smartPunctuation: true,
+      } as unknown as UseAgUiSessionOptions;
+
+      const resolved = resolveSessionInit(mixed);
+
+      // Resolved as an init: the parse options are gone, which is the whole
+      // reason the warning exists.
+      expect(resolved.engine).toBe(engine);
+      expect(resolved.options).toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain('smartPunctuation');
+
+      // Warn-once per key combination, so a streaming re-render is quiet...
+      resolveSessionInit(mixed);
+      expect(warn).toHaveBeenCalledTimes(1);
+      // ...and a different stray key is its own warning.
+      resolveSessionInit({
+        engine,
+        html: 'raw',
+      } as unknown as UseAgUiSessionOptions);
+      expect(warn).toHaveBeenCalledTimes(2);
+
+      // Neither shape on its own warns: an init keeping its options under
+      // `options`, or bare EngineOptions.
+      resolveSessionInit({ engine, options: { smartPunctuation: true } });
+      resolveSessionInit({ smartPunctuation: true });
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe('settleUnboundSession', () => {
+  it("finalizes a still-streaming session with 'aborted'", () => {
+    const reasons: (string | undefined)[] = [];
+    const session = {
+      snapshot: () => ({ phase: 'streaming' }),
+      finalize: (reason?: 'end' | 'aborted' | 'failed') => reasons.push(reason),
+    } as unknown as StreamSession;
+
+    settleUnboundSession(session);
+
+    expect(reasons).toEqual(['aborted']);
+  });
+
+  it('leaves a settled session alone', () => {
+    const reasons: (string | undefined)[] = [];
+    const session = {
+      snapshot: () => ({ phase: 'settled' }),
+      finalize: (reason?: 'end' | 'aborted' | 'failed') => reasons.push(reason),
+    } as unknown as StreamSession;
+
+    settleUnboundSession(session);
+
+    expect(reasons).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Real StreamSessions: what coalescing through the per-message binding buys,
+// and what settling an unbound one does to the document. Driven by a manual
+// frame scheduler (nothing fires until the test says so) over an engine that
+// needs no native addon.
+// ---------------------------------------------------------------------------
+
+/** Manual stand-in for the frame scheduler: fires only when told to. */
+function manualFrame() {
+  let next: (() => void) | null = null;
+  const scheduler: BufferScheduler = (flush) => {
+    next = flush;
+    return () => {
+      next = null;
+    };
+  };
+  return {
+    scheduler,
+    fire() {
+      const f = next;
+      next = null;
+      f?.();
+    },
+  };
+}
+
+/**
+ * Whole-source-as-one-paragraph engine: satisfies the session's span
+ * invariant (text value === source slice) without the native md4c addon.
+ */
+const wholeParagraphEngine: Engine = {
+  name: 'whole-paragraph',
+  parse(source: string): ParsedDocument {
+    const span = { start: 0, end: source.length };
+    return {
+      source,
+      blocks: [
+        {
+          kind: 'paragraph',
+          span,
+          children: [{ kind: 'text', span, value: source }],
+        },
+      ],
+    };
+  },
+};
+
+describe('bindMessageEvents over a real StreamSession', () => {
+  it('commits once per frame when coalescing, not once per delta', () => {
+    const frame = manualFrame();
+    const session = new StreamSession({
+      engine: wholeParagraphEngine,
+      bufferScheduler: frame.scheduler,
+      idleScheduler: () => () => {},
+    });
+    const revisions: number[] = [];
+    session.subscribe((snap) => revisions.push(snap.revision));
+    const events = new FakeEvents();
+    bindMessageEvents(events, 'm1', session, { coalesce: true });
+
+    events.emitDelta('m1', 'one ');
+    events.emitDelta('m1', 'two ');
+    events.emitDelta('m1', 'three');
+    expect(revisions).toEqual([]); // nothing parsed yet
+    frame.fire();
+
+    expect(revisions).toEqual([1]);
+    expect(session.snapshot().document.source).toBe('one two three');
+  });
+
+  it('drains the pending buffer when the run settles the message', () => {
+    const frame = manualFrame();
+    const session = new StreamSession({
+      engine: wholeParagraphEngine,
+      bufferScheduler: frame.scheduler,
+      idleScheduler: () => () => {},
+      // A metered reveal: run end here finalizes straight through it, since
+      // the per-message binding owns no run-end drained hold.
+      smoother: () => 4,
+    });
+    const events = new FakeEvents();
+    bindMessageEvents(events, 'm1', session, { coalesce: true });
+
+    events.emitDelta('m1', 'a long enough tail');
+    frame.fire();
+    expect(session.snapshot().document.source).toBe('a lo');
+
+    events.emitMessageEnd('m1');
+
+    expect(session.snapshot().phase).toBe('settled');
+    expect(session.snapshot().document.source).toBe('a long enough tail');
+    expect(session.pendingLength).toBe(0);
+  });
+
+  it('settling an unbound session commits its held-back tail once', () => {
+    const frame = manualFrame();
+    const session = new StreamSession({
+      engine: wholeParagraphEngine,
+      bufferScheduler: frame.scheduler,
+      idleScheduler: () => () => {},
+      holdBackChars: 4,
+    });
+    const events = new FakeEvents();
+    // The hook's messageId switch: detach, then settle what was left open.
+    const detach = bindMessageEvents(events, 'm1', session, { coalesce: true });
+
+    events.emitDelta('m1', 'half a sentence and **bo');
+    frame.fire();
+    detach();
+    expect(session.snapshot().phase).toBe('streaming');
+
+    settleUnboundSession(session);
+
+    expect(session.snapshot().phase).toBe('settled');
+    expect(session.snapshot().document.source).toBe(
+      'half a sentence and **bo',
+    );
   });
 });

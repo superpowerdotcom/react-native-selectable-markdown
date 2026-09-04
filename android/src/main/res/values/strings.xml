@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The two selection-menu items this library implements, as overridable and
+  translatable Android resources.
+
+  WHY THEY ARE RESOURCES AND NOT KOTLIN LITERALS. These strings are shown to
+  the user, and until they lived here a French or Japanese app got "Copy
+  Text" / "Copy Markdown" with no way to change them short of forking: the
+  titles were `when`-branch literals with no Context in sight. As resources
+  they get both Android override paths for free — a host app declares the
+  same names in its own `res/values/strings.xml` (an app resource wins over a
+  library's) to reword them, and adds `res/values-fr/strings.xml` to
+  translate them.
+
+  THE CROSS-PLATFORM PATH IS THE `title` FIELD, NOT THIS FILE. These are the
+  FALLBACK, used for a `selectionActions` entry that is a bare identifier.
+  An entry written as `{ id, title }` in JS carries its own label, which
+  reaches Android and iOS alike from whatever i18n the app already uses; see
+  src/view/selectionActions.ts. This file is what makes the Android half
+  overridable for an app that would rather stay in Android resources — the
+  counterpart of the iOS host's NSLocalizedString lookup against Bundle.main.
+
+  The names are prefixed because a library's resources merge into the
+  application's single namespace, where a plain `copy_text` would be a
+  collision waiting to happen — and, since an app resource silently wins, a
+  collision that renames this menu rather than failing the build.
+-->
+<resources>
+    <string name="selectable_markdown_copy_text">Copy Text</string>
+    <string name="selectable_markdown_copy_markdown">Copy Markdown</string>
+</resources>

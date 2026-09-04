@@ -1,22 +1,35 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { Engine } from '../engine/Engine';
 import type { EngineOptions } from '../engine/options';
-import { StreamSession, type BufferScheduler } from '../stream/StreamSession';
+import {
+  StreamSession,
+  type BufferScheduler,
+  type IdleScheduler,
+} from '../stream/StreamSession';
 import type { RepairOptions } from '../stream/repair';
 import type { Smoother } from '../stream/smoothing';
-import { getOrCreateSession, type TextMessageEvents } from './useAgUiSession';
+import {
+  getOrCreateSession,
+  useDeferredUnmount,
+  type TextMessageEvents,
+} from './useAgUiSession';
 
 /**
  * The slice of StreamSession the run-scoped binding drives. Structural (like
  * `SessionSink`) so the binding core is testable with a recording fake:
  * `replace` for pre-existing rows and their rewrites (its prefix diff keeps
  * the common append-shaped case incremental), `appendBuffered` for rows born
- * inside an observed run (so a smoother can meter them out), `rewrite` for
+ * inside an observed run (so a smoother can meter them out) and for an
+ * adopted row this binding took over mid-reveal, `rewrite` for
  * rewrites of those born rows (an edit confined to the unrevealed tail keeps
  * the metered reveal typing; `rewrite` itself escalates to replace semantics
  * when the edit reaches committed text), and
  * `flushBuffered`/`drained`/`pendingLength`/`finalize`/`notifyRunFinalized`
- * for row switching and run-end settling. `append` is included for hosts
- * that drive the sink directly alongside the binding.
+ * for row switching and run-end settling. `append` carries a pre-existing
+ * row whose session predates this binding (an adopted row — see
+ * `RunBindingPolicy.getContent`), where the binding knows the delta but not
+ * the full text `replace` would need; hosts driving the sink directly
+ * alongside the binding use it too.
  */
 export type RunSessionSink = Pick<
   StreamSession,
@@ -57,7 +70,14 @@ export interface RunBindingPolicy {
    * snapshot). When provided it seeds and re-syncs pre-existing rows —
    * covering text that arrived before this binding attached, which the
    * binding's own delta accumulation cannot know about. Absent, the binding
-   * falls back to the deltas it has itself observed for the id.
+   * falls back to the deltas THIS BINDING INSTANCE has observed for the id,
+   * and only where that fallback is the whole story: a row whose session
+   * already existed when this binding first routed a delta for it (a rebind
+   * mid-run hands a fresh instance the previous one's store) is adopted
+   * instead — its deltas `append` onto whatever the session holds (or
+   * `appendBuffered`, if the takeover caught it mid-reveal), because the
+   * accumulated fallback would be a truncation and `replace` would reset
+   * the row to it.
    *
    * Presence is latched when the binding attaches (matching the hook's
    * policy latching): with an authority present the binding skips its own
@@ -111,6 +131,45 @@ export interface RunBindingPolicy {
 
 type FinalizeReason = 'end' | 'aborted' | 'failed';
 
+/**
+ * How many spent run ids one binding remembers for its stale-event filter
+ * (behavior i). A late lifecycle event arrives within a run or two of its
+ * run ending; anything older is not worth the retained strings.
+ */
+const SPENT_RUN_ID_MEMORY = 64;
+
+/**
+ * `__DEV__` is React Native's global; where it is undefined (a node test
+ * run, a plain web build) this reads as a dev build — the same gate the rest
+ * of the package's DEV diagnostics use.
+ */
+const IS_DEV = typeof __DEV__ === 'boolean' ? __DEV__ : true;
+
+/**
+ * DEV report for a session that gave up on its buffered tail:
+ * `StreamSession.drained()` REJECTS once the session has abandoned the drain
+ * (its engine threw on every scheduled retry, so no retry is armed and no
+ * drain is coming). The binding releases that session's run-end hold without
+ * finalizing it — `finalize` drains synchronously, so it would hand the same
+ * text to the same broken engine and throw straight back out — which leaves
+ * nothing else to say that a row is stuck holding text it can no longer
+ * render. The binding has no error channel of its own to route that through
+ * (its policy hooks are all inputs, and the run-failure events are inbound
+ * too), so the engine's own error is reported here, once per abandoned hold.
+ */
+function reportAbandonedDrain(id: string, error: unknown): void {
+  if (!IS_DEV) {
+    return;
+  }
+  console.error(
+    `[react-native-selectable-markdown] bindRunTextEvents: session "${id}" ` +
+      `abandoned its drain at run end — its engine refused every retry, so ` +
+      `the run-end hold was released without finalizing and the session's ` +
+      `pending text stays unrendered until a later drain succeeds.`,
+    error,
+  );
+}
+
 interface RowRecord {
   /**
    * Routing decision for the id, made at its first delta of the current run
@@ -126,6 +185,47 @@ interface RowRecord {
    * a dead second copy of every row's text for the binding's lifetime.
    */
   content: string;
+  /**
+   * True when this binding started routing an id whose session ALREADY
+   * existed — a rebind mid-run (fresh binding, same store), or a host that
+   * created the session itself before the first delta. `content` then holds
+   * only the tail this instance saw, so a pre-existing row's deltas go
+   * through `sink.append(delta)` — a call the binding makes ONLY for
+   * adopted rows, so a store whose `append` is a stub drops their text —
+   * rather than `replace(content)`, which would reset the session to that
+   * tail and drop everything streamed before the rebind. An adopted row
+   * caught mid-reveal keeps metering instead of appending; see `paced`.
+   *
+   * Cleared by a rewrite (`onMessageReplaced`), which hands over the row's
+   * full text and so makes the accumulation whole again — with a
+   * `getContent` authority latched there is no accumulation to rebase, so
+   * the rewrite leaves the flag alone and the authority outranks it on
+   * every delta regardless. Deliberately NOT cleared by a later run start,
+   * unlike `preexisting`: nothing about a new run re-seeds `content`, so it
+   * is still the same truncation, and re-judging the row as pre-existing
+   * would hand that truncation to `replace` and drop the earlier text after
+   * all — the very defect adoption exists to prevent. A row therefore stays
+   * adopted for the binding's life unless the host evicts the id (directly
+   * or via `evictOnRunStart`, either of which drops the record at the next
+   * observed run start) or supplies a `getContent` authority.
+   */
+  adopted: boolean;
+  /**
+   * Set alongside `adopted` when the session being taken over still had
+   * text pending — a row born in an observed run, mid-reveal (a smoother's,
+   * or plain per-frame coalescing) when the rebind happened. Its deltas
+   * then go through `sink.appendBuffered(delta)`, so that reveal keeps
+   * playing out; plain `append` would drain the whole withheld tail into
+   * one commit and the row would never pace again.
+   *
+   * Judged once, from `pendingLength` at the moment of adoption, because
+   * that is the only evidence a fresh binding has that the row was being
+   * metered: the previous instance's routing decisions went with it. A row
+   * whose buffer happened to be empty at the takeover therefore reads as
+   * unpaced and appends — the one-revision commit every other pre-existing
+   * row gets. Cleared with `adopted` by a rewrite.
+   */
+  paced: boolean;
 }
 
 /**
@@ -141,7 +241,15 @@ interface RowRecord {
  *     binding did not see (attach mid-run, stream resume). A pre-existing
  *     row's text goes through `replace` (authoritative content when
  *     `policy.getContent` exists, else the accumulated deltas): committed in
- *     one revision, never typed. A row born after an observed run start
+ *     one revision, never typed. The exception is an ADOPTED row — its
+ *     session already existed when this binding first routed a delta for it
+ *     (a rebind mid-run, a host-created session) and no authority is
+ *     configured, so the accumulation is only a tail: its deltas `append`,
+ *     which commits in one revision without resetting the row to that tail.
+ *     An adopted row whose session still had text PENDING at the takeover
+ *     was mid-reveal, so it keeps going through `appendBuffered` instead
+ *     and the smoother finishes typing it out (see `RowRecord.paced`).
+ *     A row born after an observed run start
  *     routes through `appendBuffered` — typed out when the session has a
  *     smoother — no matter how large its first delta is, so a one-burst
  *     answer still streams.
@@ -185,6 +293,12 @@ interface RowRecord {
  *     yet, and any born row taking its first routing decision while the
  *     hold is up (the awaited one-burst answer, or a successor row
  *     mounting mid-drain) is adopted into the drain (see the policy docs).
+ *     A session that has given up on its tail settles the other way: its
+ *     `drained()` rejects (the engine refused every scheduled retry — see
+ *     `StreamSession.drained`), so the hold is released WITHOUT finalizing
+ *     — finalize drains, which would hand the same text back to the same
+ *     broken engine — and the error is reported in DEV. The binding never
+ *     reports `holding: true` for a session whose drain is never coming.
  *     Settling spans `store.ids()`, never just the rows this instance
  *     routed: a rebind mid-run (fresh binding, same store — the hook does
  *     this on an events identity change) must still settle sessions the
@@ -204,14 +318,41 @@ interface RowRecord {
  *     last-delta id) resets.
  * (g) Detach. The returned function unsubscribes everything, is idempotent,
  *     and drops any pending hold callbacks (a stale `drained()` resolution
- *     neither finalizes nor flips the hold flag).
+ *     neither finalizes nor flips the hold flag). It does not flush or
+ *     settle the sessions — a rebind must not dump a smoother's withheld
+ *     backlog, and a session drains its own pending text on its own timers
+ *     with no binding attached, so nothing is stranded by detaching. The
+ *     binding that takes over keeps that reveal metered rather than ending
+ *     it: a row it adopts with text still pending stays on the buffered
+ *     path (behavior a, `RowRecord.paced`). A
+ *     session dropped for good (the screen popped) needs `dispose()`, which
+ *     is what stops those timers; `useAgUiRunSessions` does that for its
+ *     whole map at unmount.
  * (h) Attach/catch-up. `onAttached` (optional event): the host (re)attached
  *     to its event source after a detached stretch, and catch-up covers the
  *     gap — every buffered session flushes in one commit, run observation
- *     drops (`preRunIds = null`), per-row routing re-judges pre-existing,
- *     and any armed grace cancels. Held sessions are not dropped: the flush
+ *     drops (`preRunIds = null`, and the spent-run memory of behavior i
+ *     with it), per-row routing re-judges pre-existing, and any armed grace
+ *     cancels. Held sessions are not dropped: the flush
  *     empties them, so their parked continuations finalize with their
  *     run-end reasons and release the hold.
+ * (i) Run identity. When the host passes a `runId` to `onRunStarted`, the
+ *     binding remembers which runs it watched go SPENT — superseded by a
+ *     later run start, or ended by their own `onRunFinalized` — and ignores
+ *     an `onRunFinalized` / `onRunFailed` carrying one of those, so a
+ *     superseded run's late event cannot settle the run being observed. An
+ *     id stays spent only until that run starts again: a fresh
+ *     `onRunStarted` for it means it is live, so it is revived and can
+ *     finalize (a retried run reusing its id, a replayed start). Catch-up
+ *     empties the memory outright, with the rest of the run observation
+ *     (behavior h). Fail-open everywhere else, and deliberately: an id this
+ *     binding never saw start (a resumed run, a run that began during a
+ *     detached stretch, a host that ids its lifecycle events but does not
+ *     always announce a start) settles normally, because dropping a
+ *     legitimate run end would strand its sessions in 'streaming' forever,
+ *     while a premature settle self-heals on the next delta. With no id on
+ *     either side nothing is filtered at all, so a host without run ids
+ *     must not forward events from a run it no longer observes.
  */
 export function bindRunTextEvents(
   events: TextMessageEvents,
@@ -223,6 +364,50 @@ export function bindRunTextEvents(
    * yet, which means every id is pre-existing (see behavior a).
    */
   let preRunIds: ReadonlySet<string> | null = null;
+  /**
+   * Identity of the run being observed right now, when the host supplies
+   * one (see behavior i). `undefined` = none in flight here: no run start
+   * observed, one that carried no id, or the observed run has since ended.
+   * Only used to decide which id goes into `spentRunIds`.
+   */
+  let observedRunId: string | undefined;
+  /**
+   * Run ids this binding watched go spent: superseded by a later observed
+   * run start, or settled by their own clean run end. A lifecycle event
+   * carrying one of these is late and must not settle anything.
+   *
+   * The filter drops ONLY these, and an id leaves the set the moment its
+   * run starts again (`onRunStarted` revives it) or catch-up empties the
+   * whole memory. An id this binding never saw start — or saw start again —
+   * proves nothing: a resumed or reconnected run, a run created before this
+   * binding attached, a retry reusing its id, a host that puts ids on its
+   * lifecycle events but emits `onRunStarted` only for runs it started
+   * itself. Dropping such a finalize strands its sessions in phase
+   * 'streaming' for good, which is a strictly worse failure than the one
+   * this filter exists to prevent (a premature settle self-heals: the next
+   * delta puts the session back to 'streaming'). So the unknown id settles,
+   * and only a run last seen to be over is filtered out.
+   */
+  const spentRunIds = new Set<string>();
+  const markRunSpent = (runId: string | undefined): void => {
+    if (runId === undefined) {
+      return;
+    }
+    spentRunIds.add(runId);
+    // Only the newest spent runs can plausibly still have an event in
+    // flight, and this set lives as long as the binding does. Insertion
+    // order is Set iteration order, so the oldest goes first.
+    while (spentRunIds.size > SPENT_RUN_ID_MEMORY) {
+      const oldest = spentRunIds.values().next();
+      if (oldest.done === true) {
+        break;
+      }
+      spentRunIds.delete(oldest.value);
+    }
+  };
+  /** A run-lifecycle event belonging to a run known to be over. */
+  const staleRun = (runId: string | undefined): boolean =>
+    runId !== undefined && spentRunIds.has(runId);
   /**
    * Content-authority presence, latched at bind time (the same latch the
    * hook applies to the composed policy). With an authority, the per-row
@@ -309,6 +494,19 @@ export function bindRunTextEvents(
    * failure / detach having superseded this hold; the held check covers
    * double `onRunFinalized` delivery registering two continuations for one
    * id.
+   *
+   * `drained()` can also REJECT, and this continuation must survive it: a
+   * session that has given up on its tail (its engine refused every
+   * scheduled retry — see `StreamSession.drained`) settles the promise with
+   * the engine's error, and no drain is ever coming. The hold is released
+   * WITHOUT finalizing — `finalize` drains synchronously, so it would hand
+   * the same text to the same broken engine and throw out of this
+   * continuation — and the error is reported once (see
+   * `reportAbandonedDrain`), because nothing else would say the row is
+   * stuck. The staleness guards run first there too, so a hold something
+   * else already superseded settles silently, as its resolution would.
+   * Uncaught, the rejection would be an unhandled promise rejection AND
+   * leave `onHoldChanged(true)` standing for the binding's life.
    */
   const parkDrained = (
     id: string,
@@ -320,26 +518,50 @@ export function bindRunTextEvents(
     held.set(id, { sink, reason });
     setHolding(true);
     void (async () => {
-      for (;;) {
-        await sink.drained();
+      try {
+        for (;;) {
+          await sink.drained();
+          if (epoch !== holdEpoch || !held.has(id)) {
+            return;
+          }
+          await nextMacrotask();
+          if (epoch !== holdEpoch || !held.has(id)) {
+            return;
+          }
+          if (sink.pendingLength === 0) {
+            break;
+          }
+          if (!notified) {
+            // The re-check caught text on a session parked empty (the final
+            // render-loop feed): tell its smoother the run is over now, so
+            // the late tail drains against the bounded deadline instead of
+            // the steady pacing rate.
+            sink.notifyRunFinalized();
+            notified = true;
+          }
+        }
+      } catch (error) {
+        // The session gave up on its tail: no drain is coming, so waiting
+        // is the one thing this continuation must not keep doing. Same
+        // staleness guards as a resolution — a superseded hold has already
+        // chosen how the session settles, and reporting its engine error
+        // now would be noise about a hold nobody is waiting on.
         if (epoch !== holdEpoch || !held.has(id)) {
           return;
         }
-        await nextMacrotask();
-        if (epoch !== holdEpoch || !held.has(id)) {
-          return;
+        // Release the hold WITHOUT finalizing: `finalize` drains, which
+        // hands the same text back to the engine that just refused it
+        // MAX_DRAIN_RETRIES times in a row and throws from here. The
+        // session keeps its pending text (a later append or flush retries
+        // it), and the binding stops reporting `holding: true` for a row it
+        // can no longer wait on.
+        held.delete(id);
+        if (held.size === 0) {
+          cancelGrace();
+          setHolding(false);
         }
-        if (sink.pendingLength === 0) {
-          break;
-        }
-        if (!notified) {
-          // The re-check caught text on a session parked empty (the final
-          // render-loop feed): tell its smoother the run is over now, so
-          // the late tail drains against the bounded deadline instead of
-          // the steady pacing rate.
-          sink.notifyRunFinalized();
-          notified = true;
-        }
+        reportAbandonedDrain(id, error);
+        return;
       }
       held.delete(id);
       sink.finalize(reason);
@@ -355,7 +577,7 @@ export function bindRunTextEvents(
   const recordFor = (id: string): RowRecord => {
     let rec = rows.get(id);
     if (rec === undefined) {
-      rec = { preexisting: null, content: '' };
+      rec = { preexisting: null, content: '', adopted: false, paced: false };
       rows.set(id, rec);
     }
     return rec;
@@ -389,6 +611,9 @@ export function bindRunTextEvents(
     }
     lastDeltaId = id;
 
+    // Whether this binding has ever routed the id BEFORE this delta — the
+    // adoption question below, which `recordFor` would erase by minting.
+    const known = rows.has(id);
     const rec = recordFor(id);
     // A row's FIRST routing decision of this run observation — the moment
     // late-row adoption (behavior d) can apply, judged below.
@@ -396,14 +621,46 @@ export function bindRunTextEvents(
     if (unjudged) {
       rec.preexisting = preRunIds === null || preRunIds.has(id);
     }
-    const sink = sinkFor(id);
+    const existing = store.get(id);
+    const sink = existing ?? store.create(id);
+    if (!known && existing !== undefined) {
+      // The session predates this binding: a rebind mid-run (the hook does
+      // this on an `events` identity change, which an inline event object
+      // makes every render), or a host that created the row's session
+      // itself. Whatever it already holds, this instance did not route and
+      // cannot reconstruct — so its deltas append onto it instead of
+      // replacing it (see `RowRecord.adopted`).
+      rec.adopted = true;
+      // Text still pending means a reveal is in flight on this row: it was
+      // born in a run somebody observed and is being metered out. Stay on
+      // the buffered path, because `append` would drain that withheld tail
+      // into one commit (see `RowRecord.paced`).
+      rec.paced = existing.pendingLength > 0;
+    }
     if (!hasAuthority) {
       rec.content += delta;
     }
     if (rec.preexisting) {
       // One-revision commit, never typed. `replace` drains pending and
-      // prefix-diffs, so the steady state is a plain append under the hood.
-      sink.replace(policy?.getContent?.(id) ?? rec.content);
+      // prefix-diffs, so the steady state is a plain append under the hood —
+      // but only the full text may be handed to it: the authority's, or the
+      // accumulation when this binding has seen the row from its first
+      // character. An adopted row appends its delta instead, which is the
+      // same one-revision commit without the reset a truncated `replace`
+      // would cause — unless the takeover caught it mid-reveal, in which
+      // case it keeps metering (see `RowRecord.paced`).
+      const authoritative = policy?.getContent?.(id);
+      if (authoritative !== undefined) {
+        sink.replace(authoritative);
+      } else if (rec.adopted) {
+        if (rec.paced) {
+          sink.appendBuffered(delta);
+        } else {
+          sink.append(delta);
+        }
+      } else {
+        sink.replace(rec.content);
+      }
     } else {
       sink.appendBuffered(delta);
     }
@@ -433,7 +690,21 @@ export function bindRunTextEvents(
     endedIds.add(id);
   });
 
-  const offFinalized = events.onRunFinalized(() => {
+  const offFinalized = events.onRunFinalized((runId) => {
+    if (staleRun(runId)) {
+      // A spent run's late RUN_FINISHED (behavior i): settling here would
+      // end the run this binding is actually observing.
+      return;
+    }
+    // This run is over, so its identity stops meaning "in flight" and
+    // starts meaning "spent" — both the id the event carried and the one
+    // the observed run start gave us (the same id, for a host that sends
+    // both). Clearing `observedRunId` is what keeps a NEXT run whose start
+    // this binding never sees able to finalize: its id is unknown, not
+    // spent, so it fails open.
+    markRunSpent(observedRunId);
+    markRunSpent(runId);
+    observedRunId = undefined;
     const epoch = holdEpoch;
     // Settle across the STORE, not the binding-local `rows` map: a rebind
     // mid-run hands a fresh instance a store holding sessions it never
@@ -504,7 +775,11 @@ export function bindRunTextEvents(
     }
   });
 
-  const offFailed = events.onRunFailed((info) => {
+  const offFailed = events.onRunFailed((info, runId) => {
+    if (staleRun(runId)) {
+      // A spent run's failure is not this run's failure (behavior i).
+      return;
+    }
     if (info?.disposition === 'benign') {
       // Reconnect handoff / conflict-with-resume / stale interrupt: the
       // stream is not over. Leave every session streaming (an existing hold
@@ -513,6 +788,11 @@ export function bindRunTextEvents(
     }
     const reason: FinalizeReason =
       info?.disposition === 'aborted' ? 'aborted' : 'failed';
+    // Deliberately NOT marked spent here: AG-UI's failure lifecycle is
+    // failed THEN finalized, and that follow-on RUN_FINISHED is a path this
+    // binding handles (`terminalFailureSeen` below settles anything the
+    // failure did not reach). Filtering it out would skip that. The run is
+    // marked spent when the finalize arrives, like any other run end.
     terminalFailureSeen = true;
     holdEpoch += 1;
     held.clear();
@@ -533,12 +813,30 @@ export function bindRunTextEvents(
     setHolding(false);
   });
 
-  const offStarted = events.onRunStarted?.((existingMessageIds) => {
+  const offStarted = events.onRunStarted?.((existingMessageIds, runId) => {
     // A new run start flushes any leftover drain: still-held sessions from
     // the previous run settle (with their run-end reasons) before the new
     // run's rows begin. (This also cancels an armed late-row grace.)
     settleHeld();
     terminalFailureSeen = false;
+    if (runId !== undefined) {
+      // A run that is STARTING is live, whatever this binding remembers
+      // about the id: a retry reusing it, a replayed RUN_STARTED, an
+      // interleaving that comes back to it. Leaving it spent would filter
+      // out the end of a run happening right now and strand its sessions in
+      // 'streaming' for the binding's life (behavior i).
+      spentRunIds.delete(runId);
+    }
+    if (observedRunId !== runId) {
+      // Whatever was in flight has just been superseded: from here its late
+      // RUN_FINISHED / RUN_ERROR must not settle this new run's sessions
+      // (behavior i). A repeated start for the same id is not a supersession.
+      markRunSpent(observedRunId);
+    }
+    // The run being observed from here on — including `undefined` from a
+    // host that sends no ids, which leaves nothing to mark spent at this
+    // run's end rather than carrying the previous run's identity forward.
+    observedRunId = runId;
     // Copy at the event boundary: hosts naturally pass their LIVE
     // timeline-id set, and the standard AG-UI order lets them add the
     // newborn id at TEXT_MESSAGE_START — before this binding's lazy
@@ -581,12 +879,21 @@ export function bindRunTextEvents(
       // Created by a rewrite = adopted content, pre-existing by definition:
       // it must render in one revision, never type out. Content retained
       // only without an authority — the same gate as the delta path.
-      rows.set(id, { preexisting: true, content: hasAuthority ? '' : content });
+      rows.set(id, {
+        preexisting: true,
+        content: hasAuthority ? '' : content,
+        adopted: false,
+        paced: false,
+      });
     } else if (!hasAuthority) {
       // An already-routed row keeps its routing decision (a mid-run patch
       // of a streaming row keeps streaming its subsequent deltas); only the
-      // accumulated base rebases.
+      // accumulated base rebases. The rewrite is the row's full text, so an
+      // adopted row stops being adopted: the fallback is the whole story
+      // again and its next delta can go back through `replace`.
       rec.content = content;
+      rec.adopted = false;
+      rec.paced = false;
     }
     const sink = sinkFor(id);
     if (rec !== undefined && rec.preexisting === false) {
@@ -615,6 +922,21 @@ export function bindRunTextEvents(
       setHolding(false);
     }
     preRunIds = null;
+    // Run observation is gone, and with it the identity of whatever was in
+    // flight: the run finishing next may well be one that started during
+    // the detached stretch. It is NOT marked spent — it may still be
+    // running, and a run this binding cannot see the end of must keep its
+    // right to finalize.
+    observedRunId = undefined;
+    // The spent-run memory goes too, deliberately. Everything in it was
+    // learned before a gap this binding cannot see into: a run it watched
+    // end may have been retried under the same id, and the catch-up stream
+    // may replay that run's lifecycle. Keeping the memory would filter a
+    // legitimate run end and strand its sessions in 'streaming' forever;
+    // dropping it can at worst let a genuinely late event settle rows early,
+    // which the next delta undoes (behavior i's fail-open). Attach clears
+    // every other piece of run observation for the same reason.
+    spentRunIds.clear();
     endedIds.clear();
     lastDeltaId = null;
     terminalFailureSeen = false;
@@ -651,7 +973,26 @@ export function bindRunTextEvents(
   };
 }
 
+/**
+ * What `useAgUiRunSessions` passes to the sessions it creates: the
+ * `StreamSessionInit` surface (with the smoother as a factory — one session
+ * per row), plus the host `policy`. The same session fields as
+ * `UseAgUiSessionInit`, so a host can move between the two hooks without
+ * losing a knob; there is no `coalesce` here because the run-scoped binding
+ * always buffers a row born inside an observed run.
+ *
+ * Every session field is read when a row's session is CREATED and holds for
+ * that session's life — changing this object on a later render reaches the
+ * next new row, not one already streaming. Only `policy` is live (see its
+ * own note).
+ */
 export interface UseAgUiRunSessionsInit {
+  /**
+   * Parser for every session this hook creates. Absent, sessions use the
+   * package default (the native md4c engine) — pass one where native code
+   * cannot run, or to swap the parser wholesale.
+   */
+  engine?: Engine;
   /** Parse options, captured when each session is created. */
   options?: EngineOptions;
   /**
@@ -662,6 +1003,8 @@ export interface UseAgUiRunSessionsInit {
   smoother?: () => Smoother;
   /** Forwarded to each created session (see `StreamSessionInit`). */
   holdBackChars?: number;
+  /** Forwarded to each created session (see `StreamSessionInit`). */
+  holdIdleMs?: number;
   /** Forwarded to each created session (see `StreamSessionInit.repair`). */
   repair?: RepairOptions;
   /**
@@ -669,6 +1012,13 @@ export interface UseAgUiRunSessionsInit {
    * `StreamSessionInit.bufferScheduler`).
    */
   bufferScheduler?: BufferScheduler;
+  /**
+   * Forwarded to each created session (see
+   * `StreamSessionInit.idleScheduler`).
+   */
+  idleScheduler?: IdleScheduler;
+  /** Forwarded to each created session (see `StreamSessionInit.now`). */
+  now?: () => number;
   /**
    * Host policy, composed with (not replaced by) the hook's own
    * `onHoldChanged`, which drives the returned `holding` state. The
@@ -693,6 +1043,12 @@ interface StreamSessionStore extends RunSessionStore {
  * rows the host renders before their first delta arrives. `holding` mirrors
  * the run-end drained-hold — `true` while a finished run's tail is still
  * metering out, the cue to keep streaming chrome up.
+ *
+ * At unmount every session in the map is disposed: the component owned them,
+ * and their flush and idle-drain timers outlive both the view's unsubscribe
+ * and the binding's detach (see `StreamSession.dispose`). A host that keeps
+ * rendering a session past this component's life must own it itself, through
+ * its own store and `bindRunTextEvents`.
  */
 export function useAgUiRunSessions(
   events: TextMessageEvents,
@@ -715,11 +1071,15 @@ export function useAgUiRunSessions(
         getOrCreateSession(sessions, id, () => {
           const current = initRef.current;
           return new StreamSession({
+            engine: current?.engine,
             options: current?.options,
             smoother: current?.smoother?.(),
             holdBackChars: current?.holdBackChars,
+            holdIdleMs: current?.holdIdleMs,
             repair: current?.repair,
             bufferScheduler: current?.bufferScheduler,
+            idleScheduler: current?.idleScheduler,
+            now: current?.now,
           });
         }),
       evict: (id) => {
@@ -731,6 +1091,19 @@ export function useAgUiRunSessions(
   const store = storeRef.current;
 
   const [holding, setHolding] = useState(false);
+
+  // Declared before the binding effect so its cleanup is scheduled first.
+  // A session's scheduled flushes and idle drains are timers IT owns:
+  // unsubscribing a view does not stop them, and detaching the binding does
+  // not either, so a screen popping mid-run would leave every held session
+  // parsing and committing into a document nobody reads until it drained.
+  // Pending text goes with them — nothing renders it any more.
+  useDeferredUnmount(() => {
+    for (const session of sessions.values()) {
+      session.dispose();
+    }
+    sessions.clear();
+  });
 
   useEffect(() => {
     const latched = initRef.current?.policy;

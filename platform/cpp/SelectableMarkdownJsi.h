@@ -72,15 +72,25 @@
  * 6. A RUNTIME THAT CANNOT BACK AN ArrayBuffer BY A MutableBuffer IS NEVER
  *    INSTALLED INTO. Invariant 5 rests on jsi::Runtime::createArrayBuffer,
  *    which is *not* universally implemented: React Native's JSCRuntime
- *    implements it as `throw std::logic_error("Not implemented")` on every
- *    version this package supports (ReactCommon/jsc/JSCRuntime.cpp, checked
- *    on 0.73 through 0.81). Publishing the binding on such a runtime would
- *    advertise a parser that throws on every call, and it would throw from
- *    inside `parse` — indistinguishable, from JS, from a document md4c
- *    choked on. So installSelectableMarkdown probes the capability once and
- *    refuses the install when it is missing, which turns a per-document
- *    mystery into one startup warning naming Hermes. Hermes, the default on
- *    every supported version, passes the probe.
+ *    implements it as `throw std::logic_error("Not implemented")`
+ *    (ReactCommon/jsc/JSCRuntime.cpp). Publishing the binding on such a
+ *    runtime would advertise a parser that throws on every call, and it
+ *    would throw from inside `parse` — indistinguishable, from JS, from a
+ *    document md4c choked on. So installSelectableMarkdown probes the
+ *    capability once and refuses the install when it is missing, which turns
+ *    a per-document mystery into one startup warning naming Hermes. Hermes
+ *    passes the probe.
+ *
+ *    WHAT WAS ACTUALLY CHECKED, and against which versions. The JSCRuntime
+ *    source was read on 0.73 through 0.81; package.json's peer floor is now
+ *    `react-native >= 0.82`, and nothing in this repository has re-read it
+ *    there (CI compiles against the 0.75.4 devDependency's headers). That
+ *    gap costs correctness nothing, because the refusal is a *probe* and not
+ *    a version test: a runtime that grows a working createArrayBuffer simply
+ *    passes and gets the binding. What the gap does mean is that "JSC is
+ *    refused" is a statement about versions this package no longer supports,
+ *    so treat it as the reason the probe exists rather than as a claim about
+ *    0.82+.
  */
 
 #ifndef SELECTABLE_MARKDOWN_JSI_H

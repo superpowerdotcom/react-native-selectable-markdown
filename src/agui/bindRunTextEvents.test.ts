@@ -14,14 +14,18 @@ import type { RunFailureInfo, TextMessageEvents } from './useAgUiSession';
 type DeltaCb = (messageId: string, delta: string) => void;
 type EndCb = (messageId: string) => void;
 type VoidCb = () => void;
-type FailedCb = (info?: RunFailureInfo) => void;
-type StartedCb = (existingMessageIds: ReadonlySet<string>) => void;
+type FinalizedCb = (runId?: string) => void;
+type FailedCb = (info?: RunFailureInfo, runId?: string) => void;
+type StartedCb = (
+  existingMessageIds: ReadonlySet<string>,
+  runId?: string,
+) => void;
 type ReplacedCb = (messageId: string, content: string) => void;
 
 class FakeEvents implements TextMessageEvents {
   private deltaCbs = new Set<DeltaCb>();
   private endCbs = new Set<EndCb>();
-  private finalizedCbs = new Set<VoidCb>();
+  private finalizedCbs = new Set<FinalizedCb>();
   private failedCbs = new Set<FailedCb>();
   private startedCbs = new Set<StartedCb>();
   private replacedCbs = new Set<ReplacedCb>();
@@ -37,7 +41,7 @@ class FakeEvents implements TextMessageEvents {
     return () => this.endCbs.delete(cb);
   }
 
-  onRunFinalized(cb: VoidCb): () => void {
+  onRunFinalized(cb: FinalizedCb): () => void {
     this.finalizedCbs.add(cb);
     return () => this.finalizedCbs.delete(cb);
   }
@@ -70,15 +74,15 @@ class FakeEvents implements TextMessageEvents {
     for (const cb of [...this.endCbs]) cb(messageId);
   }
 
-  emitRunFinalized(): void {
-    for (const cb of [...this.finalizedCbs]) cb();
+  emitRunFinalized(runId?: string): void {
+    for (const cb of [...this.finalizedCbs]) cb(runId);
   }
 
-  emitRunFailed(info?: RunFailureInfo): void {
-    for (const cb of [...this.failedCbs]) cb(info);
+  emitRunFailed(info?: RunFailureInfo, runId?: string): void {
+    for (const cb of [...this.failedCbs]) cb(info, runId);
   }
 
-  emitRunStarted(existingMessageIds: Iterable<string>): void {
+  emitRunStarted(existingMessageIds: Iterable<string>, runId?: string): void {
     // A Set passes through BY REFERENCE: snapshotting belongs to the
     // binding (it must copy at the event boundary — hosts hand over their
     // live timeline-id set), and copying here would mask a regression in
@@ -87,7 +91,7 @@ class FakeEvents implements TextMessageEvents {
       existingMessageIds instanceof Set
         ? existingMessageIds
         : new Set(existingMessageIds);
-    for (const cb of [...this.startedCbs]) cb(snapshot);
+    for (const cb of [...this.startedCbs]) cb(snapshot, runId);
   }
 
   emitMessageReplaced(messageId: string, content: string): void {
@@ -455,6 +459,55 @@ describe('bindRunTextEvents', () => {
     await drainSettles();
     expect(sink('m1').finalizeReasons).toEqual(['end']);
     expect(holds).toEqual([true, false]);
+  });
+
+  it('releases the hold and reports the error when a session abandons its drain', async () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    const holds: boolean[] = [];
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    const engineError = new Error('engine refused every drain');
+    try {
+      bindRunTextEvents(events, store, { onHoldChanged: (h) => holds.push(h) });
+
+      events.emitRunStarted([]);
+      events.emitDelta('m1', 'tail');
+      events.emitMessageEnd('m1');
+      const held = sink('m1');
+      held.pending = 4;
+      // The session gave up on its tail: MAX_DRAIN_RETRIES scheduled drains
+      // threw in a row, so `drained()` rejects with the engine's error
+      // instead of waiting for a drain that is never coming.
+      held.drained = () => Promise.reject(engineError);
+      events.emitRunFinalized();
+      expect(holds).toEqual([true]);
+
+      await drainSettles();
+
+      // The hold is released — a dead engine must not leave the host's
+      // status chrome streaming forever — and nothing finalized: finalize
+      // drains, which would hand the same text back to the same engine.
+      expect(holds).toEqual([true, false]);
+      expect(held.finalizeReasons).toEqual([]);
+      expect(held.calls).toEqual(['appendBuffered:tail', 'notifyRunFinalized']);
+      // Reported once, naming the session and carrying the engine's error.
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      expect(String(consoleError.mock.calls[0]?.[0])).toContain('m1');
+      expect(consoleError.mock.calls[0]?.[1]).toBe(engineError);
+      // The rejection is handled inside the parked continuation, so it never
+      // reaches the process as an unhandled rejection.
+      expect(unhandled).toEqual([]);
+    } finally {
+      consoleError.mockRestore();
+      process.off('unhandledRejection', onUnhandled);
+    }
   });
 
   it('finalizes immediately on terminal failure: flush first, no hold', () => {
@@ -1033,6 +1086,361 @@ describe('bindRunTextEvents', () => {
     expect(sink('m1').finalizeReasons).toEqual(['end']);
     expect(holds).toEqual([true, false]);
   });
+
+  it('appends for a row whose session predates this binding instead of replacing it with the tail it saw', () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    const detach = bindRunTextEvents(events, store);
+
+    events.emitRunStarted([]);
+    events.emitDelta('m1', 'Hello ');
+    events.emitDelta('m1', 'world. ');
+
+    // Rebind mid-run: fresh binding, same store (the hook does this on an
+    // `events` identity change, which an inline event object causes every
+    // render). The new instance has no run observation, so the row judges
+    // pre-existing, and no accumulated content — `replace` would hand the
+    // session the tail alone and reset it to that.
+    detach();
+    bindRunTextEvents(events, store);
+    events.emitDelta('m1', 'and it ');
+    events.emitDelta('m1', 'continues.');
+
+    expect(sink('m1').calls).toEqual([
+      'appendBuffered:Hello ',
+      'appendBuffered:world. ',
+      'append:and it ',
+      'append:continues.',
+    ]);
+  });
+
+  it('replaces from the authority after a rebind, which knows the whole row', () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    let content = '';
+    const policy: RunBindingPolicy = { getContent: () => content };
+    const detach = bindRunTextEvents(events, store, policy);
+
+    events.emitRunStarted([]);
+    content = 'Hello ';
+    events.emitDelta('m1', 'Hello ');
+
+    detach();
+    bindRunTextEvents(events, store, policy);
+    content = 'Hello world.';
+    events.emitDelta('m1', 'world.');
+
+    // Adoption is the fallback's problem only: with an authority the full
+    // text is known, so the row keeps its one-revision replace.
+    expect(sink('m1').calls).toEqual([
+      'appendBuffered:Hello ',
+      'replace:Hello world.',
+    ]);
+  });
+
+  it("appends into a session the host created before the row's first delta", () => {
+    const events = new FakeEvents();
+    const { store, sink, created } = makeStore();
+    bindRunTextEvents(events, store);
+    // `sessionFor` in the hook: the host rendered the row before its text
+    // arrived, so the session exists and this binding never fed it.
+    store.create('m1');
+
+    events.emitRunStarted(['m1']);
+    events.emitDelta('m1', 'first');
+    events.emitDelta('m1', ' second');
+
+    expect(created).toEqual(['m1']);
+    expect(sink('m1').calls).toEqual(['append:first', 'append: second']);
+  });
+
+  it('a rewrite ends adoption: the row goes back to replacing with the full text', () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    const detach = bindRunTextEvents(events, store);
+
+    events.emitRunStarted([]);
+    events.emitDelta('m1', 'streamed');
+    detach();
+    bindRunTextEvents(events, store);
+    events.emitDelta('m1', ' tail');
+    // The rewrite is the row's full text, so the accumulation is the whole
+    // story again from here.
+    events.emitMessageReplaced('m1', 'whole text');
+    events.emitDelta('m1', ' more');
+
+    expect(sink('m1').calls).toEqual([
+      'appendBuffered:streamed',
+      'append: tail',
+      'replace:whole text',
+      'replace:whole text more',
+    ]);
+  });
+
+  it('keeps a row adopted across a later run start, whose snapshot re-seeds nothing', () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    const detach = bindRunTextEvents(events, store);
+
+    events.emitRunStarted([], 'run-1');
+    events.emitDelta('m1', 'Hello ');
+    detach();
+    bindRunTextEvents(events, store);
+    events.emitDelta('m1', 'world. ');
+
+    // A second run continuing the same row. The routing decision re-judges
+    // (m1 is in the new pre-run snapshot, so pre-existing again) but the
+    // accumulation is STILL only the tail this instance saw — nothing about
+    // a run start re-seeds it — so adoption must survive: replacing from
+    // that tail would drop everything streamed before the rebind, which is
+    // the defect adoption exists to prevent.
+    events.emitRunStarted(['m1'], 'run-2');
+    events.emitDelta('m1', 'More.');
+
+    expect(sink('m1').calls).toEqual([
+      'appendBuffered:Hello ',
+      'append:world. ',
+      'append:More.',
+    ]);
+  });
+
+  it('ends adoption when the host evicts the row at run start', () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    const detach = bindRunTextEvents(events, store);
+
+    events.emitRunStarted([], 'run-1');
+    events.emitDelta('m1', 'Hello ');
+    detach();
+    bindRunTextEvents(events, store, { evictOnRunStart: (id) => id === 'm1' });
+    events.emitDelta('m1', 'world. ');
+
+    // Eviction drops the session AND (through the run-start reconciliation)
+    // the row record, so the row starts over from nothing with nothing to
+    // lose — the documented way out of adoption, besides a getContent
+    // authority.
+    events.emitRunStarted(['m1'], 'run-2');
+    events.emitDelta('m1', 'fresh');
+
+    expect(sink('m1').calls).toEqual(['replace:fresh']);
+  });
+
+  it('keeps an adopted row metered when the takeover caught it mid-reveal', () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    const detach = bindRunTextEvents(events, store);
+
+    events.emitRunStarted([]);
+    events.emitDelta('m1', 'Hello world, a long answer. ');
+    // The row is born, so it types: its smoother still owes 24 characters
+    // when the rebind hands the session to a fresh binding.
+    sink('m1').pending = 24;
+
+    detach();
+    bindRunTextEvents(events, store);
+    events.emitDelta('m1', 'x');
+    events.emitDelta('m1', 'yz');
+
+    // Adoption alone would put these on `append`, which drains the withheld
+    // tail into one commit and ends the reveal for good; pending text says
+    // the row was mid-reveal, so it stays on the buffered path.
+    expect(sink('m1').calls).toEqual([
+      'appendBuffered:Hello world, a long answer. ',
+      'appendBuffered:x',
+      'appendBuffered:yz',
+    ]);
+  });
+
+  it('ignores a run finalize belonging to a run it watched be superseded', async () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    bindRunTextEvents(events, store);
+
+    // run-1 observed, then superseded by run-2: from here the binding KNOWS
+    // run-1 is spent, which is what makes its late RUN_FINISHED droppable.
+    events.emitRunStarted([], 'run-1');
+    events.emitRunStarted([], 'run-2');
+    events.emitDelta('m1', 'live');
+    events.emitMessageEnd('m1');
+    events.emitRunFinalized('run-1');
+    await drainSettles();
+    expect(sink('m1').finalizeReasons).toEqual([]);
+
+    events.emitRunFinalized('run-2');
+    await drainSettles();
+    expect(sink('m1').finalizeReasons).toEqual(['end']);
+  });
+
+  it('ignores a run failure belonging to a run it watched be superseded', () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    bindRunTextEvents(events, store);
+
+    events.emitRunStarted([], 'run-1');
+    events.emitRunStarted([], 'run-2');
+    events.emitDelta('m1', 'live');
+    events.emitRunFailed({ disposition: 'failed' }, 'run-1');
+    expect(sink('m1').finalizeReasons).toEqual([]);
+
+    events.emitRunFailed({ disposition: 'failed' }, 'run-2');
+    expect(sink('m1').finalizeReasons).toEqual(['failed']);
+  });
+
+  it('settles a run whose start it never saw: an unknown id is not a stale one', async () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    bindRunTextEvents(events, store);
+
+    events.emitRunStarted([], 'run-1');
+    events.emitDelta('m1', 'first answer');
+    events.emitMessageEnd('m1');
+    events.emitRunFinalized('run-1');
+    await drainSettles();
+    expect(sink('m1').finalizeReasons).toEqual(['end']);
+
+    // A second run this host does not announce — a resume, a reconnect, a
+    // run created elsewhere — that still ids its lifecycle events. Its id is
+    // unknown here, not spent, so it must settle: dropping a legitimate run
+    // end strands the row in 'streaming' for the binding's whole life, which
+    // is strictly worse than the premature settle the filter guards against
+    // (that one self-heals on the next delta).
+    events.emitDelta('m2', 'second answer');
+    events.emitMessageEnd('m2');
+    events.emitRunFinalized('run-2');
+    await drainSettles();
+
+    expect(sink('m2').finalizeReasons).toEqual(['end']);
+  });
+
+  it('drops a repeat of a run end it already acted on', async () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    bindRunTextEvents(events, store);
+
+    events.emitRunStarted([], 'run-1');
+    events.emitDelta('m1', 'live');
+    events.emitMessageEnd('m1');
+    events.emitRunFinalized('run-1');
+    await drainSettles();
+    expect(sink('m1').finalizeReasons).toEqual(['end']);
+
+    // Double delivery of a run that has already ended here: spent means
+    // spent, so it cannot settle a row that started after it.
+    events.emitDelta('m2', 'next answer');
+    events.emitRunFinalized('run-1');
+    await drainSettles();
+
+    expect(sink('m2').finalizeReasons).toEqual([]);
+  });
+
+  it('settles a run that starts again under an id it watched end', async () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    bindRunTextEvents(events, store);
+
+    events.emitRunStarted([], 'run-1');
+    events.emitDelta('m1', 'first answer');
+    events.emitMessageEnd('m1');
+    events.emitRunFinalized('run-1');
+    await drainSettles();
+    expect(sink('m1').finalizeReasons).toEqual(['end']);
+
+    // The host runs the id again — a retry reusing it, a replayed
+    // RUN_STARTED. A run that is starting is live, so the id stops being
+    // spent; leaving it spent would drop this run's own end and strand the
+    // row it streamed in 'streaming' for the binding's life.
+    events.emitRunStarted(['m1'], 'run-1');
+    events.emitDelta('m2', 'second answer');
+    events.emitMessageEnd('m2');
+    events.emitRunFinalized('run-1');
+    await drainSettles();
+
+    expect(sink('m2').finalizeReasons).toEqual(['end']);
+  });
+
+  it('revives an id that comes back into observation after being superseded', async () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    bindRunTextEvents(events, store);
+
+    // run-1 is superseded by run-2, then observed again: interleaved runs,
+    // where the binding's last word on run-1 is that it is live.
+    events.emitRunStarted([], 'run-1');
+    events.emitRunStarted([], 'run-2');
+    events.emitRunStarted([], 'run-1');
+    events.emitDelta('m1', 'live');
+    events.emitMessageEnd('m1');
+    events.emitRunFinalized('run-1');
+    await drainSettles();
+    expect(sink('m1').finalizeReasons).toEqual(['end']);
+
+    // run-2 was superseded and never came back, so its late end is still
+    // filtered out — reviving one id revives only that id.
+    events.emitDelta('m2', 'next answer');
+    events.emitRunFinalized('run-2');
+    await drainSettles();
+
+    expect(sink('m2').finalizeReasons).toEqual([]);
+  });
+
+  it('clears the spent-run memory on attach, so a retried id can finalize', async () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    bindRunTextEvents(events, store);
+
+    events.emitRunStarted([], 'run-1');
+    events.emitDelta('m1', 'before the gap');
+    events.emitMessageEnd('m1');
+    events.emitRunFinalized('run-1');
+    await drainSettles();
+    expect(sink('m1').finalizeReasons).toEqual(['end']);
+
+    // Catch-up covers a stretch this binding could not see: run-1 may have
+    // been retried in it, and the caught-up stream may replay its start. So
+    // nothing remembered as spent is trustworthy any more — the memory goes
+    // with the rest of the run observation.
+    events.emitAttached();
+    events.emitDelta('m2', 'after the gap');
+    events.emitMessageEnd('m2');
+    events.emitRunFinalized('run-1');
+    await drainSettles();
+
+    expect(sink('m2').finalizeReasons).toEqual(['end']);
+  });
+
+  it('filters nothing when the observed run start carried no id', async () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    bindRunTextEvents(events, store);
+
+    // Fail-open: an id on one side only proves nothing, so a host that
+    // sends no run ids keeps the original settle-everything behavior.
+    events.emitRunStarted([]);
+    events.emitDelta('m1', 'live');
+    events.emitMessageEnd('m1');
+    events.emitRunFinalized('run-9');
+    await drainSettles();
+
+    expect(sink('m1').finalizeReasons).toEqual(['end']);
+  });
+
+  it('drops run identity on attach, so the caught-up run can still finalize', async () => {
+    const events = new FakeEvents();
+    const { store, sink } = makeStore();
+    bindRunTextEvents(events, store);
+
+    events.emitRunStarted([], 'run-1');
+    events.emitDelta('m1', 'live');
+    // Catch-up covers the gap: the run that is finishing now may well be one
+    // this binding never saw start, so the filter goes back off with the
+    // rest of the run observation.
+    events.emitAttached();
+    events.emitMessageEnd('m1');
+    events.emitRunFinalized('run-2');
+    await drainSettles();
+
+    expect(sink('m1').finalizeReasons).toEqual(['end']);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1266,5 +1674,106 @@ describe('bindRunTextEvents over real StreamSessions', () => {
     expect(session.snapshot().document.source).toBe('abcdWXYZ');
     frame.fire();
     expect(session.snapshot().document.source).toBe('abcdWXYZ12');
+  });
+
+  it('a rebind mid-run keeps the streamed document instead of resetting it to the next delta', () => {
+    const frame = manualFrame();
+    const sessions = new Map<string, StreamSession>();
+    const store: RunSessionStore = {
+      get: (id) => sessions.get(id),
+      create: (id) => {
+        const session = new StreamSession({
+          engine: wholeParagraphEngine,
+          bufferScheduler: frame.scheduler,
+          idleScheduler: () => () => {},
+        });
+        sessions.set(id, session);
+        return session;
+      },
+      evict: (id) => {
+        sessions.delete(id);
+      },
+      ids: () => sessions.keys(),
+    };
+    const events = new FakeEvents();
+    // No `getContent`: the binding's own accumulation is all it has, and a
+    // fresh instance's accumulation starts empty.
+    const detach = bindRunTextEvents(events, store);
+
+    events.emitRunStarted([]);
+    events.emitDelta('m1', 'Hello ');
+    events.emitDelta('m1', 'world, ');
+    events.emitDelta('m1', 'this is a long answer. ');
+    frame.fire();
+    const session = sessions.get('m1');
+    if (session === undefined) {
+      throw new Error('session not created');
+    }
+    expect(session.snapshot().document.source).toBe(
+      'Hello world, this is a long answer. ',
+    );
+
+    // The hook rebinds on every `events` identity change. The row now
+    // judges pre-existing (no observed run start), and routing it through
+    // `replace` with what THIS instance accumulated would hand the session
+    // a non-prefix and reset it — 36 already-rendered characters gone
+    // mid-stream.
+    detach();
+    bindRunTextEvents(events, store);
+    events.emitDelta('m1', 'and it continues.');
+
+    expect(session.snapshot().document.source).toBe(
+      'Hello world, this is a long answer. and it continues.',
+    );
+    expect(session.snapshot().phase).toBe('streaming');
+  });
+
+  it('a rebind mid-reveal keeps pacing the row instead of dumping its tail', () => {
+    const frame = manualFrame();
+    const sessions = new Map<string, StreamSession>();
+    const store: RunSessionStore = {
+      get: (id) => sessions.get(id),
+      create: (id) => {
+        const session = new StreamSession({
+          engine: wholeParagraphEngine,
+          bufferScheduler: frame.scheduler,
+          idleScheduler: () => () => {},
+          smoother: () => 4, // metered release: 4 units per fired flush
+        });
+        sessions.set(id, session);
+        return session;
+      },
+      evict: (id) => {
+        sessions.delete(id);
+      },
+      ids: () => sessions.keys(),
+    };
+    const events = new FakeEvents();
+    const detach = bindRunTextEvents(events, store);
+
+    events.emitRunStarted([]);
+    events.emitDelta('m1', 'Hello world, a long answer. '); // 28 units
+    frame.fire();
+    const session = sessions.get('m1');
+    if (session === undefined) {
+      throw new Error('session not created');
+    }
+    expect(session.snapshot().document.source).toBe('Hell');
+    expect(session.pendingLength).toBe(24);
+
+    // The hook rebinds on every `events` identity change. The row judges
+    // pre-existing and adopted, but it is mid-reveal: routing its next
+    // delta through `append` would drain all 24 withheld characters into
+    // one commit and never meter this row again.
+    detach();
+    bindRunTextEvents(events, store);
+    events.emitDelta('m1', 'x');
+
+    expect(session.snapshot().document.source).toBe('Hell');
+    expect(session.pendingLength).toBe(25);
+
+    frame.fire();
+    expect(session.snapshot().document.source).toBe('Hello wo');
+    expect(session.snapshot().phase).toBe('streaming');
   });
 });

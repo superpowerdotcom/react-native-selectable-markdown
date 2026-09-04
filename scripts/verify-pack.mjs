@@ -8,8 +8,10 @@
 // tarball into a scratch dir, and asserts that everything a consuming app
 // resolves is present and loadable.
 //
-// Run with `npm run verify:pack`. Packing triggers `prepare`/`prepack`, so
-// this also proves the build-on-install hook works.
+// Run with `npm run verify:pack`. Packing triggers `prepare` — the one
+// build lifecycle script this package declares, and the same one npm runs on
+// `npm publish` and on a `github:` install — so this also proves the
+// build-on-install hook works.
 
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -68,9 +70,15 @@ const REQUIRED_FILES = ['react-native.config.js', 'src/index.ts'];
 //                          registers codegen's non-measuring descriptor and
 //                          every run lays out at zero height — no build error.
 //   platform/ios/fabric    the measurer and the mounting-layer view. Missing,
-//                          every new-architecture iOS app fails to link on
-//                          `SelectableRunHostCls`, a symbol codegen generated
-//                          a reference to on the app's behalf.
+//                          the class the generated
+//                          RCTThirdPartyComponentsProvider names is never
+//                          compiled, so at this package's peer floor
+//                          (react-native >= 0.82) its NSClassFromString
+//                          lookup finds nothing: a silent registration miss
+//                          whose only symptom is `RunHost` throwing at mount.
+//                          On the older React Natives that still call
+//                          `SelectableRunHostCls` directly it is instead a
+//                          link failure in the consuming app.
 //   android/src/main/jni   the CMake seam itself and the JNI measurer.
 const REQUIRED_NATIVE_FILES = [
   'platform/fabric/RNSMRunHostShadowNode.cpp',
@@ -232,11 +240,13 @@ const checkPodspecPaths = (pkgDir, podspecPath, manifest) => {
  * callee is `codegenNativeComponent`, and build-time codegen only parses a
  * file whose source text matches `/export\s+default\s+\(?codegenNativeComponent</`.
  * `tsc` erases the type argument and turns the export into
- * `exports.default = …`, which matches neither. Nothing throws: the default
- * export falls back to the runtime `codegenNativeComponent`, which returns
- * `requireNativeComponent`, which is dead under bridgeless — so every run
- * drops to the `<Text selectable>` fallback and both custom menu items vanish
- * with no error anywhere.
+ * `exports.default = …`, which matches neither. Nothing in the build reports
+ * it: the default export falls back to the runtime `codegenNativeComponent`,
+ * which returns `requireNativeComponent`, which is dead under bridgeless — so
+ * the run either renders with a null view config (an invariant violation) or,
+ * where the module resolves to nothing at all, `RunHost` throws. The
+ * `<Text selectable>` fallback that used to swallow both went with the old
+ * architecture in 0.10.0.
  *
  * `check:codegen` proves the *build* does not emit a transpiled copy. This is
  * the only check that sees the artifact a consumer actually installs, so it
@@ -250,7 +260,9 @@ const checkPodspecPaths = (pkgDir, podspecPath, manifest) => {
  *     generates no component at all and still builds cleanly;
  *   - no transpiled copy ships under `main`'s output tree, where a bundler
  *     that ignores the `react-native` field would resolve it and get exactly
- *     the silent degradation above.
+ *     the silent degradation above;
+ *   - the shim that replaces it there ships with a .d.ts beside it, because
+ *     `exports` promises one for every `./dist/*` path.
  *
  * THAT LAST ONE IS KEYED ON CONTENT, NOT ON THE FILENAME, and the difference
  * matters. `dist/view/SelectableRunHostNativeComponent.js` legitimately exists:
@@ -298,7 +310,7 @@ const checkCodegenSpec = (pkgDir, manifest) => {
   // silent pass, which is the failure mode this exists to catch.
   const distDir = path.join(pkgDir, path.dirname(manifest.main ?? 'dist/index.js'));
   if (!fs.existsSync(distDir)) return;
-  let shims = 0;
+  const shimFiles = [];
   const walk = (dir) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
@@ -313,12 +325,35 @@ const checkCodegenSpec = (pkgDir, manifest) => {
               'longer holds. Reach it through a call-expression `require`.',
           );
         } else if (entry.name.endsWith('.js')) {
-          shims++;
+          shimFiles.push(full);
         }
       }
     }
   };
   walk(distDir);
+  const shims = shimFiles.length;
+
+  // A shim with no .d.ts beside it is a hole in `exports`, not just a missing
+  // convenience. The `./dist/*` pattern declares its types as `./dist/*.d.ts`,
+  // and a types condition that names a file which is not in the tarball is a
+  // hard TS7016 for any consumer who deep-imports the path — an error the
+  // package cannot be fixed from the consumer's side. tsc emits every other
+  // dist declaration; this one comes from scripts/emit-dist-spec-shim.mjs,
+  // which is exactly the kind of hand-written emit that goes missing. The
+  // declaration re-exports the prop types from the untranspiled spec in src/,
+  // whose presence in the tarball is asserted at the top of this function.
+  for (const shim of shimFiles) {
+    const declaration = shim.replace(/\.js$/, '.d.ts');
+    if (!fs.existsSync(declaration)) {
+      fail(
+        `codegen spec: ${path.relative(pkgDir, shim)} ships with no ` +
+          `${path.basename(declaration)} beside it, but "exports"'s "./dist/*" entry declares ` +
+          'its types as "./dist/*.d.ts". A TypeScript consumer deep-importing that path gets ' +
+          '"Could not find a declaration file", not an implicit any. ' +
+          '`npm run build` emits both via scripts/emit-dist-spec-shim.mjs.',
+      );
+    }
+  }
 
   // The shim's absence is as consumer-visible as a leak, just louder: the
   // static require in dist/view/RunHost.js stops resolving and every bundler
@@ -404,8 +439,267 @@ const checkRequireGraph = (pkgDir, manifest) => {
   }
 };
 
+/**
+ * ONCE `exports` EXISTS, IT — NOT THE FILE TREE — IS THE PACKAGE'S PUBLIC
+ * SURFACE, and every check above this one resolves by filesystem path and so
+ * cannot see it. `NODE_SAFE_ENTRIES` loads `<pkgDir>/dist/…` directly; a map
+ * that forgot `./dist/*` would leave those files present, loadable and
+ * unreachable, and the failure would surface as ERR_PACKAGE_PATH_NOT_EXPORTED
+ * in a consumer's app rather than here.
+ *
+ * So the deep paths README documents for headless consumers are resolved the
+ * way a consumer resolves them: through a `node_modules` link, by bare
+ * specifier. Both spellings are asserted — with and without `.js` — because
+ * the README writes them without an extension and `exports` does no extension
+ * search of its own; only a subpath pattern for each form makes both work.
+ *
+ * `<name>/package.json` is checked because autolinking resolves the package
+ * root through it (@react-native-community/cli), and an `exports` map that
+ * omits it breaks `pod install` and the Gradle sweep in every consuming app
+ * while every file in this tarball is still exactly where it belongs.
+ *
+ * AND BOTH CONDITIONS, BECAUSE THE PACKAGE NOW SHIPS TWO BUILDS. `require`
+ * takes the CommonJS tree in dist/, `import` takes the ES modules in dist/esm
+ * — and only one of the two can be checked with `createRequire`. So the ESM
+ * half is exercised in a child Node process (checkEsmResolution below), which
+ * both resolves and IMPORTS each Node-safe deep path: an ESM build is
+ * unusually easy to ship broken (a missing `"type": "module"`, one relative
+ * specifier left without its `.js`) and every one of those failures is invisible
+ * to a resolver and loud on the first import.
+ */
+const checkExportsResolution = (pkgDir, manifest) => {
+  const consumer = path.join(scratch, 'consumer');
+  const linked = path.join(consumer, 'node_modules', manifest.name);
+  fs.mkdirSync(path.dirname(linked), { recursive: true });
+  if (!fs.existsSync(linked)) fs.symlinkSync(pkgDir, linked, 'dir');
+  const consumerRequire = createRequire(path.join(consumer, 'index.js'));
+
+  const resolves = (specifier) => {
+    try {
+      return consumerRequire.resolve(specifier);
+    } catch (error) {
+      fail(
+        `exports: a consumer cannot resolve "${specifier}" (${error.code ?? error.message}). ` +
+          'The file may well be in the tarball — "exports" is what decides whether a ' +
+          'consumer is allowed to reach it.',
+      );
+      return null;
+    }
+  };
+
+  const root = resolves(manifest.name);
+  const expectedRoot = path.join(pkgDir, manifest.main ?? '');
+  if (root && fs.realpathSync(root) !== fs.realpathSync(expectedRoot)) {
+    fail(
+      `exports: "${manifest.name}" resolves to ${path.relative(pkgDir, root)} under Node's ` +
+        `own conditions, not to "main" (${manifest.main}).`,
+    );
+  }
+
+  resolves(`${manifest.name}/package.json`);
+
+  for (const [relative] of NODE_SAFE_ENTRIES) {
+    resolves(`${manifest.name}/${relative}`);
+    resolves(`${manifest.name}/${relative.replace(/\.js$/, '')}`);
+  }
+
+  // Metro reads `exports` from React Native 0.79 on, and prefers the
+  // `react-native` condition over `main` when it is there. That condition is
+  // therefore the same load-bearing thing the `react-native` field is (see
+  // checkCodegenSpec): it is what gets the untranspiled codegen spec in front
+  // of Metro. A map whose "." entry lost it sends Metro to dist/ instead, and
+  // the component silently stops having a static view config.
+  const rootEntry = manifest.exports?.['.'];
+  if (manifest.exports && typeof rootEntry === 'object' && rootEntry !== null) {
+    if (rootEntry['react-native'] !== `./${manifest['react-native']}`) {
+      fail(
+        `exports: the "." entry's "react-native" condition is ${JSON.stringify(rootEntry['react-native'])}, ` +
+          `expected "./${manifest['react-native']}". Metro honours "exports" ahead of the ` +
+          '"react-native" field, so this condition is what makes it read the untranspiled spec.',
+      );
+    }
+    if (rootEntry.default !== `./${manifest.main}`) {
+      fail(
+        `exports: the "." entry's "default" condition is ${JSON.stringify(rootEntry.default)}, ` +
+          `expected "./${manifest.main}" — every bundler that is not Metro lands here.`,
+      );
+    }
+    // The two builds, each pinned to the field that names it. `require` must
+    // stay on the CommonJS tree even though `import` exists, and `import` must
+    // point at the ESM one: a map where both conditions resolved to dist/ would
+    // pass every resolution check above and quietly undo the ESM build.
+    if (rootEntry.require?.default !== `./${manifest.main}`) {
+      fail(
+        `exports: the "." entry's "require" condition is ${JSON.stringify(rootEntry.require)}, ` +
+          `expected its "default" to be "./${manifest.main}".`,
+      );
+    }
+    if (manifest.module && rootEntry.import?.default !== `./${manifest.module}`) {
+      fail(
+        `exports: the "." entry's "import" condition is ${JSON.stringify(rootEntry.import)}, ` +
+          `expected its "default" to be "./${manifest.module}" — the ES module build is what ` +
+          'webpack, Rollup and Vite tree-shake.',
+      );
+    }
+  } else if (manifest.exports) {
+    fail('exports: the "." entry is not a conditions object, so nothing pins Metro to src/.');
+  }
+
+  checkEsmResolution(consumer, pkgDir, manifest);
+};
+
+/**
+ * The `import` condition, resolved AND loaded the way a bundler's Node does.
+ *
+ * It has to be a child process: `createRequire().resolve` above can only ever
+ * take the `require` condition, and this package's ESM output is exactly the
+ * kind that resolves and then fails to load — dist/esm/package.json's
+ * `"type": "module"` is what stops Node parsing those files as CommonJS, and
+ * every relative specifier in them needs the `.js` that tsc does not write
+ * (scripts/finish-esm-build.mjs adds both). A missing one is an
+ * ERR_MODULE_NOT_FOUND in a consumer's app and nothing at all here, unless
+ * something actually imports the module.
+ *
+ * The root barrel is resolved but NOT imported, for the same reason it is
+ * absent from NODE_SAFE_ENTRIES: it re-exports the React Native view layer.
+ */
+const checkEsmResolution = (consumer, pkgDir, manifest) => {
+  if (!manifest.exports) return;
+
+  // The `"type": "module"` marker is asserted on the FILE rather than inferred
+  // from the probe below, because the probe cannot see it on a new enough
+  // runtime: Node detects ES module syntax in an untyped .js from 22.7 on, so
+  // this same import succeeds there and fails with `Cannot use import statement
+  // outside a module` on Node 20 — the version both workflows pin and the floor
+  // most consumers are on. A check that passes or fails with the checker's Node
+  // is not a check.
+  const esmDir = path.dirname(path.join(pkgDir, manifest.module ?? 'dist/esm/index.js'));
+  const marker = path.join(esmDir, 'package.json');
+  if (!fs.existsSync(marker)) {
+    fail(
+      `exports: ${path.relative(pkgDir, marker)} is not in the tarball, so Node reads the ` +
+        'ES module build as CommonJS and every import statement in it is a SyntaxError. ' +
+        '`npm run build` writes it via scripts/finish-esm-build.mjs.',
+    );
+  } else {
+    const declared = JSON.parse(fs.readFileSync(marker, 'utf8'));
+    if (declared.type !== 'module') {
+      fail(
+        `exports: ${path.relative(pkgDir, marker)} says "type": ${JSON.stringify(declared.type)}, ` +
+          'not "module" — the ES module build would be parsed as CommonJS.',
+      );
+    }
+    // Bundlers read `sideEffects` from the package.json nearest the module, so
+    // the root's declaration does not reach dist/esm. Without it here, the ESM
+    // build resolves and loads and still cannot be tree-shaken, which is the
+    // only reason it exists.
+    if (declared.sideEffects !== false) {
+      fail(
+        `exports: ${path.relative(pkgDir, marker)} does not declare "sideEffects": false. ` +
+          'webpack and Rollup read that hint from the nearest package.json, so the ES module ' +
+          'build cannot be tree-shaken without it.',
+      );
+    }
+  }
+
+  const probe = path.join(consumer, 'esm-probe.mjs');
+  const specifiers = {
+    resolveOnly: [manifest.name, `${manifest.name}/dist`],
+    load: NODE_SAFE_ENTRIES.flatMap(([relative, exported]) => [
+      [`${manifest.name}/${relative}`, exported],
+      [`${manifest.name}/${relative.replace(/\.js$/, '')}`, exported],
+    ]),
+  };
+  fs.writeFileSync(
+    probe,
+    [
+      'const plan = JSON.parse(process.argv[2]);',
+      'const out = [];',
+      'for (const specifier of plan.resolveOnly) {',
+      '  out.push({ specifier, resolved: import.meta.resolve(specifier) });',
+      '}',
+      'for (const [specifier, exported] of plan.load) {',
+      '  const namespace = await import(specifier);',
+      '  out.push({',
+      '    specifier,',
+      '    resolved: import.meta.resolve(specifier),',
+      '    exports: typeof namespace[exported],',
+      '  });',
+      '}',
+      'process.stdout.write(JSON.stringify(out));',
+      '',
+    ].join('\n'),
+  );
+
+  let reported;
+  try {
+    reported = JSON.parse(
+      execFileSync(process.execPath, [probe, JSON.stringify(specifiers)], {
+        cwd: consumer,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }),
+    );
+  } catch (error) {
+    fail(
+      'exports: the "import" condition is not usable — a consumer importing this package as ' +
+        `ES modules got:\n    ${String(error.stderr || error.message).trim().split('\n').join('\n    ')}`,
+    );
+    return;
+  }
+
+  for (const entry of reported) {
+    // Every one of these must land in the ES module tree; the point of the
+    // condition is that it does not serve the CommonJS build twice.
+    if (!entry.resolved.includes('/dist/esm/')) {
+      fail(
+        `exports: "${entry.specifier}" resolves to ${entry.resolved} under the "import" ` +
+          'condition, which is not the ES module build. The `import` condition would then ' +
+          'hand a bundler the CommonJS tree it cannot tree-shake.',
+      );
+    }
+    if (entry.exports !== undefined && entry.exports !== 'function') {
+      fail(
+        `exports: "${entry.specifier}" imported as an ES module, but the export the ` +
+          `require-condition check loads is ${entry.exports} there.`,
+      );
+    }
+  }
+};
+
+/**
+ * Compiled objects are not source, and `files` is not `.gitignore`.
+ *
+ * A root `.gitignore` does NOT filter what npm packs out of a directory named
+ * in `files`: with `platform` allowlisted, an `md4c.o` left behind by the
+ * vendor sync smoke test in platform/cpp/vendor/md4c/UPSTREAM.md ships to the
+ * registry — an object built for one maintainer's machine, in a package whose
+ * whole native contract is "the consumer compiles these sources". The
+ * `files` negations exist to stop that; this is what proves they still work,
+ * since the tarball is the only place the two rulesets meet.
+ */
+const BUILD_ARTIFACT_EXTENSIONS = new Set(['.o', '.a', '.so', '.dylib', '.obj', '.lib', '.node']);
+
+const checkNoBuildArtifacts = (pkgDir) => {
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (BUILD_ARTIFACT_EXTENSIONS.has(path.extname(entry.name))) {
+        fail(
+          `build artifact: ${path.relative(pkgDir, full)} is a compiled object, not source, ` +
+            'and it is in the tarball. The root .gitignore does not apply inside a directory ' +
+            'listed in "files" — the "!**/*.o" / "!**/*.a" negations there are what excludes it.',
+        );
+      }
+    }
+  };
+  walk(pkgDir);
+};
+
 try {
-  console.log('[verify-pack] packing (runs prepare/prepack, i.e. the build)…');
+  console.log('[verify-pack] packing (runs prepare, i.e. the build)…');
   execFileSync('npm', ['pack', '--pack-destination', scratch], {
     cwd: repoRoot,
     stdio: ['ignore', 'inherit', 'inherit'],
@@ -446,6 +740,8 @@ try {
 
   checkCodegenSpec(pkgDir, manifest);
   checkRequireGraph(pkgDir, manifest);
+  checkExportsResolution(pkgDir, manifest);
+  checkNoBuildArtifacts(pkgDir);
 
   const podspecPath = checkAutolinkTargets(pkgDir, require);
   if (podspecPath && fs.existsSync(podspecPath)) checkPodspecPaths(pkgDir, podspecPath, manifest);

@@ -33,7 +33,10 @@ import { projectRun } from '../selection/mapSelection';
 import type { ProjectedRun, RunMark } from '../selection/mapSelection';
 import { segmentRuns } from '../selection/runs';
 import type { ClassifyBlock } from '../selection/runs';
-import { resolveRunAttributes } from './runAttributes';
+import {
+  resetUnpairedFontSizeWarningsForTests,
+  resolveRunAttributes,
+} from './runAttributes';
 import type { RunTextAttribute } from './runAttributes';
 import { defaultTheme, headingFontSize, mergeTheme } from './theme';
 
@@ -452,6 +455,302 @@ describeNative('resolveRunAttributes', () => {
  * projection object alone, so these cases hand-build one — which also keeps
  * them running on a machine with no compiled addon.
  */
+/*
+ * The semantics channel: what a range IS, as opposed to what it looks like.
+ *
+ * THE FAILURE THIS EXISTS TO END. Run merging flattens a document into one
+ * platform text view per run, so the roles the JS renderer tree sets
+ * (`accessibilityRole="header"`) never run for a block that flows — a heading
+ * inside a merged run reached VoiceOver and TalkBack as prose in a bigger
+ * font, unreachable by heading-by-heading navigation. Neither host can
+ * recover the role from the styling, and the one that tried inferred it from
+ * a font-size + line-height + weight shape that any `attributeForMark` could
+ * counterfeit or erase. These cases pin the wire field that replaced the
+ * inference.
+ */
+describeNative('semantic roles', () => {
+  linkNativeEngineAsDefault();
+
+  /** The role entries, in wire order, with the text each covers. */
+  function rolesOf(run: ProjectedRun, attributes: RunTextAttribute[]) {
+    return attributes
+      .filter((a) => a.role !== undefined)
+      .map((a) => ({
+        role: a.role,
+        level: a.roleLevel,
+        text: run.text.slice(a.start, a.end),
+      }));
+  }
+
+  /** The role entries with their collection coordinates, in wire order. */
+  function collectionsOf(run: ProjectedRun, attributes: RunTextAttribute[]) {
+    return attributes
+      .filter((a) => a.role !== undefined)
+      .map((a) => ({
+        role: a.role,
+        text: run.text.slice(a.start, a.end),
+        row: a.roleRow,
+        rowCount: a.roleRowCount,
+        column: a.roleColumn,
+        columnCount: a.roleColumnCount,
+      }));
+  }
+
+  test('every heading in a merged run carries its role and its level', () => {
+    const run = project('# One\n\nBody.\n\n### Three\n\nMore.\n');
+    // The premise: all four blocks are one run, which is what loses the
+    // renderer tree's roles in the first place.
+    expect(run.text).toContain('One');
+    expect(run.text).toContain('Three');
+
+    expect(rolesOf(run, resolveRunAttributes(run, defaultTheme))).toEqual([
+      { role: 'heading', level: 1, text: 'One' },
+      { role: 'heading', level: 3, text: 'Three' },
+    ]);
+  });
+
+  test('nothing outside the three roles claims one', () => {
+    // Links are deliberately absent: they cross as `pressables`, which is
+    // what both hosts hit-test and vend accessibility elements from, so a
+    // second copy here would be two sources of truth for one construct. A
+    // code block and a blockquote are absent because neither platform has a
+    // primitive for them, so announcing them would mean shipping an English
+    // word — see `RunSemanticRole`. The list item in the same source DOES
+    // claim one, which is what this asserts is the only addition.
+    const run = project(
+      '**bold** and `code` and [a](https://example.com/x)\n\n> quoted\n\n- item\n\n```js\nx\n```\n',
+      EVERYTHING,
+      ALWAYS_FLOWING,
+    );
+    expect(rolesOf(run, resolveRunAttributes(run, defaultTheme))).toEqual([
+      { role: 'listItem', level: 1, text: '\u2022 item' },
+    ]);
+  });
+
+  test('a flowed list numbers its items, and a sublist numbers its own', () => {
+    // The premise of the whole channel: run merging puts the list in the same
+    // text view as the prose, so the `<Text accessibilityRole>` tree that
+    // would have carried this never runs.
+    const run = project('Intro.\n\n- one\n- two\n  - deep\n- three\n');
+    expect(collectionsOf(run, resolveRunAttributes(run, defaultTheme))).toEqual([
+      { role: 'listItem', text: '\u2022 one', row: 1, rowCount: 3, column: undefined, columnCount: undefined },
+      // Its OWN text, with the sublist it contains left to the entries below:
+      // one entry is one focus stop on both hosts, so a parent that kept its
+      // whole mark range read the sublist as part of itself and again as
+      // itself. See `resolveRunSemantics`.
+      {
+        role: 'listItem',
+        text: '\u2022 two',
+        row: 2,
+        rowCount: 3,
+        column: undefined,
+        columnCount: undefined,
+      },
+      // The sublist is a collection of its own: "item 1 of 1", not "3 of 4".
+      { role: 'listItem', text: '\u2022 deep', row: 1, rowCount: 1, column: undefined, columnCount: undefined },
+      { role: 'listItem', text: '\u2022 three', row: 3, rowCount: 3, column: undefined, columnCount: undefined },
+    ]);
+    // The nesting depth rides on `roleLevel`, which is the same field a
+    // heading's level uses.
+    const levels = resolveRunAttributes(run, defaultTheme)
+      .filter((a) => a.role === 'listItem')
+      .map((a) => a.roleLevel);
+    expect(levels).toEqual([1, 1, 2, 1]);
+  });
+
+  /*
+   * The exact document the round-2 verifier drove through both hosts: one
+   * merged run holding a heading, linked prose, a three-item list with a
+   * two-item sublist, and a 3x2 GFM table. On iOS it vended three list
+   * elements, the middle one labelled '* beta item\n* nested one\n* nested
+   * two' — two focus stops lost, because `enumerateAttribute` returns the
+   * parent's value over the child's range. On Android it vended the parent
+   * AND both children, so the sublist was announced twice. One rule fixes
+   * both: an item's entry covers the characters that item alone contributes.
+   */
+  test('a parent list item stops where its sublist begins, on both hosts', () => {
+    const run = project(
+      '## Getting started\n\nSee the [installation guide](https://x.com/g) first.\n\n' +
+        '- alpha item\n- beta item\n  - nested one\n  - nested two\n- gamma item\n\n' +
+        '| h1 | h2 |\n| - | - |\n| a | b |\n| c | d |\n',
+      EVERYTHING,
+      ALWAYS_FLOWING,
+    );
+    const attributes = resolveRunAttributes(run, defaultTheme);
+    expect(
+      attributes
+        .filter((a) => a.role === 'listItem')
+        .map((a) => [run.text.slice(a.start, a.end), a.roleLevel, `${a.roleRow} of ${a.roleRowCount}`]),
+    ).toEqual([
+      ['• alpha item', 1, '1 of 3'],
+      ['• beta item', 1, '2 of 3'],
+      ['• nested one', 2, '1 of 2'],
+      ['• nested two', 2, '2 of 2'],
+      ['• gamma item', 1, '3 of 3'],
+    ]);
+    // No two list entries overlap, and none of them TOUCHES the next either:
+    // the item separator between them carries no role, which is what stops
+    // iOS's attribute-run walk from merging two equal adjacent values back
+    // into the single range this narrowing exists to split.
+    const items = attributes.filter((a) => a.role === 'listItem');
+    for (let i = 1; i < items.length; i += 1) {
+      expect(items[i].start).toBeGreaterThan(items[i - 1].end);
+    }
+  });
+
+  test('one merged run can offer several grids of different shapes', () => {
+    // The input to the other half of the same fix, on Android:
+    // `RunAccessibility.collectionOf` has to declare ONE `CollectionInfo` on
+    // the host, and it used to give up the moment two shapes appeared — which
+    // is this document, the one a merged run actually produces. Pinned here
+    // because the wire is where that host reads its shapes from: a 3-item
+    // list, a 2-item sublist, and a 3x2 table, of which the table is the
+    // largest and the one Android now announces.
+    const run = project(
+      '- alpha\n- beta\n  - nested one\n  - nested two\n- gamma\n\n' +
+        '| h1 | h2 |\n| - | - |\n| a | b |\n| c | d |\n',
+      EVERYTHING,
+      ALWAYS_FLOWING,
+    );
+    const shapes = new Map<string, number>();
+    for (const attribute of resolveRunAttributes(run, defaultTheme)) {
+      if (attribute.roleRow === undefined) continue;
+      const key = `${attribute.roleRowCount}x${attribute.roleColumnCount ?? 1}`;
+      shapes.set(key, (shapes.get(key) ?? 0) + 1);
+    }
+    expect([...shapes.entries()]).toEqual([
+      ['3x1', 3],
+      ['2x1', 2],
+      ['3x2', 6],
+    ]);
+  });
+
+  test('a list item holding a table stops where the table begins', () => {
+    // A table is the other construct that vends ranges of its own, so it
+    // closes the item's own text the same way a sublist does — otherwise the
+    // item's element would repeat every cell.
+    const run = project(
+      '- intro\n\n  | a | b |\n  | - | - |\n  | c | d |\n',
+      EVERYTHING,
+      ALWAYS_FLOWING,
+    );
+    const attributes = resolveRunAttributes(run, defaultTheme);
+    const item = attributes.find((a) => a.role === 'listItem');
+    expect(item).toBeDefined();
+    expect(run.text.slice(item!.start, item!.end)).toBe('• intro');
+    // The cells still come back in full, from the table mark rather than the
+    // item's.
+    expect(
+      attributes
+        .filter((a) => a.role === 'tableCell')
+        .map((a) => run.text.slice(a.start, a.end)),
+    ).toEqual(['a', 'b', 'c', 'd']);
+  });
+
+  test('two lists separated by a blank line are two collections', () => {
+    // Same parent, same depth, and adjacent in the mark order — the blank
+    // line the projector puts between blocks is what separates them.
+    const run = project('- a\n- b\n\n* c\n');
+    const rows = resolveRunAttributes(run, defaultTheme)
+      .filter((a) => a.role === 'listItem')
+      .map((a) => `${a.roleRow} of ${a.roleRowCount}`);
+    expect(rows).toEqual(['1 of 2', '2 of 2', '1 of 1']);
+  });
+
+  test('a flowed table gives every cell its row and column', () => {
+    const run = project('| a | b |\n| - | - |\n| c | d |\n', EVERYTHING, ALWAYS_FLOWING);
+    expect(
+      collectionsOf(run, resolveRunAttributes(run, defaultTheme)).filter(
+        (entry) => entry.role === 'tableCell',
+      ),
+    ).toEqual([
+      // Row 1 is the header row, which is what lets Android flag those cells
+      // without this library shipping the word "header".
+      { role: 'tableCell', text: 'a', row: 1, rowCount: 2, column: 1, columnCount: 2 },
+      { role: 'tableCell', text: 'b', row: 1, rowCount: 2, column: 2, columnCount: 2 },
+      { role: 'tableCell', text: 'c', row: 2, rowCount: 2, column: 1, columnCount: 2 },
+      { role: 'tableCell', text: 'd', row: 2, rowCount: 2, column: 2, columnCount: 2 },
+    ]);
+  });
+
+  test('a list item role survives an attributeForMark that restyles it', () => {
+    // Same rule as the heading: `attributeForMark` owns the look and never
+    // the semantics, so a consumer styling list items cannot un-announce
+    // their position.
+    const run = project('- one\n- two\n');
+    const attributes = resolveRunAttributes(run, defaultTheme, (mark) =>
+      mark.kind === 'listItem' ? { color: '#ff0000' } : undefined,
+    );
+    expect(
+      attributes
+        .filter((a) => a.role === 'listItem')
+        .map((a) => [a.roleRow, a.roleRowCount, a.color]),
+    ).toEqual([
+      [1, 2, '#ff0000'],
+      [2, 2, '#ff0000'],
+    ]);
+  });
+
+  test('a role survives an attributeForMark that returns nothing at all', () => {
+    // `{}` means "style this like the surrounding text" and is a documented
+    // way to suppress a theme token. It must not also delete the heading:
+    // the entry exists for the role even with no styling on it.
+    const run = project('# Title\n\nBody.\n');
+    const attributes = resolveRunAttributes(run, defaultTheme, (mark) =>
+      mark.kind === 'heading' ? {} : undefined,
+    );
+    expect(rolesOf(run, attributes)).toEqual([
+      { role: 'heading', level: 1, text: 'Title' },
+    ]);
+    // And it really did drop the styling: the heading reads at the base
+    // run's size, which is the point of returning `{}`.
+    expect(styleAt(attributes, run.text.indexOf('Title')).fontSize).toBe(
+      defaultTheme.fonts.baseSize,
+    );
+  });
+
+  test('a run with no headings sends no role at all', () => {
+    // The wire cost of the channel on the ordinary run is zero, which is what
+    // keeps it out of the streaming budget.
+    const run = project('Just prose, with *emphasis*.\n');
+    const attributes = resolveRunAttributes(run, defaultTheme);
+    expect(attributes.every((a) => a.role === undefined)).toBe(true);
+    expect(attributes.every((a) => a.roleLevel === undefined)).toBe(true);
+  });
+});
+
+describe('semantic roles from synthetic marks', () => {
+  /** A run of `text` carrying exactly the marks given. */
+  function runWith(text: string, marks: RunMark[]): ProjectedRun {
+    return {
+      text,
+      pieces: [{ textStart: 0, textEnd: text.length, source: { start: 0, end: text.length } }],
+      marks,
+    } as ProjectedRun;
+  }
+
+  test('a heading mark with no level is announced without one', () => {
+    // A level is not required to make the range a heading, and inventing one
+    // would be a false claim — unlike the SIZE, where `styleForMark` treats
+    // an absent level as 1 because a look has to pick something.
+    const run = runWith('Title', [{ kind: 'heading', start: 0, end: 5 }]);
+    const heading = resolveRunAttributes(run, defaultTheme).find(
+      (a) => a.role === 'heading',
+    );
+    expect(heading).toBeDefined();
+    expect(heading?.roleLevel).toBeUndefined();
+  });
+
+  test('a level outside 1-6 is dropped, and the role is kept', () => {
+    const run = runWith('Title', [{ kind: 'heading', start: 0, end: 5, level: 9 }]);
+    const heading = resolveRunAttributes(run, defaultTheme).find(
+      (a) => a.role === 'heading',
+    );
+    expect(heading?.role).toBe('heading');
+    expect(heading?.roleLevel).toBeUndefined();
+  });
+});
+
 describe('embed geometry attributes', () => {
   const embedNode = { kind: 'link', span: { start: 4, end: 17 } };
   const projectedWithEmbed: ProjectedRun = {
@@ -588,5 +887,248 @@ describe('embed geometry line-height floor', () => {
     const geometry = attributes[attributes.length - 1];
 
     expect(geometry.lineHeight).toBe(200);
+  });
+
+  /*
+   * The floor used to be a scan of every attribute resolved so far, per
+   * embed — quadratic in the number of claims, and re-paid on every settle.
+   * It is one sweep now (`embedLineHeightFloors`), so these cases pin the
+   * answers the scan gave: each placeholder floors on what covers IT, and on
+   * nothing else.
+   */
+  describe('with several embeds', () => {
+    // 'H ￼ x\n\nSee ￼ tail' — a chip inside a heading, a card in the body.
+    const multi: ProjectedRun = {
+      text: 'H ￼ x\n\nSee ￼ tail',
+      pieces: [],
+      marks: [
+        { kind: 'heading', start: 0, end: 5, level: 1 },
+        { kind: 'embed', start: 2, end: 3, embedId: 0 },
+        { kind: 'embed', start: 11, end: 12, embedId: 1 },
+      ],
+      embeds: [
+        {
+          embedId: 0,
+          start: 2,
+          end: 3,
+          node: { kind: 'link', span: { start: 0, end: 1 } } as never,
+          content: { width: 40, height: 10 },
+        },
+        {
+          embedId: 1,
+          start: 11,
+          end: 12,
+          node: { kind: 'link', span: { start: 2, end: 3 } } as never,
+          content: { width: 40, height: 12 },
+        },
+      ],
+    };
+
+    test('each placeholder floors on the marks that cover it, not on the run', () => {
+      const attributes = resolveRunAttributes(multi, defaultTheme);
+      const geometry = attributes.filter(
+        (attribute) => attribute.color === 'transparent',
+      );
+      const headingLineHeight =
+        defaultTheme.headings.lineHeight ??
+        headingFontSize(defaultTheme, 1) * defaultTheme.fonts.lineHeight;
+      const bodyLineHeight =
+        defaultTheme.fonts.baseSize * defaultTheme.fonts.lineHeight;
+
+      expect(geometry).toHaveLength(2);
+      // Inside the heading: the heading's leading, not the body's.
+      expect(geometry[0].lineHeight).toBe(headingLineHeight);
+      // Outside it: the base attribute alone.
+      expect(geometry[1].lineHeight).toBe(bodyLineHeight);
+      expect(headingLineHeight).not.toBe(bodyLineHeight);
+    });
+
+    test("a tall card never raises another embed's floor", () => {
+      // Geometry attributes cover one placeholder each, so one embed's
+      // reservation can never be another's floor — the property that lets
+      // the sweep ignore them entirely.
+      const withTallCard: ProjectedRun = {
+        ...multi,
+        embeds: [
+          { ...multi.embeds![0], content: { width: 300, height: 400 } },
+          multi.embeds![1],
+        ],
+      };
+      const geometry = resolveRunAttributes(withTallCard, defaultTheme).filter(
+        (attribute) => attribute.color === 'transparent',
+      );
+
+      expect(geometry[0].lineHeight).toBe(400);
+      expect(geometry[1].lineHeight).toBe(
+        defaultTheme.fonts.baseSize * defaultTheme.fonts.lineHeight,
+      );
+    });
+
+    test('a wide placeholder cannot retire a covering attribute out from under a narrow one', () => {
+      // A GUARD, not a supported input. `ProjectedRunEmbed` promises
+      // `end === start + 1`, which is what makes ascending `start` and
+      // ascending `end` one order; the sweep retires covering attributes by
+      // `end`, and a retirement is permanent, so it walks the placeholders in
+      // `end` order rather than inheriting `start` order. This hand-built
+      // projection breaks the promise the only way that is observable — a
+      // wide placeholder enclosing a narrow one — and pins that the narrow
+      // one still sees the heading covering it.
+      const nested: ProjectedRun = {
+        text: 'ABCDEFGH',
+        pieces: [],
+        marks: [{ kind: 'heading', start: 0, end: 4, level: 1 }],
+        embeds: [
+          {
+            embedId: 0,
+            start: 0,
+            end: 6,
+            node: { kind: 'link', span: { start: 0, end: 1 } } as never,
+            content: { width: 10, height: 1 },
+          },
+          {
+            embedId: 1,
+            start: 1,
+            end: 2,
+            node: { kind: 'link', span: { start: 1, end: 2 } } as never,
+            content: { width: 10, height: 1 },
+          },
+        ],
+      };
+      const attributes = resolveRunAttributes(nested, defaultTheme);
+      const geometry = attributes.filter(
+        (attribute) => attribute.color === 'transparent',
+      );
+      const headingLineHeight = attributes.find(
+        (attribute) => attribute.fontWeight === defaultTheme.headings.weight,
+      )?.lineHeight;
+      const bodyLineHeight =
+        defaultTheme.fonts.baseSize * defaultTheme.fonts.lineHeight;
+
+      expect(headingLineHeight).not.toBe(bodyLineHeight);
+      // The floors stay aligned with the caller's array, not the sweep order.
+      expect(geometry).toHaveLength(2);
+      // Runs past the heading's end, so the heading does not cover it.
+      expect(geometry[0].lineHeight).toBe(bodyLineHeight);
+      // Sits inside the heading, and is asked before the heading retires.
+      expect(geometry[1].lineHeight).toBe(headingLineHeight);
+    });
+  });
+
+  test.each([
+    ['an infinite height', Number.POSITIVE_INFINITY, 40],
+    ['an infinite width', 80, Number.POSITIVE_INFINITY],
+    ['a NaN height', Number.NaN, 40],
+    ['a zero height', 0, 40],
+  ])(
+    '%s reserves nothing: transparent placeholder, no line height',
+    (_label, height, width) => {
+      // `Infinity > 0` is true, so a size like this used to pass every guard
+      // in the stack and cross the bridge as the line height of a run no
+      // measurer can lay out. The placeholder still goes transparent — with
+      // no attachment over it, U+FFFC would otherwise render as tofu.
+      const projected = chipProjection(height);
+      projected.embeds![0].content = { width, height };
+      const attributes = resolveRunAttributes(projected, defaultTheme);
+
+      expect(attributes[attributes.length - 1]).toEqual({
+        start: 4,
+        end: 5,
+        color: 'transparent',
+      });
+    },
+  );
+});
+
+/*
+ * The `lineHeight` pairing rule on `MarkAttribute`, which nothing in the type
+ * can state: a returned style REPLACES the theme's, so a `fontSize` without a
+ * `lineHeight` leaves the glyphs pinned to the base run's line box and both
+ * hosts clip their ascenders (they clamp lines in both directions). The DEV
+ * warning is the only signal — the attribute itself is perfectly well-formed,
+ * so nothing downstream can tell it apart from a deliberate one.
+ *
+ * Hand-built projections, so these run without a compiled addon; and one mark
+ * KIND per case, because the warning is warn-once per kind for the life of the
+ * runtime (a streamed document resolves its attributes on every snapshot).
+ */
+describe('attributeForMark fontSize/lineHeight pairing warning', () => {
+  function oneMark(kind: RunMark['kind'], level?: number): ProjectedRun {
+    return {
+      text: 'Heading',
+      pieces: [{ textStart: 0, textEnd: 7, source: { start: 0, end: 7 } }],
+      marks: [{ kind, start: 0, end: 7, ...(level === undefined ? {} : { level }) }],
+    } as ProjectedRun;
+  }
+
+  let warn: jest.SpyInstance;
+  beforeEach(() => {
+    // The warned-kinds Set is module state that outlives every test here, so
+    // each case states its own precondition instead of inheriting whatever
+    // the previous one left behind. Without this, 'warns once per mark kind'
+    // passed only because the case above it had already put 'heading' in the
+    // Set — run alone, or reordered, it asserted nothing.
+    resetUnpairedFontSizeWarningsForTests();
+    warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    warn.mockRestore();
+  });
+
+  test('warns for a font size above the base with no line height', () => {
+    const attributes = resolveRunAttributes(oneMark('heading', 1), defaultTheme, () => ({
+      fontSize: 28,
+    }));
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('lineHeight');
+    // The STYLING is still exactly what was returned: the warning names the
+    // problem, it does not invent a line height the consumer did not ask for.
+    // The role rides along regardless — `attributeForMark` owns the look and
+    // never the semantics (see `RunTextAttribute.role`), which is why a
+    // heading restyled by a consumer is still announced as one.
+    expect(attributes[1]).toEqual({
+      start: 0,
+      end: 7,
+      fontSize: 28,
+      role: 'heading',
+      roleLevel: 1,
+    });
+  });
+
+  test('warns once per mark kind, not once per snapshot', () => {
+    // Three snapshots of the same offending run, which is what a streamed
+    // document does: the attributes are resolved again on every tick.
+    resolveRunAttributes(oneMark('heading', 2), defaultTheme, () => ({ fontSize: 30 }));
+    resolveRunAttributes(oneMark('heading', 3), defaultTheme, () => ({ fontSize: 32 }));
+    resolveRunAttributes(oneMark('heading', 2), defaultTheme, () => ({ fontSize: 30 }));
+    expect(warn).toHaveBeenCalledTimes(1);
+    // Per KIND, not once for the whole runtime: a different mark kind is a
+    // different key and gets its own single warning.
+    resolveRunAttributes(oneMark('code'), defaultTheme, () => ({ fontSize: 30 }));
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+
+  test('a matching line height is the documented shape and is silent', () => {
+    resolveRunAttributes(oneMark('strong'), defaultTheme, () => ({
+      fontFamily: 'Tiempos-Bold',
+      fontSize: 28,
+      lineHeight: 34,
+    }));
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  test('a size at or below the base is silent: a roomier box does not clip', () => {
+    resolveRunAttributes(oneMark('code'), defaultTheme, () => ({
+      fontSize: defaultTheme.fonts.baseSize,
+    }));
+    resolveRunAttributes(oneMark('emphasis'), defaultTheme, () => ({ fontSize: 11 }));
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  test('the theme path never warns: it pairs the two itself', () => {
+    // `styleForMark`'s heading case returns fontSize and lineHeight together,
+    // which is the invariant the rule asks consumers to keep.
+    resolveRunAttributes(oneMark('heading', 4), defaultTheme);
+    resolveRunAttributes(oneMark('blockquote'), defaultTheme, () => undefined);
+    expect(warn).not.toHaveBeenCalled();
   });
 });

@@ -108,7 +108,7 @@ find_package(ReactAndroid CONFIG QUIET)
 if(NOT ReactAndroid_FOUND)
   message(FATAL_ERROR
     "react-native-selectable-markdown: the ReactAndroid prefab was not found. "
-    "This library needs React Native >= 0.73 with android.buildFeatures.prefab "
+    "This library needs React Native >= 0.82 with android.buildFeatures.prefab "
     "enabled in the consuming module.")
 endif()
 
@@ -118,14 +118,20 @@ endif()
 # else, so libjsi.so satisfies every undefined symbol we produce.
 #
 # The reason this matters is version reach. `jsi` is the one prefab module
-# React Native has published unchanged across every version this package
-# supports — verified in ReactAndroid/build.gradle(.kts) on 0.73, 0.75, 0.76,
-# 0.79 and 0.81. Everything else moved: 0.73-0.75 published a target per
-# feature (react_nativemodule_core, reactnativejni, turbomodulejsijni, ...)
-# and 0.76 collapsed the lot into a single `reactnative`. Linking any of them
-# "in case we need it later" would buy nothing today and would make this file
-# need a version ladder — so it does not, and if a CallInvoker is ever
-# genuinely needed the ladder can be added then, with a symbol to justify it.
+# React Native has published under an unchanged name across every version this
+# package has ever supported: read out of ReactAndroid/build.gradle(.kts) on
+# 0.73, 0.75, 0.76, 0.79 and 0.81 back when the peer floor was 0.73, and on
+# 0.75.4 — the version this repository itself builds against — since. The
+# floor package.json declares today is >= 0.82, and nobody re-reads that file
+# on every release, which is precisely why the TARGET test below is a hard
+# error rather than an assumption: a rename or a removal stops the build with
+# a message naming the module. Everything else moved: 0.73-0.75 published a
+# target per feature (react_nativemodule_core, reactnativejni,
+# turbomodulejsijni, ...) and 0.76 collapsed the lot into a single
+# `reactnative`. Linking any of them "in case we need it later" would buy
+# nothing today and would make this file need a version ladder — so it does
+# not, and if a CallInvoker is ever genuinely needed the ladder can be added
+# then, with a symbol to justify it.
 #
 # FABRIC DOES NOT CHANGE THAT, AND THIS IS THE PART PEOPLE EXPECT TO BREAK.
 # The Fabric shadow node, its component descriptor and the JNI measurer are
@@ -149,7 +155,7 @@ endif()
 if(NOT TARGET ReactAndroid::jsi)
   message(FATAL_ERROR
     "react-native-selectable-markdown: ReactAndroid::jsi is missing from the "
-    "React Native prefab. Expected React Native >= 0.73.")
+    "React Native prefab. Expected React Native >= 0.82.")
 endif()
 target_link_libraries(selectable-markdown PRIVATE ReactAndroid::jsi)
 

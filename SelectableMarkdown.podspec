@@ -28,14 +28,20 @@ Pod::Spec.new do |s|
   # not apply to them, and they need no C++ flags).
   #
   # THE FIRST GLOB IS `platform/ios/*` AND NOT `platform/ios/**/*`, WHICH IS
-  # THE POINT. platform/ios/fabric/ is added below, only under the new
-  # architecture. Its files are individually wrapped in
-  # `#ifdef RCT_NEW_ARCH_ENABLED` as well, so a recursive glob here would still
-  # produce empty translation units rather than errors — but "empty translation
-  # unit" is one preprocessor slip away from "an old-architecture app fails to
-  # build on a React-RCTFabric header it never asked for", and this package has
-  # no way to reproduce that failure. Belt and braces, as the guard comments in
-  # those files say.
+  # THE POINT — for header hygiene, not for architecture. There is no
+  # architecture to select any more (see the top of this file):
+  # platform/ios/fabric/ is added below unconditionally, in its own entry, and
+  # every directory named there is named again in `private_header_files`. That
+  # pairing is what keeps the public Objective-C surface separate from the
+  # headers that must never reach the umbrella header, and it is spelled one
+  # directory at a time. A recursive glob would sweep any subdirectory added
+  # later into the public set by default, and a C++ or React-RCTFabric header
+  # landing there is the hard build failure the next comment describes.
+  #
+  # The Fabric sources are still individually wrapped in
+  # `#ifdef RCT_NEW_ARCH_ENABLED`. That guard is always true for this pod —
+  # install_modules_dependencies below defines the macro — so it is belt and
+  # braces, not a gate.
   source_files = [
     "platform/ios/*.{swift,h,m,mm}",
     "platform/cpp/*.{h,cpp}",
@@ -97,9 +103,31 @@ Pod::Spec.new do |s|
     # anyway (new_architecture.rb:96 takes it from
     # Helpers::Constants.cxx_language_standard), and React Native's own headers
     # require it — react/utils/hash_combine.h:16 declares a `concept`. Naming
-    # it here keeps the standard explicit for `npm run check:fabric-cpp
-    # --syntax-only platform/cpp/*.cpp`, which is what proves the markdown
-    # engine still compiles clean at it.
+    # it here keeps the standard explicit for the check that proves the
+    # markdown engine still compiles clean at it:
+    #
+    #     npm run check:fabric-cpp -- --syntax-only platform/cpp/*.cpp
+    #
+    # The bare `--` is load-bearing. npm forwards only what follows it, so a
+    # `--syntax-only` written before it is swallowed as an npm config option
+    # (npm 11 warns about it and carries on) and the script runs its default
+    # full compile instead.
+    #
+    # That command is a CI gate, not only a local one: the fabric-cpp job in
+    # .github/workflows/ci.yml runs it on both runners (adding
+    # `--platform ios` on macOS, `--platform android` on ubuntu, because an
+    # explicit file list narrows the script to a single pass) and
+    # .github/workflows/release.yml runs it on both legs of the release. The
+    # default `npm run check:fabric-cpp` skips platform/cpp on purpose — it
+    # reaches no react/renderer header — so before that step existed, the
+    # engine and its JSI installer compiled in no automated job at all.
+    #
+    # Both workflows build that file list with `find`, not with the glob
+    # written above: `platform/cpp/*.cpp` is expanded by the shell and does not
+    # descend, so a source added in a subdirectory of platform/cpp would fall
+    # outside the gate with nothing going red. The glob is fine for a local
+    # run, where the sources are in front of you; it is not what a gate should
+    # rest on.
     "CLANG_CXX_LANGUAGE_STANDARD" => "c++20",
     "DEFINES_MODULE" => "YES",
     # Every entry is a bare-name include somewhere in the tree, so it has to
@@ -133,9 +161,8 @@ Pod::Spec.new do |s|
     # SelectableMarkdownModule.mm reaches the runtime through selectors that
     # both RCTCxxBridge and the bridgeless RCTBridgeProxy implement, so it
     # needs no header out of React-NativeModulesApple or React-runtimeexecutor
-    # — which also means the old-architecture install of this pod cannot drag
-    # new-arch pods into an old-architecture app, and cannot fail to build when
-    # they are absent.
+    # — which is why it compiles the same way whether the host app runs with a
+    # bridge or bridgeless, and why neither pod has to be named here.
     "HEADER_SEARCH_PATHS" => [
       "$(inherited)",
       '"$(PODS_TARGET_SRCROOT)/platform/cpp"',

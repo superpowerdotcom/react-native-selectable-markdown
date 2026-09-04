@@ -1,6 +1,7 @@
 import type {
   AnyNode,
   HeadingNode,
+  Inline,
   ParsedDocument,
   ParagraphNode,
 } from './nodes';
@@ -108,6 +109,48 @@ describe('visit', () => {
     expect(kinds).toEqual(['heading', 'text', 'paragraph']);
   });
 
+  it("returning 'stop' ends the traversal, siblings included", () => {
+    // The distinction from `false`, asserted on the same node: `false`
+    // prunes the heading's subtree and the paragraph after it is still
+    // visited; `'stop'` ends the walk there. Without the second signal a
+    // search has to be hand-rolled off `childrenOf` just to short-circuit,
+    // which is what `runs.ts` did before this existed.
+    const stopped: string[] = [];
+    visit(doc, (n) => {
+      stopped.push(n.kind);
+      if (n.kind === 'heading') {
+        return 'stop';
+      }
+    });
+    expect(stopped).toEqual(['heading']);
+
+    const skipped: string[] = [];
+    visit(doc, (n) => {
+      skipped.push(n.kind);
+      if (n.kind === 'heading') {
+        return false;
+      }
+    });
+    expect(skipped).toEqual([
+      'heading',
+      'paragraph',
+      'emphasis',
+      'text',
+      'text',
+    ]);
+  });
+
+  it('stops mid-subtree without unwinding to the next block', () => {
+    const kinds: string[] = [];
+    visit(doc, (n) => {
+      kinds.push(n.kind);
+      if (n.kind === 'emphasis') {
+        return 'stop';
+      }
+    });
+    expect(kinds).toEqual(['heading', 'text', 'paragraph', 'emphasis']);
+  });
+
   it('traverses a single node', () => {
     const kinds: string[] = [];
     visit(paragraph, (n) => {
@@ -149,5 +192,64 @@ describe('findAt', () => {
     expect(findAt(doc, 4)).toEqual([]);
     expect(findAt(doc, 5)).toEqual([]);
     expect(findAt(doc, 11)).toEqual([]);
+  });
+});
+
+/**
+ * NESTING DEPTH IS UNTRUSTED INPUT: three kilobytes of `'> '` is 1500 levels
+ * of blockquote, the native decoder builds its tree off an explicit stack and
+ * so returns a tree that deep, and `visit` is the generic walk every other
+ * layer reaches for (streaming, the spoiler sweep, the conformance oracles).
+ * A recursive walk over such a tree overflows the JS stack; this one runs off
+ * a stack of its own.
+ */
+describe('visit at depth', () => {
+  const DEPTH = 20_000;
+
+  function deepParagraph(): ParagraphNode {
+    const span = { start: 0, end: 1 };
+    let node: Inline = { kind: 'text', value: 'x', span };
+    for (let level = 0; level < DEPTH; level += 1) {
+      node = { kind: 'emphasis', span, children: [node] };
+    }
+    return { kind: 'paragraph', span, children: [node] };
+  }
+
+  it('walks a 20000-deep tree in order, parents included', () => {
+    const deep = deepParagraph();
+    const kinds: string[] = [];
+    let parented = 0;
+    visit(deep, (n, parent) => {
+      kinds.push(n.kind);
+      if (parent !== null) {
+        parented += 1;
+      }
+    });
+
+    expect(kinds).toHaveLength(DEPTH + 2);
+    expect(kinds[0]).toBe('paragraph');
+    expect(kinds[kinds.length - 1]).toBe('text');
+    // Every node but the root the walk started from has a parent.
+    expect(parented).toBe(DEPTH + 1);
+  });
+
+  it('still honours false at the top of a deep tree', () => {
+    const visited: string[] = [];
+    visit({ source: 'x', blocks: [deepParagraph()] }, (n) => {
+      visited.push(n.kind);
+      return false;
+    });
+
+    expect(visited).toEqual(['paragraph']);
+  });
+
+  it("honours 'stop' at the top of a deep tree, and drops the siblings too", () => {
+    const visited: string[] = [];
+    visit({ source: 'x', blocks: [deepParagraph(), deepParagraph()] }, (n) => {
+      visited.push(n.kind);
+      return 'stop';
+    });
+
+    expect(visited).toEqual(['paragraph']);
   });
 });

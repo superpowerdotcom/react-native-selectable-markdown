@@ -120,6 +120,11 @@ uint32_t readUint32Arg(napi_env env, napi_value value, const char* name,
  * OffsetParser) accepts. V8 converts lone surrogates to U+FFFD on the way
  * out, which is exactly what the UTF-16 map in OffsetParser assumes for
  * ill-formed input, so the round trip stays consistent.
+ *
+ * htmlPolicy is required and type-checked, but it selects nothing:
+ * configFromBits discards it (see FlatBuffer.cpp), so both values yield the
+ * same buffer. It is validated anyway, so the signature stays the one the
+ * iOS/Android bindings implement.
  */
 napi_value parseImpl(napi_env env, napi_callback_info info) {
   size_t argc = 3;

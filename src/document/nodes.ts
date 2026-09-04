@@ -14,7 +14,11 @@ export interface NodeBase {
   incomplete?: true;
   /**
    * Present only during streaming: content that does not exist in the source
-   * (e.g. a repaired closer appended past all real offsets).
+   * (e.g. the empty padding cell synthesized for a ragged streamed table
+   * row). A repaired CLOSER is not an example — it is absorbed into the
+   * repaired node's own span, which is flagged `incomplete` instead. The flag
+   * is set only for nodes whose span starts at or past the end of the real
+   * text; see src/stream/StreamSession.ts, where both flags are stamped.
    */
   synthetic?: true;
 }

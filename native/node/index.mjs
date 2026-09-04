@@ -97,9 +97,17 @@ try {
  * parse(source, extensionBits, htmlPolicy) -> ArrayBuffer
  *
  * The bytes are the Protocol.h flat buffer, exactly as the iOS/Android
- * bindings receive them. `extensionBits` is an OR of the kExt* values and
- * `htmlPolicy` is 0 (strip) or 1 (raw); both mirror src/engine/native/
- * protocol.ts. Bad arguments throw a TypeError.
+ * bindings receive them. `extensionBits` is an OR of the kExt* values,
+ * mirrored in src/engine/native/protocol.ts.
+ *
+ * `htmlPolicy` is a reserved wire slot, not a switch: `configFromBits` reads
+ * and discards it, so 0 (`kHtmlStrip`) and 1 (`kHtmlRaw`) produce
+ * byte-identical buffers — md4c is always asked to parse HTML. Pass 1
+ * (`HTML_PARSED`), which is what the package sends. Strip-vs-raw is decided
+ * later, by `EngineOptions.html` in the decoder, and never crosses here.
+ *
+ * Bad argument types throw a TypeError; the count and types are checked, the
+ * htmlPolicy *value* is not.
  */
 export const parse = addon.parse;
 

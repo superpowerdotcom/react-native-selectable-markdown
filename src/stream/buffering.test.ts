@@ -6,9 +6,10 @@ import type {
   SessionSnapshot,
   StreamSessionInit,
 } from './StreamSession';
+import { retreatToClusterBoundary } from './clusters';
 import { StreamSession } from './StreamSession';
 import type { SmootherContext } from './smoothing';
-import { createAdaptiveSmoother } from './smoothing';
+import { createAdaptiveSmoother, createSmoother } from './smoothing';
 
 // ---------------------------------------------------------------------------
 // appendBuffered / flushBuffered: coalescing, holdback, and the drains.
@@ -328,6 +329,31 @@ describe('StreamSession.appendBuffered', () => {
     expect(session.length).toBe(14);
   });
 
+  test("append('') still drains: the empty delta is the no-op, not the call", () => {
+    const { session, counted, seen } = harness();
+    session.appendBuffered('metered text here');
+    expect(session.length).toBe(0);
+    session.append('');
+    // The drain comes first and appending nothing after it changes nothing —
+    // so `append('')` is a complete no-op only with an empty pending buffer.
+    // With text buffered it parses, bumps the revision and notifies exactly
+    // like `flushBuffered()`.
+    expect(session.length).toBe(17);
+    expect(counted.parses).toBe(1);
+    expect(seen).toHaveLength(1);
+    expect(session.snapshot().document.source).toBe('metered text here');
+    // …and with nothing pending it really is inert.
+    const snap = session.snapshot();
+    session.append('');
+    expect(session.snapshot()).toBe(snap);
+    expect(seen).toHaveLength(1);
+    // `appendBuffered('')` is unconditionally inert: it pools nothing and
+    // schedules nothing.
+    session.appendBuffered('');
+    expect(session.pendingLength).toBe(0);
+    expect(seen).toHaveLength(1);
+  });
+
   test('flushBuffered drains immediately and is idempotent when empty', () => {
     const { session, seen } = harness({ holdBackChars: 4 });
     session.flushBuffered(); // nothing pending: complete no-op
@@ -414,13 +440,86 @@ describe('StreamSession.appendBuffered', () => {
   });
 
   test("the smoother's cut never splits a surrogate pair", () => {
-    const { session, frame } = harness({ smoother: () => 3 });
+    const { session, frame, idle } = harness({ smoother: () => 3 });
     session.appendBuffered('ab\u{1F600}');
     frame.fire();
     // A cut at 3 would land inside the emoji; it moves down to 2.
     expect(session.snapshot().document.source).toBe('ab');
+    // And the emoji itself waits: it sits at the END of the buffer, where a
+    // variation selector or a joiner in the NEXT delta would make it part of
+    // a longer glyph. The idle drain is what releases it when no such delta
+    // comes — whole, never as a lone surrogate.
     frame.fire();
+    expect(session.snapshot().document.source).toBe('ab');
+    idle.fire();
     expect(session.snapshot().document.source).toBe('ab\u{1F600}');
+  });
+
+  test('a cluster split across two deltas still commits whole', () => {
+    // The buffer's end is not the text's end. A flag arriving as '🇺' then
+    // '🇸' used to commit the lone indicator on the first flush — it renders
+    // as a letter tile — and the same for 'café' decomposed, a keycap, and a
+    // ZWJ family. Everything but the ASCII-base case is held (see
+    // src/stream/clusters.ts).
+    for (const [first, second] of [
+      ['\u{1F1FA}', '\u{1F1F8} flag'],
+      ['\u{1F468}', '\u200D\u{1F469} pair'],
+      ['\u{1F469}', '\u{1F3FD} wave'],
+      ['1\uFE0F', '\u20E3 key'],
+      ['\u0939', '\u093F ok'],
+    ]) {
+      const { session, frame, seen } = harness();
+      session.appendBuffered(first);
+      frame.fire();
+      // Nothing at all: the whole delta is one unfinished cluster.
+      expect(session.length).toBe(0);
+      session.appendBuffered(second);
+      frame.fire();
+      session.finalize('end');
+      expect(session.snapshot().document.source).toBe(first + second);
+      for (const snap of seen) {
+        const src = snap.document.source;
+        expect(src === '' || src.startsWith(first + second[0])).toBe(true);
+      }
+    }
+  });
+
+  test('regional-indicator parity counts the committed text too', () => {
+    // A flag already committed flips the parity of the run still pending: a
+    // count taken inside the buffer alone reads '🇷🇺🇸' as an even run and
+    // lets the cut land after '🇷🇺', releasing the '🇺' of '🇺🇸' alone.
+    let release = 4;
+    const { session, frame, seen } = harness({ smoother: () => release });
+    // `append` commits directly, so the session really does start with a
+    // half-typed flag in its source — the state the buffer alone cannot see.
+    session.append('\u{1F1EB}');
+    expect(session.length).toBe(2);
+    session.appendBuffered('\u{1F1F7}\u{1F1FA}\u{1F1F8}!');
+    frame.fire();
+    // A cut at 4 falls after '🇷🇺', an EVEN run inside the buffer — but the
+    // committed '🇫' makes the real run odd there, so the '🇺' of '🇺🇸' would
+    // be released alone. The whole first pair goes instead, or nothing.
+    expect(session.length % 4).toBe(0);
+    expect(session.snapshot().document.source).toBe('\u{1F1EB}\u{1F1F7}');
+    release = 6;
+    frame.fire();
+    session.finalize('end');
+    expect(session.snapshot().document.source).toBe(
+      '\u{1F1EB}\u{1F1F7}\u{1F1FA}\u{1F1F8}!',
+    );
+    for (const snap of seen.slice(1)) {
+      // No METERED snapshot ever ends on an odd number of indicators. (The
+      // first one is the deliberately half-typed setup above, committed
+      // through `append`, which does not meter.)
+      const src = snap.document.source;
+      let run = 0;
+      for (let at = src.length; at >= 2; at -= 2) {
+        const cp = src.codePointAt(at - 2);
+        if (cp === undefined || cp < 0x1f1e6 || cp > 0x1f1ff) break;
+        run += 1;
+      }
+      expect(run % 2).toBe(0);
+    }
   });
 
   test('smoothing composes with holdback: the smoother never sees the held tail', () => {
@@ -568,7 +667,7 @@ describe('StreamSession.appendBuffered', () => {
   test('a metered cut never splits an emoji ZWJ sequence: the cluster releases whole', () => {
     let release = 5;
     const seen: string[] = [];
-    const { session, frame } = harness({ smoother: () => release });
+    const { session, frame, idle } = harness({ smoother: () => release });
     session.subscribe((snap) => seen.push(snap.document.source));
     session.appendBuffered(`Hi ${FAMILY}`);
     // A cut at 5 lands between the first emoji's pair and its joiner; the
@@ -584,6 +683,12 @@ describe('StreamSession.appendBuffered', () => {
     expect(session.length).toBe(3);
     release = 8;
     frame.fire();
+    // Still nothing: the family sits at the end of the buffer, where a
+    // further joiner would make it a longer glyph, so it waits for a code
+    // point that proves it finished — here, the idle drain deciding no such
+    // code point is coming.
+    expect(session.length).toBe(3);
+    idle.fire();
     expect(session.snapshot().document.source).toBe(`Hi ${FAMILY}`);
     // No committed snapshot ever held a partial cluster.
     for (const source of seen) {
@@ -632,6 +737,177 @@ describe('StreamSession.appendBuffered', () => {
     release = 7;
     frame.fire();
     expect(session.snapshot().document.source).toBe(ASTRONAUT);
+  });
+
+  test('a metered cut never leaves half a flag: regional indicators release in pairs', () => {
+    // 🇺🇸 is U+1F1FA U+1F1F8 — two regional indicators, 4 UTF-16 units. A cut
+    // after the first one commits a lone 🇺, which renders as a letter tile
+    // and then flips to the flag a frame later.
+    const FLAG = '\u{1F1FA}\u{1F1F8}';
+    /** Regional indicators at the very end of a committed snapshot. */
+    const trailingIndicators = (text: string) =>
+      [.../[\u{1F1E6}-\u{1F1FF}]*$/u.exec(text)![0]].length;
+    let release = 2;
+    const seen: string[] = [];
+    const { session, frame } = harness({ smoother: () => release });
+    session.subscribe((snap) => seen.push(snap.document.source));
+    session.appendBuffered(`${FLAG}${FLAG} up`);
+    frame.fire();
+    expect(session.length).toBe(0);
+    release = 4; // the whole first flag — the run before the cut is even
+    frame.fire();
+    expect(session.length).toBe(4);
+    release = 2; // half of the second flag: held, exactly like the first
+    frame.fire();
+    expect(session.length).toBe(4);
+    release = 4;
+    frame.fire();
+    expect(session.length).toBe(8);
+    release = 3;
+    frame.fire();
+    expect(session.snapshot().document.source).toBe(`${FLAG}${FLAG} up`);
+    for (const source of seen) {
+      expect(trailingIndicators(source) % 2).toBe(0);
+    }
+  });
+
+  test('a metered cut never splits a combining mark off its base', () => {
+    // 'café' in NFD: 'cafe' + U+0301. A cut at 4 commits 'cafe' and repaints
+    // it as 'café' on the next flush.
+    const { session, frame } = harness({ smoother: () => 4 });
+    session.appendBuffered('cafe\u0301 open');
+    frame.fire();
+    expect(session.snapshot().document.source).toBe('caf');
+  });
+
+  test('a metered cut never splits a keycap or an Indic matra off its base', () => {
+    // '1️⃣' is '1' U+FE0F U+20E3: the keycap is a combining enclosing mark.
+    let release = 1;
+    const { session, frame } = harness({ smoother: () => release });
+    session.appendBuffered('1\uFE0F\u20E3 first');
+    frame.fire();
+    expect(session.length).toBe(0);
+    release = 2; // between the variation selector and the keycap
+    frame.fire();
+    expect(session.length).toBe(0);
+    release = 3;
+    frame.fire();
+    expect(session.snapshot().document.source).toBe('1\uFE0F\u20E3');
+
+    // Devanagari 'हि' is ह + the matra ि (U+093F, a spacing combining mark):
+    // a cut between them shows a bare ह for a frame.
+    const { session: hi, frame: hiFrame } = harness({ smoother: () => 1 });
+    hi.appendBuffered('\u0939\u093F\u0928 ok');
+    hiFrame.fire();
+    expect(hi.length).toBe(0);
+  });
+
+  /**
+   * Drives a session with a REAL `createSmoother` on a fake clock — 16 ms
+   * frames, text fed in three-unit chunks, the idle drain firing when its
+   * deadline actually passes. The tests above set the release count by hand,
+   * which cannot see how the policy's BUDGET behaves when the session
+   * retreats its answer; this can.
+   */
+  function typewriter(text: string, charsPerSecond: number) {
+    let t = 0;
+    // One box: TypeScript narrows a `let` written only from inside a closure
+    // to `never` at the call site.
+    const timers: { frame: (() => void) | null; idle: (() => void) | null } = {
+      frame: null,
+      idle: null,
+    };
+    let idleDeadline = 0;
+    const counted = countingEngine();
+    const commits: string[] = [];
+    const session = new StreamSession({
+      engine: counted.engine,
+      now: () => t,
+      bufferScheduler: (flush) => {
+        timers.frame = flush;
+        return () => {
+          timers.frame = null;
+        };
+      },
+      idleScheduler: (flush, ms) => {
+        timers.idle = flush;
+        idleDeadline = t + ms;
+        return () => {
+          timers.idle = null;
+        };
+      },
+      smoother: createSmoother({ charsPerSecond, now: () => t }),
+    });
+    session.subscribe((snap) => commits.push(snap.document.source));
+    let fed = 0;
+    // Long enough that a stall shows up as a stall: 500 frames is 8 s of
+    // wall clock for texts that type out in well under one.
+    for (let f = 0; f < 500; f += 1) {
+      t += 16;
+      if (fed < text.length && f % 2 === 0) {
+        session.appendBuffered(text.slice(fed, fed + 3));
+        fed += 3;
+      }
+      if (timers.idle !== null && t >= idleDeadline) {
+        const fire = timers.idle;
+        timers.idle = null;
+        fire();
+      }
+      const frame = timers.frame;
+      timers.frame = null;
+      frame?.();
+    }
+    return { source: session.snapshot().document.source, commits };
+  }
+
+  test('a real createSmoother drains text whose glyphs are wider than one frame of budget', () => {
+    // The regression this pins: the cluster-safe retreat releases less than
+    // the smoother answered, and a policy charged for its own answer can
+    // then never accrue enough to afford the whole glyph — every one of
+    // these stalled forever, committing nothing at all (or, for 'café',
+    // stopping at 'caf') until the budget was settled against what really
+    // landed.
+    const cases: Array<[string, number]> = [
+      ['\u{1F1FA}\u{1F1F8} flag', 100], // regional-indicator pair
+      ['\u{1F1FA}\u{1F1F8} flag', 30], // …and a rate whose whole credit window is narrower than it
+      ['1\uFE0F\u20E3 ok', 100], // keycap
+      ['\u0939\u093F\u0928\u094D\u0926\u0940 \u0920\u0940\u0915 \u0939\u0948', 30], // Indic matras and viramas
+      ['\u0939\u093F\u0928\u094D\u0926\u0940 \u0920\u0940\u0915 \u0939\u0948', 60],
+      ['cafe\u0301 open', 30], // NFD combining accent
+    ];
+    for (const [text, charsPerSecond] of cases) {
+      const { source, commits } = typewriter(text, charsPerSecond);
+      expect([text, charsPerSecond, source]).toEqual([text, charsPerSecond, text]);
+      // It drained by typing, not by one lurch at the end.
+      expect(commits.length).toBeGreaterThan(1);
+      // And no commit along the way painted half a glyph.
+      for (const commit of commits) {
+        expect(retreatToClusterBoundary(text, commit.length)).toBe(commit.length);
+      }
+    }
+  });
+
+  test('a stalled metered flush arms the idle drain, and progress disarms it', () => {
+    // A cut parked inside a cluster releases nothing however often the frame
+    // fires, so the frame cadence alone would spin forever: the idle drain
+    // is the backstop. It must not survive the release, or it would fire
+    // into a healthy reveal and dump the rest of the buffer in one commit.
+    let release = 4;
+    const { session, frame, idle } = harness({ smoother: () => release });
+    session.appendBuffered('cafe\u0301 open');
+    frame.fire(); // 4 lands between 'e' and its accent: retreated to 'caf'
+    expect(session.length).toBe(3);
+    expect(idle.pending).toBe(false); // progress: no backstop needed
+    release = 1; // now the cut is inside the 'e' + accent cluster itself
+    frame.fire();
+    expect(session.length).toBe(3); // nothing released…
+    expect(idle.pending).toBe(true); // …so the backstop is armed
+    frame.fire();
+    expect(idle.cancelled).toBe(0); // armed once, not re-armed (and pushed out) per frame
+    release = 2; // the whole cluster is affordable: the reveal resumes
+    frame.fire();
+    expect(session.length).toBe(5);
+    expect(idle.pending).toBe(false);
   });
 
   test('with repair.hideUriLikeLabels a smoothed cut snaps from the [ past the )', () => {
@@ -777,16 +1053,54 @@ describe('StreamSession external drains keep the adaptive smoother honest', () =
 });
 
 describe('StreamSession.notifyRunFinalized', () => {
-  test('forwards to the smoother on the session clock', () => {
+  function lifecycleSmoother() {
     const stamps: Array<number | undefined> = [];
     const smoother = Object.assign(() => Infinity, {
       notifyRunFinalized: (now?: number) => {
         stamps.push(now);
       },
     });
+    return { smoother, stamps };
+  }
+
+  test('forwards to the smoother on the session clock', () => {
+    const { smoother, stamps } = lifecycleSmoother();
     const { session } = harness({ smoother, now: () => 1234 });
+    session.appendBuffered('tail');
     session.notifyRunFinalized();
     expect(stamps).toEqual([1234]);
+  });
+
+  test('with nothing pending it does not arm the policy at all', () => {
+    // Arming a policy that has nothing to drain would leave it armed: the
+    // reset paths run on a later smoother call, and an empty session makes
+    // none — so the NEXT run's first flush would be judged a run-end drain
+    // instead of paced. `bindRunTextEvents` skips the call for the same
+    // reason; the session enforces it for hand-driven integrations.
+    const { smoother, stamps } = lifecycleSmoother();
+    const { session, frame } = harness({ smoother, now: () => 1234 });
+    session.notifyRunFinalized();
+    expect(stamps).toEqual([]);
+    // Not a one-shot suppression either: the next run still arms normally.
+    session.appendBuffered('next run');
+    session.notifyRunFinalized();
+    expect(stamps).toEqual([1234]);
+    frame.fire();
+  });
+
+  test('an empty session leaves an adaptive policy paced for its next run', () => {
+    const { session, frame } = harness({
+      smoother: createAdaptiveSmoother(),
+      now: () => 0,
+    });
+    // Run 1 ended with nothing pending — the drain must not be armed.
+    session.notifyRunFinalized();
+    // Run 2: the pre-buffer gate still applies, so a 20-unit burst (below
+    // the 40-unit gate) stays held instead of being dumped as a drain.
+    session.appendBuffered('x'.repeat(20));
+    frame.fire();
+    expect(session.length).toBe(0);
+    expect(session.pendingLength).toBe(20);
   });
 
   test('is a safe no-op without a smoother or without the lifecycle method', () => {
@@ -919,5 +1233,313 @@ describe('StreamSession.rewrite', () => {
     frame.fire();
     expect(session.length).toBeLessThan(23 + 84);
     expect(session.pendingLength).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Lifecycle: what happens to the buffered machinery when the engine throws
+// mid-flush, and when the consumer drops the session before the stream ends.
+// Both are about timers — the scheduled flush and the idle drain — which
+// nothing else cancels once they are armed.
+// ---------------------------------------------------------------------------
+
+describe('StreamSession buffered flush failures', () => {
+  /** Paragraph engine that throws while `boom.on` is set. */
+  function throwingHarness(init?: Partial<StreamSessionInit>) {
+    const counted = countingEngine();
+    const boom = { on: false };
+    const engine: Engine = {
+      name: 'throws-on-demand',
+      parse(source, options) {
+        if (boom.on) {
+          throw new Error('engine boom');
+        }
+        return counted.engine.parse(source, options);
+      },
+    };
+    return { boom, ...harness({ engine, ...init }) };
+  }
+
+  test('a throwing flush keeps the text pending and leaves a timer to retry it', async () => {
+    const { session, boom, frame, idle } = throwingHarness({ holdBackChars: 2 });
+    session.appendBuffered('hello world');
+    let drained = false;
+    void session.drained().then(() => {
+      drained = true;
+    });
+
+    boom.on = true;
+    // The scheduler wrapper clears the flush cancel before calling in, so a
+    // throw here used to leave the buffer with no timer at all: nothing to
+    // release the tail, and `drained()` parked forever.
+    expect(() => frame.fire()).toThrow('engine boom');
+    expect(session.length).toBe(0);
+    expect(session.snapshot().revision).toBe(0);
+    expect(session.pendingLength).toBe(11); // nothing lost, nothing doubled
+    expect(idle.pending).toBe(true);
+
+    boom.on = false;
+    idle.fire();
+    expect(session.length).toBe(11);
+    expect(session.snapshot().document.source).toBe('hello world');
+    await Promise.resolve();
+    expect(drained).toBe(true);
+  });
+
+  test('a persistently throwing engine keeps retrying the tail instead of stranding it', async () => {
+    const { session, boom, frame, idle } = throwingHarness({
+      holdBackChars: 2,
+      holdIdleMs: 250,
+    });
+    session.appendBuffered('hello world');
+    let drained = false;
+    void session.drained().then(() => {
+      drained = true;
+    });
+
+    boom.on = true;
+    expect(() => frame.fire()).toThrow('engine boom');
+    expect(idle.pending).toBe(true);
+    // The retry itself throws. Before, that was the end of it: the drain
+    // cleared both timers on its way in and armed nothing on its way out, so
+    // an engine that is broken rather than briefly unlucky — an unlinked
+    // native module, the case the docs name — stranded the tail after
+    // exactly one retry and `drained()` parked forever.
+    const delays: Array<number | null> = [];
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      expect(() => idle.fire()).toThrow('engine boom');
+      expect(session.pendingLength).toBe(11); // nothing lost, nothing doubled
+      expect(idle.pending).toBe(true);
+      delays.push(idle.lastMs);
+    }
+    // …and it backs off rather than retrying a dead engine every 250ms.
+    expect(delays).toEqual([250, 500, 1000, 2000]);
+
+    boom.on = false;
+    idle.fire();
+    expect(session.snapshot().document.source).toBe('hello world');
+    await Promise.resolve();
+    expect(drained).toBe(true);
+    // A later failure starts the backoff over.
+    boom.on = true;
+    session.appendBuffered('. more'); // released text with a construct char, so it parses
+    expect(() => frame.fire()).toThrow('engine boom');
+    expect(() => idle.fire()).toThrow('engine boom');
+    expect(idle.lastMs).toBe(250);
+  });
+
+  test('a subscriber throwing past the commit still settles the smoother', () => {
+    // The commit landed, so the answer really WAS released; skipping the
+    // settlement left `createSmoother` holding a phantom charge and, after a
+    // blocked flush, a lifted budget cap that the next flush would spend.
+    const released: number[] = [];
+    const smoother = Object.assign(() => 3, {
+      notifyReleased(n: number) {
+        released.push(n);
+      },
+    });
+    const { session, frame } = harness({ smoother });
+    session.subscribe(() => {
+      throw new Error('subscriber boom');
+    });
+    session.appendBuffered('hello world');
+    expect(() => frame.fire()).toThrow('subscriber boom');
+    expect(session.length).toBe(3);
+    expect(released).toEqual([3]);
+  });
+
+  test('an engine that never recovers ends the retries and settles drained()', async () => {
+    const { session, boom, frame, idle } = throwingHarness({
+      holdBackChars: 2,
+      holdIdleMs: 250,
+    });
+    session.appendBuffered('hello world');
+    let settled: string | null = null;
+    void session.drained().then(
+      () => {
+        settled = 'resolved';
+      },
+      (error: Error) => {
+        settled = error.message;
+      },
+    );
+
+    boom.on = true;
+    expect(() => frame.fire()).toThrow('engine boom');
+    // Eight refused retries run the backoff ladder out and then stop. Before
+    // the bound this ran forever: a host timer threw every four seconds for
+    // the life of the session and `drained()` never settled, so a run parked
+    // behind it — `bindRunTextEvents` awaits one at run end — held forever.
+    let retries = 0;
+    while (idle.pending && retries < 20) {
+      expect(() => idle.fire()).toThrow('engine boom');
+      retries += 1;
+    }
+    expect(retries).toBe(9);
+    await Promise.resolve();
+    expect(settled).toBe('engine boom');
+    // Nothing was dropped to get there…
+    expect(session.pendingLength).toBe(11);
+    expect(session.length).toBe(0);
+    // …a later `drained()` fails fast rather than parking on a drain that is
+    // not coming…
+    await expect(session.drained()).rejects.toThrow('engine boom');
+    // …and an explicit drain still retries the tail, so a session whose
+    // engine comes back keeps every character.
+    boom.on = false;
+    session.flushBuffered();
+    expect(session.snapshot().document.source).toBe('hello world');
+    await expect(session.drained()).resolves.toBeUndefined();
+  });
+
+  test('new buffered input restarts the retry ladder', async () => {
+    const { session, boom, frame, idle } = throwingHarness({ holdIdleMs: 100 });
+    session.appendBuffered('hello');
+    boom.on = true;
+    expect(() => frame.fire()).toThrow('engine boom');
+    while (idle.pending) {
+      expect(() => idle.fire()).toThrow('engine boom');
+    }
+    await expect(session.drained()).rejects.toThrow('engine boom');
+    // A delta is a fresh attempt: the session is trying again, so it is no
+    // longer giving up, and `drained()` parks again rather than failing.
+    session.appendBuffered(' world');
+    let settled = false;
+    void session.drained().then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    boom.on = false;
+    frame.fire();
+    await Promise.resolve();
+    expect(settled).toBe(true);
+    expect(session.snapshot().document.source).toBe('hello world');
+  });
+
+  test('a throwing finalize leaves the session exactly as it was', () => {
+    const { session, boom } = throwingHarness();
+    session.append('one\n\ntwo\n\nthree');
+    const before = session.snapshot();
+    boom.on = true;
+    expect(() => session.finalize('end')).toThrow('engine boom');
+    // `finalize` reparses from scratch and then rewrites the anchor
+    // bookkeeping — phase, frozen prefix, last blocks, carried tail scan —
+    // so a parse that throws must put all of it back, not just the phase.
+    expect(session.snapshot()).toBe(before);
+    expect(session.snapshot().phase).toBe('streaming');
+    expect(session.length).toBe(15);
+    // …and the session still finalizes normally afterwards.
+    boom.on = false;
+    session.finalize('end');
+    expect(session.snapshot().phase).toBe('settled');
+    expect(session.snapshot().document.source).toBe('one\n\ntwo\n\nthree');
+  });
+
+  test('a throwing replace leaves the session exactly as it was', () => {
+    const { session, boom } = throwingHarness();
+    session.append('hello world');
+    const before = session.snapshot();
+    boom.on = true;
+    expect(() => session.replace('totally different text')).toThrow(
+      'engine boom',
+    );
+    // `replace` rebuilds the session from scratch — source, anchor, frozen
+    // prefix and identity cache — before it parses, so a parse that throws
+    // used to leave `length` counting a document no snapshot contained.
+    expect(session.length).toBe(11);
+    expect(session.snapshot()).toBe(before);
+    expect(session.snapshot().document.source).toBe('hello world');
+    // …and the session still works on the same terms afterwards.
+    boom.on = false;
+    session.append(' again');
+    expect(session.snapshot().document.source).toBe('hello world again');
+    session.replace('totally different text');
+    expect(session.snapshot().document.source).toBe('totally different text');
+  });
+
+  test('a throwing append leaves length and snapshot in agreement', () => {
+    const { session, boom } = throwingHarness();
+    session.append('committed.');
+    boom.on = true;
+    expect(() => session.append(' lost.')).toThrow('engine boom');
+    expect(session.length).toBe(10);
+    expect(session.snapshot().document.source).toBe('committed.');
+    boom.on = false;
+    session.append(' kept.');
+    expect(session.snapshot().document.source).toBe('committed. kept.');
+    expect(session.length).toBe(16);
+  });
+});
+
+describe('StreamSession.dispose', () => {
+  test('cancels both timers and drops the pending tail', () => {
+    const { session, frame, idle, seen } = harness({ holdBackChars: 3 });
+    session.appendBuffered('Watch this **');
+    frame.fire(); // 'Watch this' committed, ' **' held, idle armed
+    expect(session.length).toBe(10);
+    expect(idle.pending).toBe(true);
+
+    session.dispose();
+    expect(idle.pending).toBe(false);
+    expect(idle.cancelled).toBe(1);
+    expect(session.pendingLength).toBe(0); // dropped, not appended
+    expect(session.length).toBe(10);
+
+    // Nothing a stale timer or a late delta can do wakes it up again.
+    idle.fire();
+    frame.fire();
+    session.appendBuffered('more');
+    expect(frame.pending).toBe(false);
+    expect(session.pendingLength).toBe(0);
+    expect(seen).toHaveLength(1);
+  });
+
+  test('a smoother cannot keep re-scheduling a disposed session', () => {
+    // The flush re-schedules itself for as long as the smoother withholds
+    // text, so an unsubscribed session with a backlog goes on parsing and
+    // committing every frame until it drains. dispose() is what stops it.
+    const { session, frame, counted } = harness({ smoother: () => 2 });
+    session.appendBuffered('x'.repeat(40));
+    frame.fire();
+    frame.fire();
+    expect(frame.pending).toBe(true);
+    const parses = counted.parses;
+
+    session.dispose();
+    expect(frame.pending).toBe(false);
+    frame.fire();
+    expect(counted.parses).toBe(parses);
+    expect(session.length).toBe(4);
+  });
+
+  test('resolves outstanding drained() waiters instead of parking them', async () => {
+    const { session, frame } = harness({ smoother: () => 2 });
+    session.appendBuffered('x'.repeat(40));
+    frame.fire();
+    let drained = false;
+    const wait = session.drained().then(() => {
+      drained = true;
+    });
+    session.dispose();
+    await wait;
+    expect(drained).toBe(true);
+    // And a fresh await after disposal resolves immediately too.
+    await session.drained();
+  });
+
+  test('flushBuffered() before dispose() keeps the tail instead of dropping it', () => {
+    const { session, frame, idle } = harness({ holdBackChars: 3 });
+    session.appendBuffered('Keep every char');
+    frame.fire();
+    expect(session.length).toBe(12);
+    session.flushBuffered();
+    session.dispose();
+    expect(session.length).toBe(15);
+    expect(session.snapshot().document.source).toBe('Keep every char');
+    expect(idle.pending).toBe(false);
   });
 });

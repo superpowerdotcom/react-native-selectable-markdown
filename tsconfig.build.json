@@ -22,13 +22,18 @@
     // an `ExportDefaultDeclaration` whose callee is `codegenNativeComponent`
     // (@react-native/babel-plugin-codegen/index.js:155-160), and tsc's
     // CommonJS emit turns that into `exports.default = ...`, which the visitor
-    // never matches. Nothing throws: the default export stays the runtime
-    // `codegenNativeComponent`, which returns `requireNativeComponent`
-    // (Libraries/Utilities/codegenNativeComponent.js:67-70) — dead under
-    // bridgeless. The component then resolves to nothing and every run drops
-    // to the <Text selectable> fallback, losing onSelectionAction and both
-    // custom menu items, with no error anywhere. `npm run check:codegen`
-    // reproduces that degradation as a negative control so it stays visible.
+    // never matches. Nothing in the build reports it: the default export stays
+    // the runtime `codegenNativeComponent`, which returns
+    // `requireNativeComponent` (Libraries/Utilities/codegenNativeComponent.js:67-70)
+    // — dead under bridgeless, where a view config comes from
+    // `getViewManagerConfig` and that soft-errors to null
+    // (BridgelessUIManager.js:273-291). What a consumer gets is a run that
+    // renders with a null view config, an invariant violation
+    // (ReactNativeViewConfigRegistry.js:122), or — where the require resolves
+    // to nothing at all — the throw in `RunHost`. The `<Text selectable>`
+    // fallback that used to absorb both went with the old architecture in
+    // 0.10.0. Loud at render, silent here, which is why `npm run check:codegen`
+    // reproduces the transpiled copy as a negative control.
     //
     // EXCLUDING IT HERE IS NOT ENOUGH ON ITS OWN. `exclude` only filters the
     // `include` glob: a file reached by an `import` — even an `import type` —

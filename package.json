@@ -5,8 +5,60 @@
   "license": "MIT",
   "private": false,
   "main": "dist/index.js",
+  "module": "dist/esm/index.js",
   "types": "dist/index.d.ts",
   "react-native": "src/index.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "react-native": "./src/index.ts",
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "default": "./dist/index.js"
+    },
+    "./dist": {
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "default": "./dist/index.js"
+    },
+    "./dist/*.js": {
+      "require": {
+        "types": "./dist/*.d.ts",
+        "default": "./dist/*.js"
+      },
+      "import": {
+        "types": "./dist/esm/*.d.ts",
+        "default": "./dist/esm/*.js"
+      },
+      "default": "./dist/*.js"
+    },
+    "./dist/*": {
+      "require": {
+        "types": "./dist/*.d.ts",
+        "default": "./dist/*.js"
+      },
+      "import": {
+        "types": "./dist/esm/*.d.ts",
+        "default": "./dist/esm/*.js"
+      },
+      "default": "./dist/*.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json",
+    "./react-native.config.js": "./react-native.config.js"
+  },
   "files": [
     "dist",
     "src",
@@ -15,10 +67,13 @@
     "!src/**/__tests__",
     "android",
     "platform",
+    "!**/*.o",
+    "!**/*.a",
     "SelectableMarkdown.podspec",
     "react-native.config.js",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "repository": {
     "type": "git",
@@ -38,10 +93,10 @@
   "scripts": {
     "test": "jest",
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json && node scripts/emit-dist-spec-shim.mjs",
+    "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.esm.json && node scripts/finish-esm-build.mjs && node scripts/emit-dist-spec-shim.mjs",
+    "build:watch": "node scripts/emit-dist-spec-shim.mjs && tsc -p tsconfig.build.json --watch",
     "release": "node scripts/release.mjs",
     "prepare": "npm run build",
-    "prepack": "npm run build",
     "verify:pack": "node scripts/verify-pack.mjs",
     "check:codegen": "node scripts/check-codegen.mjs",
     "check:fabric-cpp": "node scripts/check-fabric-cpp.mjs",
@@ -53,7 +108,8 @@
     "bench:pathological": "node bench/pathological.mjs",
     "bench:streaming": "node bench/streaming-replay.mjs",
     "bench:crossing": "node bench/crossing.mjs",
-    "bench:all": "node bench/throughput.mjs && node bench/pathological.mjs && node bench/streaming-replay.mjs && node bench/crossing.mjs",
+    "bench:projection": "node bench/projection.mjs",
+    "bench:all": "node bench/throughput.mjs && node bench/pathological.mjs && node bench/streaming-replay.mjs && node bench/crossing.mjs && node bench/projection.mjs",
     "bench:headtohead": "node bench/head-to-head.mjs"
   },
   "peerDependencies": {

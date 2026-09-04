@@ -1,8 +1,10 @@
 /*
  * The Fabric mounting-layer view. Read RCTSelectableRunHostComponentView.h
  * first: it says what this class is for, why the whole file is inside the
- * new-architecture guard, and why the `SelectableRunHostCls` symbol at the
- * bottom is not optional.
+ * new-architecture guard, and what the `SelectableRunHostCls` symbol at the
+ * bottom is still for now that discovery goes through
+ * RCTThirdPartyComponentsProvider — compatibility with the React Natives that
+ * call it directly, its exact spelling pinned by scripts/check-codegen.mjs.
  *
  * WHAT THIS FILE DELIBERATELY DOES NOT DO: build a string. `text` and
  * `attributes` are props, they arrive here, and they are ignored on purpose.
@@ -54,13 +56,18 @@
 using namespace facebook::react;
 
 /*
- * NO COMMAND PROTOCOL IS ADOPTED HERE, because the spec declares no commands.
- * Codegen emits RCTSelectableRunHostViewProtocol and
- * RCTSelectableRunHostHandleCommand into RCTComponentViewHelpers.h only for a
- * component that has some; adding one to the spec is what brings the protocol
- * back, and conforming to it is what makes the compiler demand the
- * implementation.
+ * THE COMMAND PROTOCOL IS ADOPTED IN A CLASS EXTENSION, NOT IN THE HEADER, and
+ * that is the pattern React Native's own component views use
+ * (RCTSwitchComponentView.mm:21, RCTScrollViewComponentView.mm). Codegen emits
+ * RCTSelectableRunHostViewProtocol and RCTSelectableRunHostHandleCommand into
+ * RCTComponentViewHelpers.h only for a component whose spec declares commands,
+ * and conforming to it here is what makes the compiler demand -clearSelection
+ * and -setSelection:end: below. Keeping the conformance out of the public-ish
+ * header also keeps the generated header — which reaches React's C++ renderer
+ * types — out of anything that includes ours.
  */
+@interface RCTSelectableRunHostComponentView () <RCTSelectableRunHostViewProtocol>
+@end
 
 /*
  * Codegen gives `selectionActions` an ordered std::vector<std::string> rather
@@ -69,6 +76,14 @@ using namespace facebook::react;
  * (src/view/SelectableRunHostNativeComponent.ts says so at the point of
  * decision). Order therefore has to survive this conversion too, which is why
  * it is a plain in-order copy and not a set.
+ *
+ * Each element is one menu item packed as `identifier` or
+ * `identifier + U+001F + title`, and this function deliberately does not
+ * unpack it: the split belongs where the fallback titles live, which is
+ * SelectableRunHostView's `parseSelectionAction`. That the packing survives
+ * an NSString round-trip is the reason it is a separator and not, say, a
+ * second parallel prop — the vector's element type is what
+ * scripts/check-codegen.mjs pins, and it is unchanged.
  */
 static NSArray<NSString *> *RCTSelectableRunHostActions(const std::vector<std::string> &actions)
 {
@@ -234,6 +249,14 @@ static bool RCTSelectableRunHostPressablesEqual(
       [weakSelf emitEmbedLayoutWithId:embedId x:x y:y width:width height:height];
     };
     /*
+     * Weak for the identical reason. Unlike the three above, this one fires
+     * continuously while a selection handle is dragged, which is why the Swift
+     * host dedupes before calling it rather than leaving that to JS.
+     */
+    _hostView.onSelectionChange = ^(NSInteger start, NSInteger end) {
+      [weakSelf emitSelectionChangeWithStart:start end:end];
+    };
+    /*
      * `contentView` is framed for free from `updateLayoutMetrics:`
      * (RCTViewComponentView.mm:419-421), so this class needs no
      * `layoutSubviews` override — unlike the paper wrapper, which has one
@@ -280,6 +303,17 @@ static bool RCTSelectableRunHostPressablesEqual(
     _hostView.selectable = newViewProps.selectable;
   }
 
+  /*
+   * `exclusiveSelection` needs no default sync in -initWithFrame:, unlike
+   * `selectionActions`: the generated default (true, from
+   * WithDefault<boolean, true>) and the Swift host's default (true) agree, so
+   * the diff-then-push here starts from a true premise. That agreement is
+   * asserted in scripts/check-codegen.mjs rather than assumed.
+   */
+  if (oldViewProps.exclusiveSelection != newViewProps.exclusiveSelection) {
+    _hostView.exclusiveSelection = newViewProps.exclusiveSelection;
+  }
+
   if (oldViewProps.selectionActions != newViewProps.selectionActions) {
     _hostView.selectionActions = RCTSelectableRunHostActions(newViewProps.selectionActions);
   }
@@ -291,9 +325,9 @@ static bool RCTSelectableRunHostPressablesEqual(
   /*
    * Unlike `text` and `attributes`, `decorations` IS read here: its
    * layout-affecting half was consumed by the string builder on the layout
-   * thread (RNSMAttributedText attributedStringWithProps:), but the drawn
-   * half — the boxes and rules — is painted by the host view itself, so the
-   * view needs the list. Same decoder as the builder used, so the two halves
+   * thread (RNSMAttributedText attributedStringWithProps:fontSizeMultiplier:),
+   * but the drawn half — the boxes and rules — is painted by the host view
+   * itself, so the view needs the list. Same decoder as the builder used, so the two halves
    * of one decoration cannot disagree about a field.
    */
   if (!RCTSelectableRunHostDecorationsEqual(oldViewProps, newViewProps)) {
@@ -440,6 +474,58 @@ static bool RCTSelectableRunHostPressablesEqual(
           .y = static_cast<Float>(y),
           .width = static_cast<Float>(width),
           .height = static_cast<Float>(height)});
+}
+
+- (void)emitSelectionChangeWithStart:(NSInteger)start end:(NSInteger)end
+{
+  /*
+   * The nil check matters for the same recycling reason as the three above,
+   * and here it is also what silences the empty-range report that
+   * -[SelectableRunHostView reset] itself provokes: prepareForRecycle clears
+   * the emitter before calling reset, so the selection the recycled run had is
+   * not announced to a JS tree that is already unmounting it.
+   *
+   * The offsets were clamped against the current text by SelectableRunHostView
+   * and deduped there; nothing here re-derives or re-filters them. An EMPTY
+   * range is a legal payload on this event alone — it is how JS learns the
+   * selection went away (docs/SELECTION.md, "Event: onSelectionChange").
+   */
+  if (!_eventEmitter) {
+    return;
+  }
+
+  static_cast<const SelectableRunHostEventEmitter &>(*_eventEmitter)
+      .onSelectionChange(SelectableRunHostEventEmitter::OnSelectionChange{
+          .start = static_cast<int>(start), .end = static_cast<int>(end)});
+}
+
+#pragma mark - Native Commands
+
+- (void)handleCommand:(const NSString *)commandName args:(const NSArray *)args
+{
+  /*
+   * The generated dispatcher validates the argument count and each argument's
+   * type before calling the two selectors below, and RCTLogErrors an
+   * unrecognised command name under RCT_DEBUG. Doing any of that by hand here
+   * would be a second, divergent copy of the spec.
+   */
+  RCTSelectableRunHostHandleCommand(self, commandName, args);
+}
+
+- (void)clearSelection
+{
+  [_hostView clearSelection];
+}
+
+- (void)setSelection:(NSInteger)start end:(NSInteger)end
+{
+  /*
+   * Straight through, deliberately. Clamping belongs in the Swift host, which
+   * is the only place that knows what the text currently is — JS computed
+   * these offsets against a snapshot that may be a frame behind, exactly like
+   * the offsets travelling the other way on an event.
+   */
+  [_hostView setSelection:start end:end];
 }
 
 @end

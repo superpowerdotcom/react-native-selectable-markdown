@@ -27,18 +27,40 @@ import com.facebook.react.module.annotations.ReactModule
  *    that read finds nothing and the parse fails on an app whose native
  *    module was, a tick later, perfectly fine.
  *
- * Why it returns Boolean and never throws: this runs on the JS thread during
- * startup, and the causes it can hit (a Gradle/NDK misconfiguration, an ABI
- * the host app filtered out, a JS runtime that is already gone) are things
+ * Why it reports an outcome and never throws: this runs on the JS thread
+ * during startup, and the causes it can hit (a Gradle/NDK misconfiguration, an
+ * ABI the host app filtered out, a JS runtime that is already gone) are things
  * only a rebuild can fix. Throwing here would take the whole app down at
  * launch for a fault no user action can clear, and would report it far from
  * its cause. So the reason goes to logcat for whoever is debugging the build
- * and the outcome comes back as `false`. It is not a soft failure: md4c is
- * the only parser this package ships, so a `false` that is never followed by
+ * and the outcome comes back as a string. It is not a soft failure: md4c is
+ * the only parser this package ships, so a refusal that is never followed by
  * a successful install means every non-empty document throws out of
  * parseDocument — with a message naming the missing native module — instead
  * of rendering. The view layer itself is unaffected, which is why this is
  * reported rather than fatal: the app runs, its markdown does not parse.
+ *
+ * WHY THE OUTCOME IS THREE STRINGS AND NOT A BOOLEAN, which is what it used
+ * to be. A bare `false` conflated "not yet" with "not ever". The JS side is
+ * invited to poll `isNativeEngineAvailable()`, so it retried every failure on
+ * every call — each retry crossing the bridge and writing another Log.w. Only
+ * this class can tell the two apart, so this is where the difference is
+ * spoken:
+ *
+ *  - `installed`   — the global is on the runtime now.
+ *  - `unavailable` — TRANSIENT. No JSI context or a null runtime pointer: the
+ *                    context is starting or tearing down. Ask again.
+ *  - `refused`     — PERMANENT for this process or this runtime: the .so did
+ *                    not load, its JNI symbol did not match, or the C++
+ *                    installer rejected the runtime. Memoized below so the
+ *                    warning prints once, and memoized again in
+ *                    src/engine/native/install.ts so the next call does not
+ *                    even reach this method.
+ *
+ * A JS bundle older than this binary ignores the return value and reads the
+ * global instead, so the change is invisible to it; a newer bundle meeting an
+ * older binary sees `true`/`false` and reads a `false` as `unavailable`, which
+ * is the older behaviour — retried forever, but never wrong.
  *
  * The @ReactModule annotation is what the new architecture reads the JS-facing
  * name from. ReactPackageTurboModuleManagerDelegate builds each package's
@@ -53,10 +75,39 @@ class SelectableMarkdownModule(reactContext: ReactApplicationContext) :
 
     override fun getName(): String = MODULE_NAME
 
+    /**
+     * Remembers a PERMANENT refusal, so a polling caller gets one logcat line
+     * instead of one per call.
+     *
+     * Only the permanent half is memoized. `unavailable` is deliberately not,
+     * because that branch means "ask again once the context is up", and a
+     * cache there would turn a startup race into a permanent failure.
+     *
+     * Scoped to this module instance, which is the right scope: a reload
+     * builds a new ReactApplicationContext and therefore a new module, so a
+     * fresh runtime is asked afresh rather than inheriting a refusal that
+     * belonged to the runtime before it. `nativeLibraryLoaded` is the one
+     * genuinely process-wide fact, and it has its own memo below.
+     *
+     * Success is deliberately NOT memoized here, unlike the iOS module's
+     * `_installed`: `installSelectableMarkdown` is idempotent per runtime
+     * (OnLoad.cpp invariant 4) and re-installing is cheap, while a stale
+     * "already installed" flag surviving a runtime swap would be silent and
+     * wrong. src/engine/native/install.ts memoizes the success, so the second
+     * call does not reach this method anyway.
+     */
+    private var refused = false
+
     @ReactMethod(isBlockingSynchronousMethod = true)
-    fun install(): Boolean {
+    fun install(): String {
+        if (refused) {
+            return OUTCOME_REFUSED
+        }
+
         if (!nativeLibraryLoaded) {
-            return false
+            // The `by lazy` below has already logged, once for the process.
+            refused = true
+            return OUTCOME_REFUSED
         }
 
         // The holder is absent before the JS runtime exists (and on a context
@@ -66,7 +117,7 @@ class SelectableMarkdownModule(reactContext: ReactApplicationContext) :
         val contextHolder = reactApplicationContext.javaScriptContextHolder
         if (contextHolder == null) {
             Log.w(TAG, "install skipped: no JSI context holder (context not ready)")
-            return false
+            return OUTCOME_UNAVAILABLE
         }
 
         return try {
@@ -85,9 +136,15 @@ class SelectableMarkdownModule(reactContext: ReactApplicationContext) :
                         "install skipped: no JSI runtime pointer " +
                             "(context tearing down, or running without a JSI runtime)",
                     )
-                    false
+                    OUTCOME_UNAVAILABLE
+                } else if (nativeInstall(runtimePointer)) {
+                    OUTCOME_INSTALLED
                 } else {
-                    nativeInstall(runtimePointer)
+                    // The C++ installer refused this runtime and has already
+                    // written the reason to logcat (OnLoad.cpp). Nothing about
+                    // asking again would change the answer for this runtime.
+                    refused = true
+                    OUTCOME_REFUSED
                 }
             }
         } catch (error: Throwable) {
@@ -95,9 +152,11 @@ class SelectableMarkdownModule(reactContext: ReactApplicationContext) :
             // case: the .so loaded but was built from a source tree whose
             // JNI symbol does not match this class. Caught with everything
             // else because no failure mode of an optional fast path is worth
-            // taking the app down for.
+            // taking the app down for. Permanent: the symbol will not appear
+            // without a rebuild.
             Log.w(TAG, "install failed: native install threw", error)
-            false
+            refused = true
+            OUTCOME_REFUSED
         }
     }
 
@@ -115,6 +174,19 @@ class SelectableMarkdownModule(reactContext: ReactApplicationContext) :
 
     companion object {
         const val MODULE_NAME = "SelectableMarkdown"
+
+        /**
+         * The three answers `install()` can give. Read by
+         * src/engine/native/install.ts, which must spell them identically —
+         * the strings are the whole contract, and they are matched verbatim
+         * on the JS side (an unrecognised value there is read as
+         * `unavailable`, which is the safe direction: retry rather than give
+         * up). iOS returns the same three from
+         * platform/ios/SelectableMarkdownModule.mm.
+         */
+        const val OUTCOME_INSTALLED = "installed"
+        const val OUTCOME_UNAVAILABLE = "unavailable"
+        const val OUTCOME_REFUSED = "refused"
 
         private const val TAG = "SelectableMarkdown"
         private const val LIBRARY_NAME = "selectable-markdown"

@@ -16,12 +16,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * returns byte-for-byte what a rebuild would have; the agreement doctrine in
  * `RunTextMeasure` is untouched, this just stops paying for it repeatedly.
  *
- * WHY IT EXISTS. Under Fabric the C++ shadow node re-measures on every commit
- * and `SelectableRunHostView.commitProps` builds the same styled string again
- * on the UI thread; on paper the shadow node dirties on every prop batch. A
- * streamed message recommits its settled runs many times per second with
- * nothing about them changed, so the same Spannable and the same StaticLayout
- * were being rebuilt from identical inputs on two threads. React Native's own
+ * WHY IT EXISTS. The C++ shadow node re-measures on every commit and
+ * `SelectableRunHostView.commitProps` builds the same styled string again on
+ * the UI thread. A streamed message recommits its settled runs many times per
+ * second with nothing about them changed, so the same Spannable and the same
+ * StaticLayout were being rebuilt from identical inputs on two threads. React Native's own
  * text stack solves this identically (TextLayoutManager's spannable cache plus
  * a TextMeasureCache keyed on the full layout constraints, capped at 1024).
  *
@@ -33,10 +32,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  *    be added to the `Spec` wrappers (the key holds the lists, not the
  *    wrappers).
  *  - the window display metrics (`density`, `scaledDensity`), because build
- *    bakes them into the spans: every `AbsoluteSizeSpan` and
+ *    bakes them into the spans: every `AbsoluteSizeSpan` and every attribute
  *    `RunLineHeightSpan` goes through `PixelUtil.toPixelFromSP` (reads
- *    `scaledDensity`) and every margin/tab-stop through `toPixelFromDIP`
- *    (reads `density`), both off `DisplayMetricsHolder.getWindowDisplayMetrics()`.
+ *    `scaledDensity`), and every margin, tab stop and embed reservation —
+ *    box and line height alike — through `toPixelFromDIP` (reads `density`),
+ *    both off `DisplayMetricsHolder.getWindowDisplayMetrics()`.
  *    A FONT-SCALE CHANGE MUST MISS THE CACHE: without the metrics in the key,
  *    every run after an accessibility font-size change would keep rendering
  *    and measuring at the previous scale, silently, until eviction happened
@@ -50,8 +50,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * onTrimMemory, is memory reclamation, not invalidation: every entry is pure
  * derived data, so dropping all of them costs rebuilds and nothing else.)
  *
- * THREADING. `RunTextMeasure.measure` runs on paper's shadow thread and on
- * Fabric's layout thread (through JNI); `commitProps` runs on the UI thread.
+ * THREADING. `RunTextMeasure.measure` runs on whatever thread Fabric calls
+ * the JNI measure from — the background layout thread, or the UI thread for a
+ * synchronous commit; `commitProps` runs on the UI thread.
  * Every map access is synchronized on the map — including gets, because with
  * `accessOrder = true` a get reorders the map. The lock is also what safely
  * publishes a built Spannable across threads; after `build` returns, nothing

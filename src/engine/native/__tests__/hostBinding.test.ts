@@ -81,7 +81,28 @@ describe('host binding discovery', () => {
           install: () => {
             installCalls += 1;
             if (binding) (globalThis as Globals).__selectableMarkdown = binding;
-            return binding !== null;
+            return binding !== null ? 'installed' : 'unavailable';
+          },
+        },
+      },
+    }));
+  }
+
+  /**
+   * A platform module that answers with a fixed outcome and never installs
+   * anything — the shape of a device that cannot host the binding at all.
+   *
+   * `outcome` is typed `unknown` on purpose: the three strings are what a
+   * current binary returns, and a bare `false` is what an older one returns,
+   * and `installNativeEngine` has to read both.
+   */
+  function mockRefusingPlatform(outcome: unknown): void {
+    jest.doMock('react-native', () => ({
+      NativeModules: {
+        SelectableMarkdown: {
+          install: () => {
+            installCalls += 1;
+            return outcome;
           },
         },
       },
@@ -133,8 +154,29 @@ describe('host binding discovery', () => {
     });
   });
 
+  /**
+   * The warning is the feature here, so it is captured and asserted rather
+   * than left to print.
+   *
+   * Both cases below drive `installNativeEngine` down its protocol-mismatch
+   * path, which warns. Unspied, Jest renders that with a code frame and a
+   * stack, so a passing run looked like a failing one — and the message
+   * itself, the actionable half this file's docblock is about, went
+   * unchecked. The spy is installed for the whole block: a stray warning from
+   * anywhere else in it fails `toHaveBeenCalledTimes`.
+   */
   describe('protocol version skew', () => {
-    test('a binding at the wrong version is not available', () => {
+    let warn: jest.SpyInstance;
+
+    beforeEach(() => {
+      warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      warn.mockRestore();
+    });
+
+    test('a binding at the wrong version is not available, and says why once', () => {
       const binding = realBinding(999);
       if (!binding) return;
       mockPlatform(binding);
@@ -142,6 +184,22 @@ describe('host binding discovery', () => {
         expect(native.PROTOCOL_VERSION).not.toBe(999);
         expect(native.findHostBinding()).toBeNull();
         expect(native.isNativeEngineAvailable()).toBe(false);
+
+        // Both numbers and the fix, because "not available" alone would send
+        // the reader looking at their own code.
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls[0][0]).toMatch(
+          new RegExp(
+            `wire protocol v999 .*decodes v${native.PROTOCOL_VERSION}\\..*Rebuild the app`,
+          ),
+        );
+
+        // The once-per-JS-context guard (`warnedAboutProtocol` in
+        // install.ts). An app that polls availability from a render path must
+        // get a diagnostic, not a flood.
+        expect(native.isNativeEngineAvailable()).toBe(false);
+        expect(native.isNativeEngineAvailable()).toBe(false);
+        expect(warn).toHaveBeenCalledTimes(1);
       });
     });
 
@@ -157,6 +215,100 @@ describe('host binding discovery', () => {
           parseDocument('# hi\n', presets.commonmark, native.nativeEngine);
         expect(parse).toThrow(/native engine not usable/);
         expect(parse).not.toThrow(native.NativeProtocolError);
+        // Two failed parses, still one warning.
+        expect(warn).toHaveBeenCalledTimes(1);
+      });
+    });
+  });
+
+  /**
+   * The failure path used to cost as much as the success path, every time.
+   *
+   * `isNativeEngineAvailable()` is documented as safe to poll, and
+   * `install()` is a BLOCKING SYNCHRONOUS method that logs from the native
+   * side on every refusal (RCTLogWarn / Log.w). Because a `false` was never
+   * memoized, a component that asked once per render crossed the bridge once
+   * per render and turned a one-line diagnostic into a flood. The platform
+   * modules now say which refusals are permanent, and that is what these
+   * cases pin.
+   */
+  describe('a permanent refusal is asked for once', () => {
+    test("'refused' stops the polling, and availability stays false", () => {
+      mockRefusingPlatform('refused');
+      withFreshModules((native) => {
+        expect(native.isNativeEngineAvailable()).toBe(false);
+        expect(installCalls).toBe(1);
+
+        // The whole point: five more asks, still one bridge crossing.
+        for (let i = 0; i < 5; i += 1) {
+          expect(native.isNativeEngineAvailable()).toBe(false);
+        }
+        expect(installCalls).toBe(1);
+
+        // And the reason is legible to an app that wants to stop waiting.
+        expect(native.isNativeEnginePermanentlyRefused()).toBe(true);
+        expect(native.isNativeEngineInstalled()).toBe(false);
+      });
+    });
+
+    test("'unavailable' is retried, because the bridge may still arrive", () => {
+      mockRefusingPlatform('unavailable');
+      withFreshModules((native) => {
+        expect(native.isNativeEngineAvailable()).toBe(false);
+        expect(native.isNativeEngineAvailable()).toBe(false);
+        expect(native.isNativeEngineAvailable()).toBe(false);
+        // Three asks, three crossings — deliberately, since this is the state
+        // that resolves itself once the runtime is up.
+        expect(installCalls).toBe(3);
+        expect(native.isNativeEnginePermanentlyRefused()).toBe(false);
+      });
+    });
+
+    test('a native binary older than this bundle still answers a bare boolean', () => {
+      // Forward compatibility in the direction that actually happens: JS
+      // reloads without a rebuild. A `false` carries no permanence claim, so
+      // it must read as transient — retried forever, exactly as before.
+      mockRefusingPlatform(false);
+      withFreshModules((native) => {
+        expect(native.isNativeEngineAvailable()).toBe(false);
+        expect(native.isNativeEngineAvailable()).toBe(false);
+        expect(installCalls).toBe(2);
+        expect(native.isNativeEnginePermanentlyRefused()).toBe(false);
+      });
+    });
+
+    test('an unrecognised outcome is read as transient, never as permanent', () => {
+      // A future binary inventing a fourth string must not be able to make
+      // this bundle give up on a binding that is really there.
+      mockRefusingPlatform('something-new');
+      withFreshModules((native) => {
+        expect(native.isNativeEngineAvailable()).toBe(false);
+        expect(native.isNativeEngineAvailable()).toBe(false);
+        expect(installCalls).toBe(2);
+        expect(native.isNativeEnginePermanentlyRefused()).toBe(false);
+      });
+    });
+
+    test('a refusal is not remembered once the binding is actually there', () => {
+      // The refusal memo is only consulted when nothing landed on the global.
+      // A binary that reports 'refused' but installs anyway (or a host that
+      // installed during startup) must still be used.
+      const binding = realBinding(1);
+      if (!binding) return;
+      jest.doMock('react-native', () => ({
+        NativeModules: {
+          SelectableMarkdown: {
+            install: () => {
+              installCalls += 1;
+              (globalThis as Globals).__selectableMarkdown = binding;
+              return 'refused';
+            },
+          },
+        },
+      }));
+      withFreshModules((native) => {
+        expect(native.isNativeEngineAvailable()).toBe(true);
+        expect(native.isNativeEnginePermanentlyRefused()).toBe(false);
       });
     });
   });

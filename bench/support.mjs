@@ -68,6 +68,16 @@ export function loadLibrary() {
     ...require(path.join(dist, 'engine', 'native', 'index.js')),
     ...require(path.join(dist, 'stream', 'StreamSession.js')),
     ...require(path.join(dist, 'document', 'visit.js')),
+    // The rest of the pipeline a consumer runs on every snapshot, and the
+    // only part of it that is pure TypeScript over the parsed document:
+    // tail repair, run segmentation and run projection. They are here rather
+    // than in one bench because `bench:pathological` times them as the stages
+    // after the parse (the parse is the linear one; these are not), and a
+    // second copy of the require list is how the two drift apart. All three
+    // are react-native-free, so requiring them cannot fail in plain Node.
+    ...require(path.join(dist, 'stream', 'repair.js')),
+    ...require(path.join(dist, 'selection', 'runs.js')),
+    ...require(path.join(dist, 'selection', 'mapSelection.js')),
   };
 }
 
@@ -191,6 +201,36 @@ export async function resolveEngine(lib, label) {
     return null;
   }
   return { name: 'native', engine: native.engine, parse: native.parse, addonPath: native.addonPath };
+}
+
+/**
+ * What a bench does when `resolveEngine` (or any other precondition) came back
+ * empty: exit 0 after reporting, or exit 1 when the caller passed
+ * `--require-engine`.
+ *
+ * WHY THE FLAG EXISTS. Exiting 0 is right for `npm run bench:*` on a laptop
+ * with no C++ toolchain — "this machine cannot build the addon" is not a
+ * regression, and a red job for it teaches people to ignore the job. It is
+ * exactly wrong for a CI step that is a GATE: `bench:pathological --budget`
+ * and `bench:projection` are supposed to fail on a cliff, and a step that
+ * exits 0 having measured nothing is a green gate over zero samples. The
+ * likeliest cause is not a missing compiler at all but a protocol-version
+ * drift between the built addon and dist/, which `resolveEngine` reports and
+ * then swallows.
+ *
+ * So the workflows pass `--require-engine` and developers do not. `label`
+ * prefixes the message, e.g. `[bench:pathological]`.
+ */
+export function exitWithoutEngine(label, what = 'the native engine did not resolve') {
+  if (hasFlag('require-engine')) {
+    console.error(
+      `${label} --require-engine was passed and ${what}, so this run measured nothing. ` +
+        'Failing rather than reporting a gate that passed over zero samples.',
+    );
+    process.exit(1);
+  }
+  console.log(`${label} exiting 0 (pass --require-engine to make this a failure).`);
+  process.exit(0);
 }
 
 /**

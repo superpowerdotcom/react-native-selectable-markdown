@@ -4,8 +4,16 @@
  *
  * Every constant here is part of the ABI between the compiled module and
  * this package. `protocol.test.ts` re-parses the C++ header and asserts the
- * numbers match, so the two files cannot drift silently; changing a value
- * means bumping `PROTOCOL_VERSION` on both sides.
+ * numbers match, so the two files cannot drift silently.
+ *
+ * `PROTOCOL_VERSION` is bumped (on both sides at once) when a decoder built
+ * against the other side would read the buffer wrong — a changed constant, a
+ * changed layout, a field given a new meaning. It is deliberately NOT bumped
+ * for a change no decoder can observe, such as retiring a `detailA` meaning
+ * nothing ever read: `decode.ts` throws on a version mismatch, so a bump
+ * hard-breaks every old-native-module/new-JS pair, and spending that on a
+ * change both combinations survive would train people to rebuild for
+ * nothing. See the same note in `Protocol.h`.
  *
  * Design notes that matter to a reader of the decoder:
  *
@@ -133,25 +141,27 @@ export const EXT_MATH = 1 << 4;
 export const EXT_UNDERLINE = 1 << 5;
 
 /**
- * How the *parser* should treat raw HTML. This is not the same axis as
- * `EngineOptions.html`:
+ * The third argument of the native `parse` call — a RESERVED WIRE SLOT, not a
+ * switch. `configFromBits` reads it and discards it (`(void)htmlPolicy` in
+ * platform/cpp/FlatBuffer.cpp), so `parse(src, bits, 0)` and
+ * `parse(src, bits, 1)` return byte-identical buffers. `ParserConfig` in
+ * OffsetParser.h has no HTML field at all for it to reach.
  *
- * - `HTML_INERT` makes md4c ignore HTML syntax entirely (MD_FLAG_NOHTML), so
- *   `<div>x</div>` stays literal prose and never even becomes a node.
- * - `HTML_PARSED` lets md4c recognize HTML blocks and spans, which the
- *   decoder then either keeps (`html: 'raw'`) or drops (`html: 'strip'`).
+ * The two values stay named and parity-tested because they are part of the
+ * format (`kHtmlStrip`/`kHtmlRaw` in Protocol.h) and removing an argument
+ * would be a protocol change. `htmlPolicyBit()` below always sends
+ * `HTML_PARSED`, which is the value that describes what actually happens.
  *
- * Both `'strip'` and `'raw'` therefore send `HTML_PARSED`, because stripping
- * means *removing the construct*, not *rendering its source as text* — and
- * an HTML block also swallows the lines that follow it, so a parser that
- * ignored HTML would produce different block structure. Keeping the parse
- * identical across the two settings is what makes `html` a rendering choice
- * rather than a reparse: the same source yields the same blocks carrying the
- * same spans, and `'strip'` merely declines to emit the HTML nodes on the way
- * out of the decoder. Sending `HTML_INERT` for `'strip'` would instead make
- * `<div>` … blank line … `</div>` parse as an HTML block under one setting
- * and as ordinary prose under the other, moving every span after it — and
- * spans are what selection, copy and the streaming splice are built on.
+ * WHY THE SLOT IS INERT RATHER THAN WIRED UP. It once mapped `HTML_INERT` to
+ * MD_FLAG_NOHTML, which does not hide HTML — it changes the *block
+ * structure*: `<div>` … blank line … `</div>` parses as an HTML block with
+ * the flag off and as ordinary prose with it on, moving every span after it.
+ * Spans are what selection, copy and the streaming splice are built on, so
+ * `html` has to be a rendering choice rather than a reparse. md4c is
+ * therefore always asked to parse HTML, and `EngineOptions.html` is honoured
+ * on the way OUT of the decoder: `'raw'` keeps the nodes, `'strip'` declines
+ * to emit them, and every other node's span is identical either way. That
+ * decision never crosses the boundary.
  */
 export const HTML_INERT = 0;
 export const HTML_PARSED = 1;
@@ -173,10 +183,10 @@ export function extensionBits(options: ResolvedEngineOptions): number {
 
 /**
  * The html-policy word for the native call. Takes no options ON PURPOSE:
- * both `html: 'strip'` and `html: 'raw'` send `HTML_PARSED`, for the reason
- * spelled out above, so there is nothing about the resolved options this can
- * depend on. It used to accept and discard them, which read as if the
- * mapping were still open.
+ * the native side ignores the word entirely and `html` is applied in the
+ * decoder, so there is nothing about the resolved options this can depend
+ * on. It used to accept and discard them, which read as if the mapping were
+ * still open.
  */
 export function htmlPolicyBit(): number {
   return HTML_PARSED;

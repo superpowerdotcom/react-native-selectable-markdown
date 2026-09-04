@@ -335,6 +335,56 @@ describeNative('resolveRunDecorations', () => {
     expect(rule.inset).toBe(defaultTheme.rule.inset + quoteStep);
   });
 
+  /*
+   * A box at the very edge of a run has NO block separator to paint into.
+   *
+   * Box padding is drawn into the blank line the '\n\n' separators leave
+   * around a block (see `RunDecoration.paddingTop`), and both hosts clamp a
+   * band to their own bounds — `min(bounds.height, band.bottom + padding)` on
+   * iOS, `coerceAtMost(height)` on Android. A run used to be measured as
+   * exactly as tall as its lines, so a box that ENDS the run had
+   * `band.bottom == bounds.height` already and its bottom padding clamped to
+   * nothing: the border of a trailing table stroked across the bottom of its
+   * last row instead of below it, which is the ordinary shape of an answer
+   * that ends with a table, and a box that OPENS one lost its top border the
+   * same way.
+   *
+   * BOTH HOSTS NOW RESERVE THAT ROOM, and these two cases are the JS half of
+   * the contract they reserve it from: the padding IS declared at both edges,
+   * with `start === 0` and `end === text.length` as the marker. iOS derives
+   * it in the one string builder and carries it on the string the measurer
+   * and the view share (`RNSMAttributedText.runEdgeInsets(of:)`); Android
+   * derives it in `RunDecorations.edgePaddingDp`, which `RunTextMeasure`
+   * adds to the measured height and `SelectableRunHostView` sets as the
+   * child TextView's padding. Zero the padding here and both hosts stop
+   * reserving anything — which is why these cases exist: they fail the day
+   * someone "fixes" the artifact from this end, trading a squashed border
+   * for a missing one.
+   */
+  describe('a box at the edge of a run', () => {
+    test('a trailing table still declares its bottom padding', () => {
+      const { projected, decorations } = decorate(
+        'Here:\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n',
+      );
+      const border = decorations.find(
+        (d) => d.kind === 'box' && d.borderColor !== undefined,
+      );
+      if (!border) throw new Error('no table border box');
+
+      expect(border.end).toBe(projected.text.length);
+      expect(border.paddingBottom).toBe(defaultTheme.table.cellPaddingV);
+    });
+
+    test('a leading code block still declares its top padding', () => {
+      const { decorations } = decorate('```js\nconst x = 1;\n```\n\nAfter.\n');
+      const box = decorations.find((d) => d.kind === 'box');
+      if (!box) throw new Error('no code box');
+
+      expect(box.start).toBe(0);
+      expect(box.paddingTop).toBe(defaultTheme.code.paddingVertical);
+    });
+  });
+
   test('every decoration points into the text and none changes it', () => {
     const source =
       '# Title\n\n```py\nx = 1\n```\n\n| h | i |\n| - | - |\n| j | k |\n\n---\n\nDone.\n';

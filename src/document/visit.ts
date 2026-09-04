@@ -1,6 +1,20 @@
 import type { AnyNode, ParsedDocument } from './nodes';
 
-export type Visitor = (node: AnyNode, parent: AnyNode | null) => void | false;
+/**
+ * What a visitor may say about the rest of the traversal:
+ *
+ * - nothing (`undefined`): keep going, children included.
+ * - `false`: SKIP this node's children; the walk continues with its siblings.
+ * - `'stop'`: END the whole traversal, right here.
+ *
+ * The two signals are different questions — "is there anything worth seeing
+ * under this node?" and "have I seen enough?" — and a walk that answers only
+ * the first forces every search to be written by hand off `childrenOf`, which
+ * is exactly what `runs.ts` used to do.
+ */
+export type VisitSignal = void | false | 'stop';
+
+export type Visitor = (node: AnyNode, parent: AnyNode | null) => VisitSignal;
 
 const NO_CHILDREN: readonly AnyNode[] = [];
 
@@ -32,24 +46,58 @@ export function childrenOf(node: AnyNode): readonly AnyNode[] {
 
 /**
  * Pre-order traversal. Returning `false` from the visitor skips the node's
- * children (the traversal continues with its siblings).
+ * children (the traversal continues with its siblings); returning `'stop'`
+ * ends the traversal outright, so a search does not have to walk the rest of
+ * the document after it has found its answer.
  */
 export function visit(node: AnyNode | ParsedDocument, fn: Visitor): void {
-  if ('kind' in node) {
-    walk(node, null, fn);
-    return;
-  }
-  for (const block of node.blocks) {
-    walk(block, null, fn);
+  walk('kind' in node ? [node] : node.blocks, fn);
+}
+
+/**
+ * Depth-first, children left to right, OFF AN EXPLICIT STACK.
+ *
+ * Nesting depth is untrusted input: three kilobytes of `'> '` is 1500 levels
+ * of blockquote, the native decoder builds its tree off a stack of its own
+ * and so hands back a tree as deep as the source asks for, and a recursive
+ * walk over it overflows the JS stack — inside React render, on the selection
+ * path, wherever the walk happens to be called from. The two stacks below
+ * hold the pending node and its parent in step (rather than one stack of
+ * `{node, parent}` frames) so a traversal costs no allocation per node.
+ * `mapSelection`'s projector and `runs.ts` avoid recursion for the same
+ * reason.
+ */
+function walk(roots: readonly AnyNode[], fn: Visitor): void {
+  const nodes: AnyNode[] = [];
+  const parents: (AnyNode | null)[] = [];
+  pushChildren(nodes, parents, roots, null);
+  for (;;) {
+    const node = nodes.pop();
+    if (node === undefined) {
+      return;
+    }
+    const parent = parents.pop() ?? null;
+    const signal = fn(node, parent);
+    if (signal === 'stop') {
+      return;
+    }
+    if (signal === false) {
+      continue;
+    }
+    pushChildren(nodes, parents, childrenOf(node), node);
   }
 }
 
-function walk(node: AnyNode, parent: AnyNode | null, fn: Visitor): void {
-  if (fn(node, parent) === false) {
-    return;
-  }
-  for (const child of childrenOf(node)) {
-    walk(child, node, fn);
+/** Reversed, so the stack pops the children in document order. */
+function pushChildren(
+  nodes: AnyNode[],
+  parents: (AnyNode | null)[],
+  children: readonly AnyNode[],
+  parent: AnyNode | null,
+): void {
+  for (let i = children.length - 1; i >= 0; i -= 1) {
+    nodes.push(children[i]);
+    parents.push(parent);
   }
 }
 

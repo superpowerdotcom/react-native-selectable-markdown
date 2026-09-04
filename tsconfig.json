@@ -14,6 +14,10 @@
     "declaration": false,
     "noEmit": true
   },
-  "include": ["src", "conformance"],
-  "exclude": ["node_modules", "dist", "bench"]
+  // scripts/ and bench/ are here for their .ts suites only — everything else in
+  // both directories is .mjs, which `allowJs: false` ignores. Without them
+  // `npm run typecheck` would not see the tests that gate the release and bench
+  // harness, and a type error there would surface only under jest.
+  "include": ["src", "conformance", "scripts", "bench"],
+  "exclude": ["node_modules", "dist"]
 }

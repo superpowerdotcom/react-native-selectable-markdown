@@ -1,8 +1,10 @@
 /**
  * The embed list the native host reserves space from, and the projection
- * entries it is built from. Pure reshaping — `resolveRunEmbeds` must never
- * invent, drop, or reorder an embed, because `embedId` is the index the host
- * echoes back through `onEmbedLayout` and the view resolves overlays with.
+ * entries it is built from. Near-pure reshaping — `resolveRunEmbeds` must
+ * never invent or reorder an embed, and must never renumber one, because
+ * `embedId` is the identifier the host echoes back through `onEmbedLayout`
+ * and the view resolves overlays with. The one thing it does drop is a claim
+ * whose declared size cannot be reserved (see the size-guard block below).
  */
 
 import type { AnyNode } from '../document/nodes';
@@ -59,6 +61,51 @@ describe('resolveRunEmbeds', () => {
     ]);
     // The invariant the view and the host both index on.
     embeds.forEach((embed, index) => expect(embed.embedId).toBe(index));
+  });
+
+  describe('unreservable sizes', () => {
+    const withSize = (width: number, height: number): ProjectedRunEmbed[] => [
+      {
+        embedId: 0,
+        start: 1,
+        end: 2,
+        node: node('link'),
+        content: { width, height },
+      },
+      {
+        embedId: 1,
+        start: 5,
+        end: 6,
+        node: node('image'),
+        content: { width: 100, height: 40 },
+      },
+    ];
+
+    test.each([
+      ['infinite width', Number.POSITIVE_INFINITY, 40],
+      ['infinite height', 100, Number.POSITIVE_INFINITY],
+      ['NaN width', Number.NaN, 40],
+      ['zero height', 100, 0],
+      ['negative width', -100, 40],
+    ])('a claim with %s is dropped', (_label, width, height) => {
+      // `Infinity > 0` is true, so an infinite dimension used to travel all
+      // the way to TextKit (an infinite attachment rect) and to Android
+      // (a replacement span saturated to Int.MAX_VALUE), under a guard
+      // comment promising "never a crash".
+      const embeds = resolveRunEmbeds(projectedWith(withSize(width, height)));
+
+      expect(embeds).toHaveLength(1);
+      expect(embeds[0].embedId).toBe(1);
+    });
+
+    test('surviving entries keep their ids rather than being renumbered', () => {
+      // The id is resolved against `ProjectedRun.embeds`, never against a
+      // position in this list, so a drop must not shift the ones after it.
+      const [survivor] = resolveRunEmbeds(projectedWith(withSize(0, 0)));
+
+      expect(survivor.embedId).toBe(1);
+      expect(survivor.width).toBe(100);
+    });
   });
 
   test('an absent copy text stays absent rather than riding as undefined', () => {

@@ -231,6 +231,86 @@ describeNative('lazy container continuation', () => {
   });
 });
 
+describeNative("html: 'strip' keeps <br> as a line break", () => {
+  /**
+   * Stripping removes markup, and for every HTML construct but one that also
+   * removes whatever the construct carried — an inline `<span>` loses its
+   * tags, an HTML *block* takes its entire text content with it. `<br>` is
+   * the exception, because dropping it does not remove a construct, it joins
+   * two words: `line one<br>line two` would render as `line oneline two`,
+   * with no separator anywhere and no way for the reader to tell. Models
+   * write `<br>` constantly, and inside a GFM table cell it is the only line
+   * break the syntax has, so this is not a corner.
+   *
+   * The replacement is a `hardBreak` spanning exactly the tag, so a selection
+   * across it still copies back `<br>` character for character.
+   */
+  test('an inline <br> becomes a hardBreak over the tag, not a hole', () => {
+    const doc = parse('line one<br>line two\n', CM);
+    const inlines = firstParagraph(doc);
+    expect(inlines.map((n) => n.kind)).toEqual(['text', 'hardBreak', 'text']);
+    expect(sliceOf(doc, inlines[1])).toBe('<br>');
+    expect(inlines[0]).toMatchObject({ value: 'line one' });
+    expect(inlines[2]).toMatchObject({ value: 'line two' });
+  });
+
+  test.each(['<br>', '<br/>', '<br />', '<BR>', '<br class="x">'])(
+    '%s is a break in every written form',
+    (tag) => {
+      const doc = parse(`a${tag}b\n`, CM);
+      const inlines = firstParagraph(doc);
+      expect(inlines.map((n) => n.kind)).toEqual(['text', 'hardBreak', 'text']);
+      expect(sliceOf(doc, inlines[1])).toBe(tag);
+    },
+  );
+
+  test.each(['<brand>', '<br-thing>', '<br-separator/>', '<brx />'])(
+    '%s merely starts with "br" and is still stripped',
+    (tag) => {
+      // Not a prefix test: the matcher requires the tag name to END at
+      // whitespace, `/` or `>`. A hyphen is a legal tag-name character, so
+      // `<br-thing>` is an ordinary custom element — the `\b` this matcher
+      // used to rely on matched between `r` and `-` and turned every
+      // `<br-*>` element into a line break.
+      const doc = parse(`a${tag}b\n`, CM);
+      expect(firstParagraph(doc).map((n) => n.kind)).toEqual(['text', 'text']);
+    },
+  );
+
+  test('a closing </br> is nothing at all, not a break', () => {
+    // Matching every HTML parser: a void element's end tag is ignored.
+    const doc = parse('a</br>b\n', CM);
+    expect(firstParagraph(doc).map((n) => n.kind)).toEqual(['text', 'text']);
+  });
+
+  test("under html: 'raw' it stays an htmlSpan, unchanged", () => {
+    // The rewrite belongs to stripping. A consumer who asked for raw HTML
+    // gets the tag as a node and decides for itself.
+    const doc = parse('a<br>b\n', RAW);
+    const inlines = firstParagraph(doc);
+    expect(inlines.map((n) => n.kind)).toEqual(['text', 'htmlSpan', 'text']);
+    expect(inlines[1]).toMatchObject({ literal: '<br>' });
+  });
+
+  test('a <br> inside a GFM table cell breaks the cell line', () => {
+    // The case with no alternative syntax: GFM cells cannot contain a
+    // markdown hard break, so a stripped `<br>` used to concatenate the two
+    // halves of every multi-line cell a model emitted.
+    const doc = parse('| h |\n| - |\n| x<br>y |\n', LLM);
+    const table = doc.blocks[0] as { rows: { cells: { children: Inline[] }[] }[] };
+    const cell = table.rows[0].cells[0];
+    expect(cell.children.map((n) => n.kind)).toEqual(['text', 'hardBreak', 'text']);
+    expect(sliceOf(doc, cell.children[1])).toBe('<br>');
+  });
+
+  test('an HTML block still takes its content with it', () => {
+    // Deliberate and documented: stripping a block removes the construct,
+    // and a `<div>` wrapper is the construct. Only `<br>` is special-cased,
+    // because only `<br>` stands for something the reader can see.
+    expect(parse('<div>\nhello **world**\n</div>\n', CM).blocks).toEqual([]);
+  });
+});
+
 describeNative('HTML blocks and tabs', () => {
   test('a type-1 HTML block runs to its closing tag, across blank lines', () => {
     // `<pre>`/`<script>`/`<style>`/`<textarea>` blocks end at the closing tag
@@ -284,6 +364,89 @@ describeNative('permissive autolinks', () => {
   test('autolinks stay literal text with the extension off', () => {
     const doc = parseDocument('see https://e.com now\n', CM, requireNativeEngine());
     expect(firstParagraph(doc).map((n) => n.kind)).toEqual(['text']);
+  });
+
+  test('a bare email address autolinks to a mailto: destination', () => {
+    // GFM's autolink extension is three forms, not two — `https://`, `www.`
+    // and a bare `user@host.tld` — and `extensions.autolinks` advertises the
+    // extension, so all three are on. The href gets the `mailto:` md4c
+    // supplies; the span still covers only what the author typed, which is
+    // what keeps a copy of the selection free of the invented scheme.
+    const doc = parse('mail foo@e.com now\n');
+    const [, link] = firstParagraph(doc);
+    expect(link).toMatchObject({ kind: 'autolink', href: 'mailto:foo@e.com' });
+    expect(sliceOf(doc, link)).toBe('foo@e.com');
+  });
+
+  test('an address with no host dot is not an autolink', () => {
+    // md4c requires at least two dot-delimited host components, so
+    // `foo@localhost` stays prose. Pinned because it is the boundary a
+    // streaming renderer crosses one character at a time.
+    const doc = parse('mail foo@localhost now\n');
+    expect(firstParagraph(doc).map((n) => n.kind)).toEqual(['text']);
+  });
+
+  test('email autolinks follow the same extension switch as the others', () => {
+    const doc = parseDocument('mail foo@e.com now\n', CM, requireNativeEngine());
+    expect(firstParagraph(doc).map((n) => n.kind)).toEqual(['text']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Attribute strings
+// ---------------------------------------------------------------------------
+
+describeNative('hrefs, titles and info strings are decoded exactly once', () => {
+  /**
+   * A link destination, a title and a fence info string are string VALUES,
+   * not source ranges, and md4c decodes them while it builds the attribute:
+   * backslash escapes drop out there, and `internAttribute`
+   * (platform/cpp/OffsetParser.cpp) resolves the entity substrings against
+   * md4c's full HTML5 table. The decoder used to run a JS decoder over the
+   * result as well, which is invisible on ordinary input — decoding `/f&ouml;&ouml;`
+   * twice gives the same answer — and wrong on anything the author escaped on
+   * purpose. Every case below is one where the two passes differ.
+   */
+  test('a doubly-encoded entity in a destination keeps its second layer', () => {
+    const doc = parse('[a](https://e.com/?x=1&amp;amp;y=2)\n');
+    const [link] = firstParagraph(doc);
+    expect(link).toMatchObject({ kind: 'link', href: 'https://e.com/?x=1&amp;y=2' });
+  });
+
+  test('an escaped backslash in a destination stays a backslash', () => {
+    const doc = parse('[a](https://e.com/a\\\\*b)\n');
+    const [link] = firstParagraph(doc);
+    expect(link).toMatchObject({ kind: 'link', href: 'https://e.com/a\\*b' });
+  });
+
+  test('a title decodes once', () => {
+    const doc = parse('[a](https://e.com "t&amp;amp;u")\n');
+    const [link] = firstParagraph(doc);
+    expect(link).toMatchObject({ kind: 'link', title: 't&amp;u' });
+  });
+
+  test('an image src and title decode once', () => {
+    const doc = parse('![alt](https://e.com/?x=1&amp;amp;y=2 "t&amp;amp;u")\n');
+    const [img] = firstParagraph(doc);
+    expect(img).toMatchObject({
+      kind: 'image',
+      src: 'https://e.com/?x=1&amp;y=2',
+      title: 't&amp;u',
+    });
+  });
+
+  test('a fence info string decodes once', () => {
+    const doc = parse('```c&amp;lt;\nx\n```\n');
+    expect(doc.blocks[0]).toMatchObject({ kind: 'codeBlock', language: 'c&lt;' });
+  });
+
+  test('an autolink URI keeps its backslash, and its entity is still decoded', () => {
+    // The autolink half of the same contract: md4c builds an autolink's
+    // destination with MD_BUILD_ATTR_NO_ESCAPES, so `\*` survives, while the
+    // entity substrings are resolved as everywhere else.
+    const doc = parse('<https://e.com/?find=\\*&amp;lt;x>\n');
+    const [link] = firstParagraph(doc);
+    expect(link).toMatchObject({ kind: 'autolink', href: 'https://e.com/?find=\\*&lt;x' });
   });
 });
 

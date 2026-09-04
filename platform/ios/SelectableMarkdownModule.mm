@@ -26,18 +26,31 @@
  * Both objects React Native hands a NativeModule as its `bridge` expose that
  * pointer under the same selector, `-runtime`, returning `void *`:
  *
- *   - RCTCxxBridge, on the old architecture and on the new architecture with
- *     a bridge (React/Base/RCTBridge+Private.h; unchanged 0.73 -> 0.81).
+ *   - RCTCxxBridge, on the new architecture with a bridge, and on the old one
+ *     before it was removed (React/Base/RCTBridge+Private.h).
  *   - RCTBridgeProxy, in bridgeless mode, which RCTTurboModuleManager sets as
  *     the `bridge` of every legacy module and which RCTInstance constructs
  *     with `runtime:_reactInstance->getJavaScriptContext()` — the real
  *     pointer, not a stub.
  *
+ * WHICH VERSIONS THAT WAS READ ON, AND WHICH THIS PACKAGE SUPPORTS. The two
+ * headers above were read on 0.73 through 0.81, where `-runtime` did not
+ * change. package.json's peer floor is now `react-native >= 0.82`, and
+ * nothing in this repository has re-read them there (CI type-checks against
+ * the 0.75.4 devDependency's headers — `npm run check:swift`). The gap costs
+ * correctness nothing, because every call below is a *probe* and not a
+ * version test: `SelectableMarkdownClassImplements` asks the class whether it
+ * implements the selector, so a React Native that renamed or dropped
+ * `-runtime` is a clean "no runtime reachable, answer NO and warn" rather
+ * than a miscompiled message send. Read the version windows in this file as
+ * "where this was verified", never as "where this works".
+ *
  * WHAT WAS REJECTED, AND WHY, SO NOBODY RE-ADDS IT:
  *
- *   RCTRuntimeExecutorModule. Does not exist on 0.73 and was deleted again
+ *   RCTRuntimeExecutorModule. It appeared after 0.73 and was deleted again
  *   after 0.78 (React/Base/RCTRuntimeExecutorModule.h is absent in both), so
- *   it covers a four-version window. Worse, in bridgeless the executor it
+ *   it covered a four-version window that ended below this package's peer
+ *   floor. Worse, in bridgeless the executor it
  *   hands out routes through the JS message queue (ReactInstance.cpp ->
  *   RCTMessageThread::runOnQueue), so -execute: called *from* the JS thread
  *   defers rather than running inline: the install would land a tick later
@@ -136,6 +149,35 @@ BOOL SelectableMarkdownInstallInto(facebook::jsi::Runtime &runtime)
   return NO;
 }
 
+/*
+ * The three answers -install can give, as strings on the wire.
+ *
+ * WHY NOT A BOOLEAN, WHICH IS WHAT THIS USED TO RETURN. A bare NO conflated
+ * "not yet" with "not ever", and the JS side is invited to poll: it retried
+ * every refusal on every call, and every retry crossed the bridge and printed
+ * another RCTLogWarn. The two classes are distinguishable here and nowhere
+ * else, so this is where the distinction has to be spoken.
+ *
+ *   installed    — the global is on the runtime now. Nothing more to do.
+ *   unavailable  — TRANSIENT. No runtime was reachable: the bridge has not
+ *                  finished starting, or a reload is in flight. Ask again.
+ *   refused      — PERMANENT for this binary and this runtime. The runtime
+ *                  cannot back an ArrayBuffer with a jsi::MutableBuffer
+ *                  (JavaScriptCore — SelectableMarkdownJsi.h invariant 6), or
+ *                  it rejected the property writes. Asking again cannot help,
+ *                  and src/engine/native/install.ts stops asking.
+ *
+ * Strings rather than a numeric code because they survive every marshalling
+ * path a blocking synchronous method can take and read the same in a JS
+ * console as they do here. A JS bundle older than this binary ignores the
+ * return value entirely (it reads the global instead), and a JS bundle newer
+ * than an older binary sees the old `true`/`false` and reads a `false` as
+ * `unavailable` — the older behaviour, retried forever but never wrong.
+ */
+static NSString *const kSelectableMarkdownInstalled = @"installed";
+static NSString *const kSelectableMarkdownUnavailable = @"unavailable";
+static NSString *const kSelectableMarkdownRefused = @"refused";
+
 }  // namespace
 
 @implementation SelectableMarkdownModule {
@@ -145,6 +187,20 @@ BOOL SelectableMarkdownInstallInto(facebook::jsi::Runtime &runtime)
    * deliberately NOT reset anywhere: a new JS runtime comes with a new bridge
    * (or a new RCTInstance) and therefore a new module instance. */
   BOOL _installed;
+
+  /* The matching memo for the *permanent* failure, and the reason the two
+   * are separate flags rather than one tri-state: a success and a permanent
+   * refusal are both final, but only one of them means "the binding is
+   * there". Set when SelectableMarkdownInstallInto reports failure — the JSC
+   * case and the runtime-rejected-the-writes case, both of which the file
+   * header calls permanent for this binary.
+   *
+   * SCOPED TO THE MODULE INSTANCE, exactly like _installed, and for the same
+   * reason: a new JS runtime arrives with a new bridge (or a new RCTInstance)
+   * and therefore a new module, so a reload re-asks rather than inheriting a
+   * refusal that belonged to the runtime before it. The transient branch
+   * below is deliberately NOT memoized — that one is the "ask again" case. */
+  BOOL _refused;
 }
 
 RCT_EXPORT_MODULE(SelectableMarkdown)
@@ -187,27 +243,36 @@ RCT_EXPORT_MODULE(SelectableMarkdown)
 }
 
 /*
- * Install the binding and report whether it is usable right now.
+ * Install the binding and report whether it is usable right now — and, when
+ * it is not, whether asking again could ever change the answer.
  *
  * The answer is "the global exists by the time this returns", not
  * "installation was requested" — the caller's next statement reads that
- * global. A NO does not end the app: two of the three causes (no bridge yet,
- * runtime torn down mid-reload) are transient, so the JS layer records "not
- * installed" and may call again later. The third (an engine without
- * MutableBuffer-backed ArrayBuffers, i.e. JavaScriptCore) is permanent for
- * this binary. Either way nothing quietly takes over the parsing while the
- * answer is NO — this package ships no JavaScript parser, so parseDocument
- * throws until one of those later calls succeeds.
+ * global. Neither refusal ends the app: `unavailable` (no bridge yet, runtime
+ * torn down mid-reload) is transient, so the JS layer records "not installed"
+ * and may call again later; `refused` (an engine without MutableBuffer-backed
+ * ArrayBuffers, i.e. JavaScriptCore, or a runtime that rejected the writes) is
+ * permanent for this binary, and the JS layer stops asking. Either way nothing
+ * quietly takes over the parsing while the answer is not `installed` — this
+ * package ships no JavaScript parser, so parseDocument throws until one of
+ * those later calls succeeds.
  */
 RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(install)
 {
-  return @([self installBinding]);
+  return [self installOutcome];
 }
 
-- (BOOL)installBinding
+- (NSString *)installOutcome
 {
   if (_installed) {
-    return YES;
+    return kSelectableMarkdownInstalled;
+  }
+
+  /* The whole point of the flag: the warning below already printed once, and
+   * a caller polling from a render path must get one diagnostic rather than
+   * one per frame. */
+  if (_refused) {
+    return kSelectableMarkdownRefused;
   }
 
   void *runtime = [self jsRuntimePointer];
@@ -217,15 +282,18 @@ RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(install)
         @"not installed and markdown cannot be parsed yet. This is usually "
         @"transient (JS still loading, or a reload in progress) — call "
         @"install() again once the bridge is up.");
-    return NO;
+    return kSelectableMarkdownUnavailable;
   }
 
   if (!SelectableMarkdownInstallInto(*static_cast<facebook::jsi::Runtime *>(runtime))) {
-    return NO;
+    /* SelectableMarkdownInstallInto has already logged the reason. Remember
+     * the refusal so the next call neither re-crosses nor re-logs. */
+    _refused = YES;
+    return kSelectableMarkdownRefused;
   }
 
   _installed = YES;
-  return YES;
+  return kSelectableMarkdownInstalled;
 }
 
 /* NULL means "not right now", never "broken": before the bridge has started,

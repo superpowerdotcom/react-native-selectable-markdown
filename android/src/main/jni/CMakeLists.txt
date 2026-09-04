@@ -205,13 +205,20 @@ target_include_directories(react_codegen_SelectableMarkdownSpec BEFORE PUBLIC
 # FabricUIManager.measure as a ReadableMap.
 #
 # PROBED BY TARGET EXISTENCE, NEVER BY VERSION NUMBER. React Native 0.73-0.75
-# publish a prefab module per feature (reactnativejni among them); 0.76
-# collapsed the lot into a single `reactnative`. Both names are aliased into
-# the app's CMake scope by ReactNative-application.cmake before it includes
-# Android-autolinking.cmake, so exactly one of these branches is live and it is
-# the right one — with no version string in this file to go stale. This is the
-# same discipline ../../../CMakeLists.txt applies to ReactAndroid::jsi, and the
-# reason that file needs no version ladder either.
+# published a prefab module per feature (reactnativejni among them); 0.76
+# collapsed the lot into a single `reactnative`, and that is the only branch
+# reachable inside the peer range package.json declares today (>= 0.82). The
+# `reactnativejni` branch is HISTORICAL — it is kept, not because a supported
+# consumer can take it, but because it costs one line and is the only thing
+# standing between a consumer who overrides the peer range and a page of
+# undefined fbjni symbols. Whichever of the two names the app's React Native
+# publishes is aliased into the app's CMake scope by
+# ReactNative-application.cmake before it includes Android-autolinking.cmake
+# (0.75.4 aliases `reactnativejni` there; 0.76+ aliases `reactnative`), so
+# exactly one of these branches is live and it is the right one — with no
+# version string this file has to keep current. This is the same discipline
+# ../../../CMakeLists.txt applies to ReactAndroid::jsi, and the reason that
+# file needs no version ladder either.
 #
 # Failing loudly rather than falling through: if neither target exists, the
 # link error would be a page of undefined facebook::jni symbols from a
@@ -223,10 +230,11 @@ elseif(TARGET reactnative)
   target_link_libraries(react_codegen_SelectableMarkdownSpec reactnative)
 else()
   message(FATAL_ERROR
-    "react-native-selectable-markdown: neither the `reactnativejni` (React "
-    "Native 0.73-0.75) nor the `reactnative` (0.76+) prefab target is defined "
-    "in this scope. RNSMRunTextMeasurer.cpp needs react/jni/ReadableNativeMap.h "
-    "from one of them. If React Native renamed the module again, add the new "
-    "name as another branch here — the probe is deliberately by target "
-    "existence so this stays a one-line change.")
+    "react-native-selectable-markdown: neither the `reactnative` prefab target "
+    "(React Native 0.76+, which covers the whole supported range) nor the "
+    "historical `reactnativejni` (0.73-0.75) is defined in this scope. "
+    "RNSMRunTextMeasurer.cpp needs react/jni/ReadableNativeMap.h from one of "
+    "them. If React Native renamed the module again, add the new name as "
+    "another branch here — the probe is deliberately by target existence so "
+    "this stays a one-line change.")
 endif()

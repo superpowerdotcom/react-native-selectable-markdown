@@ -13,7 +13,6 @@ import android.text.style.LineHeightSpan
 import android.text.style.MetricAffectingSpan
 import android.text.style.StrikethroughSpan
 import android.text.style.StyleSpan
-import android.text.style.TypefaceSpan
 import android.text.style.UnderlineSpan
 import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.ReadableMap
@@ -58,6 +57,51 @@ object RunAttributedText {
         val strikethrough: Boolean,
         val color: Int?,
         val backgroundColor: Int?,
+        /**
+         * The semantics channel: what the range IS for a screen reader, as
+         * opposed to what it looks like — `"heading"`, `"listItem"`,
+         * `"tableCell"`, or null. `RunSemanticRole` in
+         * src/view/runAttributes.ts owns the set and says what bounds it.
+         *
+         * NOT A STYLING FIELD, and nothing in `build` reads it: it never
+         * becomes a span and never moves a glyph. `RunAccessibility.resolve`
+         * is the only consumer, which is why it rides this struct rather
+         * than a prop of its own — the ranges are already here, already
+         * parsed once per batch, already clamped by every reader.
+         *
+         * A value this binary does not recognise is carried through and
+         * ignored downstream, which leaves the range announced as the prose
+         * it already was — the same forward-compatibility rule as every
+         * other field here.
+         */
+        val role: String?,
+        /** The role's depth where it has one — a heading's level (1-6), or a
+         * list item's nesting depth (1 at top level) — null otherwise.
+         * Parsed and then dropped, because no primitive on either platform
+         * carries a rank: `setHeading` is a boolean and `CollectionItemInfo`
+         * has no depth. `RunAccessibility.resolve` states the whole argument;
+         * it stays on the wire so consuming it is one change and not two. */
+        val roleLevel: Int?,
+        /**
+         * The range's ONE-BASED position in its collection: a list item's
+         * place in its list, a table cell's row (row 1 is the header row).
+         * Null when the role has no position.
+         *
+         * One-based on the wire because 0 is the absent sentinel this whole
+         * struct uses; `RunAccessibility` subtracts one on the way into
+         * `CollectionItemInfoCompat`, which is zero-based.
+         */
+        val roleRow: Int?,
+        /** The size of that collection — a list's item count, a table's row
+         * count including the header. The "of 5" half of TalkBack's "item 2
+         * of 5", which TalkBack phrases in the reader's own language. */
+        val roleRowCount: Int?,
+        /** The range's one-based column, for the one role laid out in two
+         * dimensions (`tableCell`). Null for a list item, which is read as a
+         * one-column collection. */
+        val roleColumn: Int?,
+        /** The table's column count. Set with `roleColumn`. */
+        val roleColumnCount: Int?,
     )
 
     /**
@@ -123,6 +167,16 @@ object RunAttributedText {
             // any colour format React Native accepts.
             color = optInt(entry, "color"),
             backgroundColor = optInt(entry, "backgroundColor"),
+            role = optString(entry, "role"),
+            // 0 is the absent sentinel the whole struct uses; which ordinals
+            // are meaningful is the role's business, not the parser's. A
+            // negative one is not an ordinal either, so the same test covers
+            // both.
+            roleLevel = optInt(entry, "roleLevel")?.takeIf { it > 0 },
+            roleRow = optInt(entry, "roleRow")?.takeIf { it > 0 },
+            roleRowCount = optInt(entry, "roleRowCount")?.takeIf { it > 0 },
+            roleColumn = optInt(entry, "roleColumn")?.takeIf { it > 0 },
+            roleColumnCount = optInt(entry, "roleColumnCount")?.takeIf { it > 0 },
         )
     }
 
@@ -189,6 +243,19 @@ object RunAttributedText {
     ): Spannable {
         val out = SpannableString(text)
         if (text.isEmpty()) return out
+        // The font state an entry INHERITS. React Native's font resolver
+        // picks a face file from family, weight and slant together, so an
+        // entry that states only one of the three has to be given the other
+        // two or it loads the wrong file (`RunTypefaceSpan`). A `<Text>` tree
+        // inherits them down the tree; the wire is flat, so they are
+        // reconstructed here from the ranges that cover the entry: JS emits
+        // attributes outermost-first over properly nested ranges (marks are
+        // sorted by start, then by descending end — `mapSelection.finish`), so
+        // a stack popped against the current start is exactly "what still
+        // covers me". Only entries that say something about the font join it,
+        // which is what keeps the table-cell and embed entries — appended
+        // after the marks, and so out of nesting order — from disturbing it.
+        val fontStack = ArrayList<FontFrame>()
         for (attribute in spec.attributes) {
             // Clamp: offsets were computed against the text JS sent, which
             // under prop skew can differ in length from the text in hand.
@@ -197,7 +264,42 @@ object RunAttributedText {
             if (end <= start) continue
             val flags = Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
 
-            attribute.fontFamily?.let { out.setSpan(TypefaceSpan(it), start, end, flags) }
+            var family = attribute.fontFamily
+            var weight = attribute.fontWeight
+            var italic = attribute.italic
+            // Whether the three together differ from what already covers this
+            // range, which is the only case that needs a span: an entry
+            // resolving to the same face as the entry enclosing it would set
+            // a second span with an identical answer.
+            var faceChanged = false
+            if (family != null || weight != null || italic) {
+                while (fontStack.isNotEmpty() && fontStack[fontStack.size - 1].end <= start) {
+                    fontStack.removeAt(fontStack.size - 1)
+                }
+                val covering = fontStack.lastOrNull()
+                if (covering == null) {
+                    faceChanged = true
+                } else {
+                    if (family == null) family = covering.family
+                    if (weight == null) weight = covering.weight
+                    // Slant only ever turns ON: `fontStyle: 'normal'` on an
+                    // inner mark cannot un-italicize an outer one on this
+                    // platform either, since `StyleSpan` ORs its style in.
+                    italic = italic || covering.italic
+                    faceChanged = family != covering.family ||
+                        weight != covering.weight ||
+                        italic != covering.italic
+                }
+                fontStack.add(FontFrame(end, family, weight, italic))
+            }
+            // One span for the face, carrying all three: the entry's own
+            // values where it has them and the covering ones where it does
+            // not. Absent when nothing in force names a family — there is no
+            // face to look up then, and `RunFontWeightSpan` below still
+            // weights whatever the platform gave the paint.
+            if (faceChanged) {
+                family?.let { out.setSpan(RunTypefaceSpan(it, weight, italic), start, end, flags) }
+            }
             attribute.fontSizeSp?.let {
                 out.setSpan(
                     AbsoluteSizeSpan(PixelUtil.toPixelFromSP(it).toInt()),
@@ -214,10 +316,13 @@ object RunAttributedText {
                     flags,
                 )
             }
-            attribute.fontWeight?.let { weight ->
+            // The entry's OWN weight, not the inherited one: an entry that
+            // states no weight must not re-apply its ancestor's over a range
+            // the ancestor's span already covers.
+            attribute.fontWeight?.let { declared ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    out.setSpan(RunFontWeightSpan(weight), start, end, flags)
-                } else if (weight >= 600) {
+                    out.setSpan(RunFontWeightSpan(declared), start, end, flags)
+                } else if (declared >= 600) {
                     out.setSpan(StyleSpan(Typeface.BOLD), start, end, flags)
                 }
             }
@@ -229,6 +334,18 @@ object RunAttributedText {
                 out.setSpan(BackgroundColorSpan(it), start, end, flags)
             }
         }
+
+        // The line height each embed reserves, set here — after the
+        // attribute spans, before the decorations — because it stands in for
+        // an attribute: JS sends the reservation's height as a `lineHeight`
+        // over the placeholder, and `RunEmbeds.applyLineHeights` replaces
+        // that entry with one decoded in the box's own unit (its comment has
+        // the whole argument). Ordering is the contract among LineHeightSpans:
+        // it must come after the base and mark line heights it may raise but
+        // must not shrink below, and before `RunDecorations`' row padding,
+        // which ADJUSTS what a line height assigned and would be erased by
+        // one set after it.
+        RunEmbeds.applyLineHeights(out, embeds)
 
         // The layout-affecting half of the decoration channel (leading
         // margins, tab-stop columns), after the attribute spans on purpose:
@@ -242,17 +359,103 @@ object RunAttributedText {
             RunDecorations.applyLayoutSpans(out, decorations, paint)
         }
 
-        // Embed reservations last, though the position is symmetry rather
-        // than necessity: a ReplacementSpan supplies its metrics through
-        // `getSize` during measurement, so its insertion order relative to
-        // the LineHeightSpans above is immaterial — `chooseHeight` always
-        // runs after the glyph metrics are in. What DOES depend on order is
-        // among the LineHeightSpans themselves: the embed-height `lineHeight`
-        // attribute JS emits after the base one is what finally sizes the
-        // placeholder's line (see RunEmbedSpan for the whole story).
+        // The embed boxes last, and here the position really is symmetry
+        // rather than necessity: a ReplacementSpan supplies its metrics
+        // through `getSize` during measurement, before any `chooseHeight`
+        // runs, so its insertion order relative to the spans above is
+        // immaterial. The half that DOES depend on order was set above.
         RunEmbeds.applySpans(out, embeds)
         return out
     }
+
+    /**
+     * One entry's font state while `build` walks the attribute list: what it
+     * declared, filled in from whatever covered it. `end` is the clamped
+     * offset the frame stops covering at, which is what pops it.
+     */
+    private class FontFrame(
+        val end: Int,
+        val family: String?,
+        val weight: Int?,
+        val italic: Boolean,
+    )
+}
+
+/**
+ * The `fontFamily` of a range, resolved the way React Native resolves one.
+ *
+ * WHY NOT `TypefaceSpan(family)`, WHICH IS WHAT THIS USED TO BE. The framework
+ * span resolves through `Typeface.create(name, style)`, which reads Android's
+ * SYSTEM font map and nothing else, so a family shipped in `assets/fonts`
+ * silently rendered in the default face — while the `<Text selectable>`
+ * fallback used for standalone blocks, code blocks and table cells rendered
+ * the same theme token in the real one. `RunTypefaces` carries the whole
+ * argument, including why the asset table has to be installed rather than
+ * passed in.
+ *
+ * FAMILY, WEIGHT AND SLANT ARE ONE QUESTION, ASKED ONCE. React Native picks
+ * the face FILE from all three together (`Inter_bold.ttf` for weight 700), so
+ * a family resolved at the wrong weight loads the wrong file. This span used
+ * to read the weight off the paint, which for a range declaring both had not
+ * been raised yet — `RunFontWeightSpan` is set after it in the same
+ * iteration — so `{ fontFamily: 'Inter', fontWeight: '700' }` loaded
+ * `Inter.ttf` and synthesized the bold, while the `<Text selectable>` fallback
+ * loaded `Inter_bold.ttf`. `build` therefore hands the span the weight and the
+ * slant of the range it covers, inheriting whichever of the three the range
+ * does not state from the entries that cover it — the same inheritance a
+ * `<Text>` tree gets for free.
+ *
+ * WHY IT RESOLVES AT PAINT TIME rather than baking a `Typeface` in at build
+ * time, which would be one resolution per string instead of one per line per
+ * draw: the spannable is CACHED (`RunLayoutCache`), and the asset table is
+ * armed from a Context this object never sees. A `Typeface` baked in before
+ * the first `install` would freeze a system-map fallback into an entry that
+ * outlives the reason for it; a family NAME re-resolves correctly the moment
+ * the assets arrive.
+ *
+ * The paint is still consulted for what the range does not state — a weight
+ * no covering entry declared, and an italic set by a `StyleSpan` outside this
+ * builder — so the span composes as it always did rather than resetting the
+ * paint to a bare face.
+ *
+ * The nine-value weight scale is not decided here: React Native answers with
+ * one of a family's four files, and `RunFontWeightSpan` — set after it, on
+ * API 28+ — puts the real weight back on whatever comes back.
+ * `MetricAffectingSpan` because a family changes advance widths, so the
+ * measure path and the draw path both have to run it, which is the
+ * one-builder agreement the rest of this file keeps.
+ */
+internal class RunTypefaceSpan(
+    private val family: String,
+    private val weight: Int?,
+    private val italic: Boolean,
+) : MetricAffectingSpan() {
+
+    override fun updateMeasureState(paint: TextPaint) = update(paint)
+
+    override fun updateDrawState(paint: TextPaint) = update(paint)
+
+    private fun update(paint: TextPaint) {
+        // `Typeface.DEFAULT` for the bare paint is not a special case: its
+        // weight is 400 and it is neither bold nor italic, which is what an
+        // unstyled paint asks for anyway. Same idiom as RunFontWeightSpan.
+        val current = paint.typeface ?: Typeface.DEFAULT
+        paint.typeface =
+            RunTypefaces.resolve(family, weight ?: weightOf(current), italic || current.isItalic)
+    }
+
+    /** The paint's current weight, for a range no covering entry gave one. */
+    private fun weightOf(current: Typeface): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            current.weight
+        } else if (current.isBold) {
+            // `Typeface.getWeight` is API 28; below it the paint carries the
+            // two-value trait and nothing finer, which is exactly what the
+            // pre-28 StyleSpan branch in `build` put there.
+            RunTypefaces.WEIGHT_BOLD
+        } else {
+            RunTypefaces.WEIGHT_NORMAL
+        }
 }
 
 /**
@@ -269,11 +472,12 @@ object RunAttributedText {
  * WHY IT READS THE PAINT rather than owning a family: spans compose in
  * insertion order and JS emits marks outermost-first, so by the time this
  * runs the paint already carries the family an enclosing mark set (a strong
- * span inside a code span must weight the MONO face). A TypefaceSpan built
- * around a fixed typeface would reset that family; mutating the paint's
- * current one composes, exactly the property StyleSpan's OR-ing had. Italic
- * is carried from the current face; a fake italic (skew) lives on the paint,
- * not the typeface, and is untouched.
+ * span inside a code span must weight the MONO face) — and, since
+ * `RunTypefaceSpan` resolves through React Native's asset table, that family
+ * may be a face loaded out of `assets/fonts`. A span holding a fixed typeface
+ * would reset it; mutating the paint's current one composes, exactly the
+ * property StyleSpan's OR-ing had. Italic is carried from the current face; a
+ * fake italic (skew) lives on the paint, not the typeface, and is untouched.
  *
  * MetricAffectingSpan, because weight changes advance widths: both the
  * measure path and the draw path run it, which is what keeps the shadow
@@ -330,8 +534,11 @@ internal class RunLineHeightSpan(heightPx: Float) : LineHeightSpan {
 
     // Rounded up, once, at construction. StaticLayout works in whole pixels,
     // and rounding per line would let a run's height drift from the sum of its
-    // line heights.
-    private val lineHeight: Int = ceil(heightPx.toDouble()).toInt()
+    // line heights. Readable because `RunEmbeds.applyLineHeights` needs the
+    // tallest line height already covering a placeholder as the floor for the
+    // reservation it sets there — see that function for why a reservation may
+    // raise a line but never shrink one.
+    internal val lineHeightPx: Int = ceil(heightPx.toDouble()).toInt()
 
     override fun chooseHeight(
         text: CharSequence?,
@@ -341,32 +548,32 @@ internal class RunLineHeightSpan(heightPx: Float) : LineHeightSpan {
         v: Int,
         fm: Paint.FontMetricsInt
     ) {
-        if (fm.descent > lineHeight) {
+        if (fm.descent > lineHeightPx) {
             // Not even the descent fits. Keep as much of it as there is room
             // for and give up everything above the baseline.
-            fm.descent = min(lineHeight.toDouble(), fm.descent.toDouble()).toInt()
+            fm.descent = min(lineHeightPx.toDouble(), fm.descent.toDouble()).toInt()
             fm.bottom = fm.descent
             fm.ascent = 0
             fm.top = fm.ascent
-        } else if (-fm.ascent + fm.descent > lineHeight) {
+        } else if (-fm.ascent + fm.descent > lineHeightPx) {
             // The descent fits; keep all of it and as much ascent as is left.
             fm.bottom = fm.descent
-            fm.ascent = -lineHeight + fm.descent
+            fm.ascent = -lineHeightPx + fm.descent
             fm.top = fm.ascent
-        } else if (-fm.ascent + fm.bottom > lineHeight) {
+        } else if (-fm.ascent + fm.bottom > lineHeightPx) {
             // Glyphs fit; the font's extra bottom leading does not, so trim it.
             fm.top = fm.ascent
-            fm.bottom = fm.ascent + lineHeight
-        } else if (-fm.top + fm.bottom > lineHeight) {
+            fm.bottom = fm.ascent + lineHeightPx
+        } else if (-fm.top + fm.bottom > lineHeightPx) {
             // Only the font's extra top leading is left to trim.
-            fm.top = fm.bottom - lineHeight
+            fm.top = fm.bottom - lineHeightPx
         } else {
             // There is room to spare: split it evenly above and below. Rounding
             // up on the negative side and down on the positive one makes
             // bottom - top come out to exactly the requested height even when
             // the surplus is odd, which is what keeps a run's measured height
-            // equal to lineCount * lineHeight.
-            val additional = lineHeight - (-fm.top + fm.bottom)
+            // equal to lineCount * lineHeightPx.
+            val additional = lineHeightPx - (-fm.top + fm.bottom)
             val top = (fm.top - ceil(additional / 2.0f)).toInt()
             val bottom = (fm.bottom + floor(additional / 2.0f)).toInt()
             fm.top = top

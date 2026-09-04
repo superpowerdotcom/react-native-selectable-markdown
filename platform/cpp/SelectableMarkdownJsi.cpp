@@ -155,15 +155,20 @@ Value parseImpl(Runtime& runtime, const Value* args, size_t count) {
   const std::string source = args[0].getString(runtime).utf8(runtime);
 
   /* parseToFlatBuffer takes a uint32_t length (Protocol.h / OffsetParser.h),
-   * and the wire header stores offsets as u32. A >4GiB markdown string is
-   * not a case worth widening the protocol for, but it is a case worth
-   * refusing explicitly instead of truncating the length. */
-  if (source.size() > static_cast<size_t>(UINT32_MAX)) {
+   * and the wire header stores offsets as u32 with 0xFFFFFFFF reserved as
+   * the "no offset" sentinel (Protocol.h kNoOffset) — so the largest
+   * representable source is 2^32-2 bytes, not 2^32-1: at exactly 0xFFFFFFFF
+   * bytes a legitimate end-of-document offset would collide with the
+   * sentinel and decode as "no anchor". A >4GiB markdown string is not a
+   * case worth widening the protocol for, but it is a case worth refusing
+   * explicitly instead of truncating the length. Same bound and same
+   * reasoning as the Node test addon (native/node/addon.cpp). */
+  if (source.size() > 0xFFFFFFFEu) {
     throw JSError(runtime,
                   std::string(kGlobalName) + "." + kPropParse +
                       ": source is too large for the wire format (" +
                       std::to_string(source.size()) +
-                      " UTF-8 bytes; the limit is 4294967295).");
+                      " UTF-8 bytes; the limit is 4294967294).");
   }
 
   const ParserConfig config = configFromBits(extensionBits, htmlPolicy);

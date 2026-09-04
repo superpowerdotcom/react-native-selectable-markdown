@@ -833,8 +833,12 @@ function classifyNativeSources() {
             file: p,
             platforms: [],
             skip:
-              "the markdown engine, not the view layer — checked at the podspec's C++ " +
-              'standard by `npm run check:fabric-cpp -- --syntax-only platform/cpp/*.cpp`',
+              "the markdown engine, not the view layer — compiled at the podspec's C++ " +
+              'standard by the gate ci.yml and release.yml run: ' +
+              '`npm run check:fabric-cpp -- --syntax-only --platform <ios|android> ' +
+              "$(find platform/cpp -path platform/cpp/vendor -prune -o -name '*.cpp' -print)`. " +
+              '--platform is required because an explicit file list narrows this script to one ' +
+              'pass; `find` rather than platform/cpp/*.cpp because that glob does not descend',
           });
         } else {
           found.push({
@@ -920,6 +924,138 @@ const MUTATIONS = [
   },
 ];
 
+// ---------------------------------------------------------------------------
+// 5b. Self-test, part two: the clone guard, mutated in the real sources.
+// ---------------------------------------------------------------------------
+
+// The mutations above run against FABRIC_TU, which is a stand-in for a shadow
+// node and knows nothing about the clone guard in
+// platform/fabric/RNSMRunHostShadowNode.{h,cpp}. That guard is the most
+// expensive thing in this package to lose silently — without it every clone of
+// a measurable node is force-dirtied, which is a full-document re-measure per
+// streamed token, with no error and no warning anywhere. So these mutations
+// run against COPIES OF THE REAL FILES: the whole of platform/fabric is copied
+// into the scratch dir, the copy is edited, and the copy's directory goes on
+// the front of the include path so the edited header is the one the edited
+// .cpp sees.
+//
+// WHAT CAN AND CANNOT BE MUTATED HERE, because the difference is the whole
+// design of the guard. Deleting the `keepLayoutCleanAcrossClone(...)` call, or
+// deleting `shouldNewRevisionDirtyMeasurement` outright, compiles perfectly:
+// `cloneGuardIsLive` probes the BASE class for the two mechanisms, not this
+// class for its use of them, so removing our use of one is invisible to it —
+// verified, both edits compile clean against 0.75.4. That is not a hole in the
+// probe, it is what the probe is for: losing the guard is a performance
+// regression, and no compiler can see one. What IS checkable is the tripwire
+// itself, which is what these two mutations pin — that the static_assert
+// really fires when React Native moves, and that the deliberately-absent
+// `override` really is load-bearing rather than an oversight.
+const GUARD_SOURCE = 'RNSMRunHostShadowNode.cpp';
+
+const SOURCE_MUTATIONS = [
+  {
+    // The scenario the static_assert exists for: React Native renames or
+    // removes both clean-clone mechanisms at once, so neither half of the
+    // guard is reachable any more. Simulated by renaming what the probe looks
+    // for, because the headers themselves are not ours to edit — the probe's
+    // two `requires` expressions are exactly the surface a header change would
+    // move under us.
+    name: 'both clone-guard mechanisms gone from the base (tripwire must fire)',
+    edits: [
+      {
+        file: 'RNSMRunHostShadowNode.h',
+        find: 'requires(Node& node) { node.cleanLayout(); };',
+        replace: 'requires(Node& node) { node.cleanLayoutRenamedUpstream(); };',
+      },
+      {
+        file: 'RNSMRunHostShadowNode.h',
+        find: 'node.Base::shouldNewRevisionDirtyMeasurement(sourceNode, cloneFragment);',
+        replace:
+          'node.Base::shouldNewRevisionDirtyMeasurementRenamedUpstream(sourceNode, cloneFragment);',
+      },
+    ],
+    expect: /Neither cleanLayout\(\) nor shouldNewRevisionDirtyMeasurement\(\) is/,
+  },
+  {
+    // The 0.86-era half carries no `override`, and the header says at length
+    // that this is deliberate: the base virtual does not exist on 0.75-era
+    // headers, so the keyword would make the file uncompilable on exactly the
+    // version this harness pins. This mutation is what stops a well-meaning
+    // "you forgot `override`" from landing.
+    name: 'shouldNewRevisionDirtyMeasurement marked `override` (no such base virtual at 0.75)',
+    edits: [
+      {
+        file: 'RNSMRunHostShadowNode.h',
+        find: 'const ShadowNodeFragment& fragment) const;',
+        replace: 'const ShadowNodeFragment& fragment) const override;',
+      },
+    ],
+    expect: /only virtual member functions can be marked 'override'/,
+  },
+];
+
+/**
+ * Copies platform/fabric into a fresh scratch directory and applies `edits` to
+ * the copies. Returns the directory, or the first edit that matched nothing —
+ * a stale `find` string would otherwise make a mutation silently test the
+ * unmutated file.
+ */
+function mutateGuardSources(scratch, label, edits) {
+  const dir = path.join(scratch, `selftest_src_${label}`);
+  fs.mkdirSync(dir, { recursive: true });
+  for (const name of fs.readdirSync(fabricDir)) {
+    if (!/\.(h|cpp)$/.test(name)) continue;
+    fs.copyFileSync(path.join(fabricDir, name), path.join(dir, name));
+  }
+  for (const edit of edits) {
+    const file = path.join(dir, edit.file);
+    const before = fs.readFileSync(file, 'utf8');
+    const after = before.replace(edit.find, edit.replace);
+    if (after === before) return { dir, stale: edit };
+    fs.writeFileSync(file, after);
+  }
+  return { dir, stale: null };
+}
+
+function selftestGuard(args, scratch) {
+  let failures = 0;
+
+  // The copy must compile untouched first. Otherwise a broken copy step would
+  // read as every mutation below being caught, which is the exact failure this
+  // whole section exists to prevent one level up.
+  const baseline = mutateGuardSources(scratch, 'baseline', []);
+  const base = compile(path.join(baseline.dir, GUARD_SOURCE), ['-I', baseline.dir, ...args], scratch);
+  if (!base.ok) {
+    console.error('  FAIL  baseline copy of platform/fabric did not compile');
+    console.error(base.output);
+    return 1;
+  }
+  console.log('  ok    baseline: unmutated copy of platform/fabric compiles');
+
+  for (const m of SOURCE_MUTATIONS) {
+    const { dir, stale } = mutateGuardSources(scratch, String(SOURCE_MUTATIONS.indexOf(m)), m.edits);
+    if (stale) {
+      console.error(`  FAIL  mutation "${m.name}" changed nothing`);
+      console.error(`        ${stale.file} no longer contains: ${stale.find}`);
+      failures++;
+      continue;
+    }
+    const r = compile(path.join(dir, GUARD_SOURCE), ['-I', dir, ...args], scratch);
+    if (r.ok) {
+      console.error(`  FAIL  broken code COMPILED: ${m.name}`);
+      failures++;
+    } else if (!m.expect.test(r.output)) {
+      console.error(`  FAIL  rejected for the wrong reason: ${m.name}`);
+      console.error(`        expected ${m.expect}`);
+      console.error(r.output.split('\n').slice(0, 4).join('\n'));
+      failures++;
+    } else {
+      console.log(`  ok    rejected: ${m.name}`);
+    }
+  }
+  return failures;
+}
+
 function selftest(args, scratch) {
   let failures = 0;
 
@@ -957,7 +1093,7 @@ function selftest(args, scratch) {
       console.log(`  ok    rejected: ${m.name}`);
     }
   }
-  return failures;
+  return failures + selftestGuard(args, scratch);
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,7 +1162,9 @@ function platformIncludeDirs(platform) {
   // This package's own include roots, mirroring the two HEADER_SEARCH_PATHS
   // entries SelectableMarkdown.podspec declares for its own tree. They are here
   // so that the engine can be checked at the podspec's C++ standard with
-  // `--syntax-only platform/cpp/*.cpp`, which is what docs/FABRIC-PLAN.md §8
+  // `--syntax-only --platform <ios|android> <the platform/cpp sources>` (the
+  // spelling classifyNativeSources() prints and the workflows run, `find`-built
+  // rather than a non-recursive glob), which is what docs/FABRIC-PLAN.md §8
   // names as the proof that the c++17 -> c++20 bump is safe: without
   // platform/cpp/vendor/md4c on the path OffsetParser.cpp dies on <entity.h>,
   // and the documented command reported a failure that was the harness's, not

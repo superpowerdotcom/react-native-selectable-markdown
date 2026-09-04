@@ -1,11 +1,9 @@
 /**
  * Entity decoding, and the invariant that keeps it from breaking selection.
  *
- * `entities.ts` is the single place a `&amp;` in the source becomes an `&` in
- * a text node's value. It is small, it is pure, and until now it had no tests
- * of its own — it was covered incidentally, through a second parser's inline
- * suite, and that suite is gone. What it does is also the kind of thing that
- * is wrong quietly: a mis-decoded entity renders as slightly odd prose, and a
+ * `entities.ts` is the JS fallback behind the decoder's Entity case. It is
+ * small, it is pure, and what it does is the kind of thing that is wrong
+ * quietly: a mis-decoded entity renders as slightly odd prose, and a
  * mis-measured one moves every offset after it.
  *
  * THE TWO HALVES OF AN ENTITY'S CONTRACT. `value` is what the reader sees;
@@ -16,14 +14,18 @@
  * is — a decoder that returned the right character and the wrong length would
  * look perfect on screen and shift every subsequent span by four.
  *
- * WHY A SUBSET OF NAMED ENTITIES. CommonMark admits the full HTML5 list —
- * over two thousand names, a ~100 KB table. This package ships the couple of
- * dozen that appear in real prose and leaves the rest as literal text, which
- * is a deliberate size trade and the reason `&notanentity;` and `&hearts;`
- * behave identically here.
+ * WHY A SUBSET OF NAMED ENTITIES, AND WHAT THAT DOES NOT MEAN. CommonMark
+ * admits the full HTML5 list — over two thousand names, a ~100 KB table.
+ * This module ships the couple of dozen that appear in real prose, so
+ * `&hearts;` and `&notanentity;` behave identically *at this seam*. They do
+ * NOT behave identically in a parsed document: md4c decodes entity events
+ * and attribute strings against its own complete table, so `&hearts;` renders
+ * as ♥ and only genuinely unknown names stay literal. The end-to-end block at
+ * the bottom of this file is what pins that, and the size trade here costs
+ * nothing on the shipped path because nothing reaches this table on it.
  */
 
-import { decodeEntityAt, decodeRawString } from './entities';
+import { decodeEntityAt } from './entities';
 import { parseDocument } from './Engine';
 import { presets } from './options';
 import { describeNative, requireNativeEngine } from './native/__tests__/support';
@@ -129,48 +131,12 @@ describe('decodeEntityAt: numeric references', () => {
   });
 });
 
-describe('decodeRawString: link destinations and titles', () => {
-  /**
-   * Destinations and titles carry no inline structure — no emphasis, no code
-   * spans — but they do carry escapes and entities, and they are decoded once
-   * on the way onto the node rather than at render time. That is what lets a
-   * `href` be handed straight to `Linking.openURL`, and it is why the URL
-   * allowlist in `urlPolicy.ts` runs on the DECODED string: `&#106;` is a `j`
-   * long before any loader sees it.
-   */
-  test('a backslash escapes ASCII punctuation, and only ASCII punctuation', () => {
-    expect(decodeRawString('a\\*b')).toBe('a*b');
-    expect(decodeRawString('a\\\\b')).toBe('a\\b');
-    // `z` is not escapable, so the backslash is a literal backslash.
-    expect(decodeRawString('a\\zb')).toBe('a\\zb');
-  });
-
-  test('a trailing backslash has nothing to escape and stays literal', () => {
-    expect(decodeRawString('trailing\\')).toBe('trailing\\');
-  });
-
-  test('entities decode, including several in a row', () => {
-    expect(decodeRawString('x&amp;y')).toBe('x&y');
-    expect(decodeRawString('&#x41;&#66;')).toBe('AB');
-  });
-
-  test('an escaped ampersand keeps the entity behind it literal', () => {
-    // `\&amp;` is the author asking for the six characters, not for `&`. The
-    // escape is consumed first, so the `&` that reaches the entity scanner is
-    // already past it.
-    expect(decodeRawString('a\\&amp;b')).toBe('a&amp;b');
-  });
-
-  test('an unrecognized entity passes through unchanged', () => {
-    expect(decodeRawString('a&notanentity;b')).toBe('a&notanentity;b');
-  });
-});
-
 describeNative('the span-versus-value invariant, end to end', () => {
   test('a text node decodes its entity while its span covers the raw source', () => {
-    // The property the whole module exists to preserve. `value` is what the
-    // native host draws; the span is what `copy` slices and what the streaming
-    // splice shifts. They are deliberately different lengths here.
+    // The property the two halves of the contract exist to preserve. `value`
+    // is what the native host draws; the span is what `copy` slices and what
+    // the streaming splice shifts. They are deliberately different lengths
+    // here.
     const source = 'a &amp; b\n';
     const doc = parseDocument(source, presets.commonmark, requireNativeEngine());
     const [text] = (doc.blocks[0] as { children: Inline[] }).children;
@@ -185,5 +151,21 @@ describeNative('the span-versus-value invariant, end to end', () => {
     expect(link).toMatchObject({ kind: 'link', href: 'https://e.com?x=1&y=2' });
     // The node still spans the construct as written, entity and all.
     expect(doc.source.slice(link.span.start, link.span.end)).toBe(source.slice(0, -1));
+  });
+
+  test('a name this table does not carry still decodes, because md4c does', () => {
+    // The counterpart to the size trade in the header: `hearts` is not in
+    // NAMED_ENTITIES, and the rendered document has ♥ in it anyway. A test
+    // that only asserted `at('&hearts;') === null` would leave a reader
+    // believing this package renders `&hearts;` literally.
+    const doc = parseDocument('x &hearts; y\n', presets.commonmark, requireNativeEngine());
+    const [text] = (doc.blocks[0] as { children: Inline[] }).children;
+    expect(text).toMatchObject({ kind: 'text', value: 'x ♥ y' });
+  });
+
+  test('a genuinely unknown name stays literal, span and value alike', () => {
+    const doc = parseDocument('x &notanentity; y\n', presets.commonmark, requireNativeEngine());
+    const [text] = (doc.blocks[0] as { children: Inline[] }).children;
+    expect(text).toMatchObject({ kind: 'text', value: 'x &notanentity; y' });
   });
 });

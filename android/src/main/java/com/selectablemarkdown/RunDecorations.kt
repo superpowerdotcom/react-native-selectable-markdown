@@ -115,6 +115,95 @@ object RunDecorations {
     }
 
     /**
+     * The vertical room a run needs BEYOND its own text, in **dp**: `top`
+     * above its first line, `bottom` below its last.
+     *
+     * WHY A RUN-EDGE BOX IS DIFFERENT FROM EVERY OTHER BOX. A box's
+     * `paddingTop`/`paddingBottom` normally costs no height at all, because
+     * the projection separates blocks with '\n\n' (docs/SELECTION.md) and the
+     * padding is painted into the blank line that leaves. A box at the EDGE
+     * of a run has no such line to borrow: a table that closes an answer ends
+     * at the run's last character, so its bottom border would land on the
+     * baseline of its last row, and a code block that opens one starts at
+     * offset 0, so its top border would be drawn through its first line.
+     * Neither is a corner case — "here is a table" as the closing block of a
+     * model's answer is the ordinary shape.
+     *
+     * ONE FUNCTION, TWO CALLERS, WHICH IS THE POINT. `RunTextMeasure.measure`
+     * adds `top + bottom` to the height it reports, so the view Fabric frames
+     * is that much taller; `SelectableRunHostView` sets the same two values
+     * as the child TextView's vertical padding, so the text is drawn inside
+     * the room that was measured for it and every `totalPaddingTop` in that
+     * file follows it. Deriving them twice would be the measure/draw
+     * disagreement `RunTextMeasure`'s header exists to prevent.
+     *
+     * LARGEST WINS, NOT THE SUM: boxes that share an edge (an island inside a
+     * blockquote, both starting at offset 0) are drawn from that same edge,
+     * so the room the deepest padding needs is the room they all need.
+     *
+     * Offsets are clamped against `textLength` exactly as `applyLayoutSpans`
+     * and the draw path clamp them, so a stale offset from a newer JS bundle
+     * asks for room at an edge it actually reaches. Returns 0/0 for the
+     * ordinary run, in which case the view is exactly as tall as its text.
+     */
+    internal fun edgePaddingDp(spec: Spec, textLength: Int): EdgePadding {
+        if (spec.decorations.isEmpty() || textLength <= 0) return EdgePadding.NONE
+        var top = 0f
+        var bottom = 0f
+        for (decoration in spec.decorations) {
+            if (decoration.kind != "box") continue
+            val start = decoration.start.coerceIn(0, textLength)
+            val end = decoration.end.coerceIn(start, textLength)
+            if (end <= start) continue
+            if (start == 0) top = maxOf(top, decoration.paddingTop)
+            if (end == textLength) bottom = maxOf(bottom, decoration.paddingBottom)
+        }
+        if (top <= 0f && bottom <= 0f) return EdgePadding.NONE
+        return EdgePadding(top, bottom)
+    }
+
+    /** The result of `edgePaddingDp`, in dp. */
+    internal data class EdgePadding(val top: Float, val bottom: Float) {
+        companion object {
+            val NONE = EdgePadding(0f, 0f)
+        }
+    }
+
+    /**
+     * `edgePaddingDp` in WHOLE PIXELS, which is the form both of its consumers
+     * have to use.
+     *
+     * WHY THE ROUNDING LIVES HERE AND NOT AT EACH CALL SITE. The two sides of
+     * this contract are `RunTextMeasure.measure`, which adds the room to the
+     * height Fabric frames the host with, and `SelectableRunHostView
+     * .commitProps`, which sets the same room as the child TextView's
+     * padding — and `View.setPadding` takes an Int. The measure side used to
+     * add the un-truncated float while the view truncated it, so the drawn
+     * band could sit up to a pixel short of the room reserved for it: two
+     * derivations of one number that the comments on both sides claimed were
+     * one. Converting once, here, is what makes that claim true.
+     *
+     * ROUNDED UP, not truncated: the padding is the room a border needs to
+     * clear the text, and a fraction of a pixel short is a border drawn on the
+     * glyphs. A whole pixel of slack at the bottom of a run is invisible.
+     */
+    internal fun edgePaddingPx(spec: Spec, textLength: Int): EdgePaddingPx {
+        val dp = edgePaddingDp(spec, textLength)
+        if (dp.top <= 0f && dp.bottom <= 0f) return EdgePaddingPx.NONE
+        return EdgePaddingPx(
+            ceil(PixelUtil.toPixelFromDIP(dp.top)).toInt(),
+            ceil(PixelUtil.toPixelFromDIP(dp.bottom)).toInt(),
+        )
+    }
+
+    /** The result of `edgePaddingPx`, in whole pixels. */
+    internal data class EdgePaddingPx(val top: Int, val bottom: Int) {
+        companion object {
+            val NONE = EdgePaddingPx(0, 0)
+        }
+    }
+
+    /**
      * The layout-affecting half, applied to the spannable the one builder
      * produced — after the attribute spans, deliberately: tab-stop columns
      * are computed by measuring cell substrings, and a cell must be measured

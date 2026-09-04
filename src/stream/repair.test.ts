@@ -1,7 +1,17 @@
+import { visit } from '../document/visit';
+import { parseDocument } from '../engine/Engine';
+import {
+  describeNative,
+  linkNativeEngineAsDefault,
+} from '../engine/native/__tests__/support';
 import type { ResolvedEngineOptions } from '../engine/options';
 import { presets, resolveOptions } from '../engine/options';
-import type { RepairOptions, RepairSeed } from './repair';
-import { isUriLikeLabel, repairTail, seedFromSettled } from './repair';
+import type { RepairOptions, RepairResult, RepairSeed } from './repair';
+import { continueSeed, isUriLikeLabel, repairTail, seedFromSettled } from './repair';
+
+// The property test at the bottom parses its repaired tails; every other
+// test in this file is pure and unaffected.
+linkNativeEngineAsDefault();
 
 const SEED: RepairSeed = { openFence: null, inMath: false };
 const base = resolveOptions(presets.llmChat);
@@ -10,6 +20,10 @@ const withMath = resolveOptions({
   extensions: { ...presets.llmChat.extensions, math: true },
 });
 const commonmark = resolveOptions(presets.commonmark);
+const withSpoilers = resolveOptions({
+  ...presets.llmChat,
+  extensions: { ...presets.llmChat.extensions, spoilers: true },
+});
 
 interface Case {
   name: string;
@@ -100,6 +114,28 @@ const cases: Case[] = [
     tail: '``a`b',
     text: '``a`b``',
     appended: '``',
+  },
+  // A trailing run too short to close is the closer still arriving: append
+  // only what is missing. A full run on top of it would fuse into a longer
+  // run that can never close, leaving the span literal with backticks the
+  // source never had.
+  {
+    name: 'partial closing backtick completed, not doubled',
+    tail: 'x ``y`',
+    text: 'x ``y``',
+    appended: '`',
+  },
+  {
+    name: 'partial closer of a triple run appends the two still missing',
+    tail: 'a ```x`',
+    text: 'a ```x```',
+    appended: '``',
+  },
+  {
+    name: 'two-thirds of a triple closer appends the last backtick',
+    tail: 'a ```x``',
+    text: 'a ```x```',
+    appended: '`',
   },
 
   // --- fences ---------------------------------------------------------------
@@ -272,6 +308,45 @@ const cases: Case[] = [
     text: '[a](https://x/(v))',
     appended: '))',
   },
+  // A CommonMark destination cannot hold a line break, so a '](' whose
+  // parens never balance on its own line can never become a link. Closing it
+  // anyway appended a ')' at end of TAIL, which landed inside a real text
+  // node on a LATER line and painted a character the source never had.
+  {
+    name: 'destination running into a line break stays literal',
+    tail: '[text](https://ex\nmore prose on the next line',
+    text: '[text](https://ex\nmore prose on the next line',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'emphasis after a dead destination still closes',
+    tail: '[text](https://ex\nmore *prose',
+    text: '[text](https://ex\nmore *prose*',
+    appended: '*',
+  },
+  {
+    // A line break inside a quoted TITLE is legal, so the scan runs on and
+    // the construct is still an open link.
+    name: 'title spanning a line break still closes',
+    tail: '[a](/u "ti\ntle',
+    text: '[a](/u "ti\ntle")',
+    appended: '")',
+  },
+  {
+    // The whitespace before ')' may hold a line break too.
+    name: 'closing paren on its own line is a complete link',
+    tail: '[a](/u "t"\n) rest',
+    text: '[a](/u "t"\n) rest',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'a link whose paren has not arrived yet still closes',
+    tail: '[a](/u "t"\n',
+    text: '[a](/u "t"\n)',
+    appended: ')',
+  },
 
   // --- html tails -----------------------------------------------------------
   { name: 'trailing partial tag trimmed', tail: '<div cla', text: '', appended: '', touched: 1 },
@@ -284,6 +359,48 @@ const cases: Case[] = [
     appended: '',
   },
   { name: 'trailing partial closing tag trimmed', tail: 'a <b>bold</b tag', text: 'a <b>bold', appended: '' },
+  // Comment / CDATA / PI / declaration: the tag and autolink tests both need
+  // a letter right after '<', so before handler 6 learned these shapes an
+  // unfinished comment body painted as prose while it grew and then vanished
+  // outright when its terminator landed.
+  {
+    name: 'unterminated html comment trimmed',
+    tail: 'note <!-- hidden',
+    text: 'note ',
+    appended: '',
+    touched: 1,
+  },
+  {
+    name: 'terminated html comment untouched',
+    tail: 'note <!-- hidden --> ok',
+    text: 'note <!-- hidden --> ok',
+    appended: '',
+    touched: 0,
+  },
+  {
+    // The terminator is '-->', not '>': ending the construct at the first
+    // '>' would leave the rest of the body painting as prose.
+    name: 'a > inside a comment body does not end it',
+    tail: 'note <!-- a > b',
+    text: 'note ',
+    appended: '',
+    touched: 1,
+  },
+  { name: 'unterminated processing instruction trimmed', tail: 'note <?php x', text: 'note ', appended: '' },
+  { name: 'terminated processing instruction untouched', tail: 'note <?php x?> ok', text: 'note <?php x?> ok', appended: '', touched: 0 },
+  { name: 'unterminated declaration trimmed', tail: 'x <!DOCTYPE htm', text: 'x ', appended: '' },
+  { name: 'unterminated CDATA section trimmed', tail: 'x <![CDATA[ y', text: 'x ', appended: '' },
+  { name: 'terminated CDATA section untouched', tail: 'x <![CDATA[ y]]> z', text: 'x <![CDATA[ y]]> z', appended: '', touched: 0 },
+  // Half-arrived openers: every continuation md4c recognises is one of the
+  // four above, so hold them rather than paint markup about to go.
+  { name: 'half-arrived comment opener trimmed', tail: 'x <!', text: 'x ', appended: '' },
+  { name: 'one dash short of a comment opener trimmed', tail: 'x <!-', text: 'x ', appended: '' },
+  { name: 'half-arrived CDATA opener trimmed', tail: 'x <![CDA', text: 'x ', appended: '' },
+  // ...but '<!' followed by something no construct starts with is prose, and
+  // withholding it would hide guaranteed-literal text for good.
+  { name: 'a bare <! that opens nothing stays prose', tail: 'a <! b', text: 'a <! b', appended: '', touched: 0 },
+  { name: 'a digit after <! stays prose', tail: 'a <!5 b', text: 'a <!5 b', appended: '', touched: 0 },
+  { name: 'a single dash after <! stays prose', tail: 'a <!-x b', text: 'a <!-x b', appended: '', touched: 0 },
 
   // --- structure-flip guards ---------------------------------------------------
   { name: 'lone dash line suppressed', tail: 'para\n-', text: 'para', appended: '', touched: 1 },
@@ -300,6 +417,173 @@ const cases: Case[] = [
   { name: 'newline-terminated line is complete, not suppressed', tail: 'done\n', text: 'done\n', appended: '' },
   { name: 'bare star run line suppressed', tail: 'para\n***', text: 'para\n', appended: '' },
   { name: 'bare digits stay (not yet a marker)', tail: 'para\n12', text: 'para\n12', appended: '' },
+  // md4c accepts trailing whitespace on a setext underline ("para\n= " is
+  // already an h1), so the guard has to as well or the heading flashes for
+  // the snapshot between the space and the next content character.
+  { name: 'setext equals line with trailing space suppressed', tail: 'para\n= ', text: 'para', appended: '' },
+  { name: 'setext dashes with trailing space suppressed', tail: 'para\n-- ', text: 'para', appended: '' },
+  { name: 'delimiter-run line with trailing space suppressed', tail: 'para\n*** ', text: 'para', appended: '' },
+  // The GFM half of the guard. md4c flips the paragraph above into a table
+  // the moment '| -' arrives, so the pipes-only line typed under a header
+  // row would otherwise paint as a literal pipe on a line of its own.
+  { name: 'bare pipe line under a header row suppressed', tail: '| a | b |\n|', text: '| a | b |', appended: '', touched: 1 },
+  { name: 'pipe line with trailing space suppressed', tail: '| a | b |\n| ', text: '| a | b |', appended: '' },
+  { name: 'partial delimiter row suppressed', tail: '| a | b |\n| -', text: '| a | b |', appended: '' },
+  { name: 'unterminated delimiter row suppressed', tail: '| a | b |\n| --- | --- |', text: '| a | b |', appended: '' },
+  { name: 'headerless delimiter row suppressed', tail: 'para\n---|', text: 'para', appended: '' },
+  // Once the row's line ends it is no longer the still-arriving tail line,
+  // and the table renders.
+  {
+    name: 'terminated delimiter row is left to become a table',
+    tail: '| a | b |\n| --- | --- |\n',
+    text: '| a | b |\n| --- | --- |\n',
+    appended: '',
+    touched: 0,
+  },
+  {
+    // A genuine body row made of nothing but table punctuation: the table
+    // above it already exists, so md4c paints the row. Withholding it made a
+    // real row vanish until its line terminated.
+    name: 'a body row of pure table punctuation is content, not a flip',
+    tail: '| a | b |\n| --- | --- |\n| - | - |',
+    text: '| a | b |\n| --- | --- |\n| - | - |',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'the aligned form of the same row',
+    tail: '| a | b |\n| --- | --- |\n| :- | -: |',
+    text: '| a | b |\n| --- | --- |\n| :- | -: |',
+    appended: '',
+    touched: 0,
+  },
+  {
+    // With nothing above it no table can form, so '|' is a paragraph md4c
+    // paints — and deleting it left the WHOLE parse input empty, blanking
+    // the document for that snapshot.
+    name: 'a lone pipe at document start is prose, not table punctuation',
+    tail: '|',
+    text: '|',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'the same with a trailing space',
+    tail: '| ',
+    text: '| ',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'a lone pipe under a blank line is prose too',
+    tail: 'Intro\n\n|',
+    text: 'Intro\n\n|',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'a body row is not a bare table line',
+    tail: '| a | b |\n| --- | --- |\n| c | d',
+    text: '| a | b |\n| --- | --- |\n| c | d',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'pipe tail line untouched with tables off',
+    tail: '| a | b |\n|',
+    options: commonmark,
+    text: '| a | b |\n|',
+    appended: '',
+    touched: 0,
+  },
+
+  // --- spoilers (extensions.spoilers only) ---------------------------------
+  // The one construct whose entire job is to not be read. `applySpoilers`
+  // runs after the parse and builds nothing until it sees a closing run, so
+  // without a virtual closer the body renders in the clear for every
+  // snapshot until its own '||' arrives.
+  {
+    name: 'unclosed spoiler closes',
+    tail: 'secret is ||hunter2',
+    options: withSpoilers,
+    text: 'secret is ||hunter2||',
+    appended: '||',
+  },
+  {
+    // A full '||' on top of the pipe already here would fuse into a run of
+    // three, which the transform never reads as a marker at all.
+    name: 'partial spoiler closer completed, not tripled',
+    tail: 'secret is ||hunter2|',
+    options: withSpoilers,
+    text: 'secret is ||hunter2||',
+    appended: '|',
+  },
+  {
+    name: 'balanced spoiler untouched',
+    tail: 'a ||b|| c',
+    options: withSpoilers,
+    text: 'a ||b|| c',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'a third marker opens a new pair',
+    tail: 'a ||b|| c ||d',
+    options: withSpoilers,
+    text: 'a ||b|| c ||d||',
+    appended: '||',
+  },
+  {
+    // Closing it would fuse into '||||', a run of four that pairs nothing.
+    name: 'content-empty spoiler opener suppressed',
+    tail: 'answer: ||',
+    options: withSpoilers,
+    text: 'answer: ',
+    appended: '',
+    touched: 1,
+  },
+  {
+    name: 'spoiler untouched when the extension is off',
+    tail: 'secret is ||hunter2',
+    text: 'secret is ||hunter2',
+    appended: '',
+    touched: 0,
+  },
+  { name: 'a single pipe is not a marker', tail: 'a | b', options: withSpoilers, text: 'a | b', appended: '', touched: 0 },
+  { name: 'a run of three pipes is prose', tail: 'a |||b', options: withSpoilers, text: 'a |||b', appended: '', touched: 0 },
+  {
+    name: 'escaped pipes are not markers',
+    tail: 'a \\|\\|b',
+    options: withSpoilers,
+    text: 'a \\|\\|b',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'spoiler pipes inert inside a code span',
+    tail: '`a ||b',
+    options: withSpoilers,
+    text: '`a ||b`',
+    appended: '`',
+  },
+  {
+    name: 'spoiler closes outside emphasis opened inside it',
+    tail: 'a ||b *c',
+    options: withSpoilers,
+    text: 'a ||b *c*||',
+    appended: '*||',
+  },
+  {
+    // '|' is cell syntax in a table row — an unescaped '||' splits cells
+    // before `applySpoilers` ever runs, which is why that transform excludes
+    // table cells outright — so a closer here would grow a phantom cell.
+    name: 'pipes in a table row are cell syntax, not spoiler markers',
+    tail: '| a | b |\n| --- | --- |\n| c || d',
+    options: withSpoilers,
+    text: '| a | b |\n| --- | --- |\n| c || d',
+    appended: '',
+    touched: 0,
+  },
   {
     name: 'suppressed bare line does not orphan earlier emphasis repair',
     tail: '**a\n-',
@@ -512,6 +796,101 @@ const cases: Case[] = [
     touched: 2,
   },
 
+  // --- block boundaries: inline scope ends at the previous leaf block -------
+  // An opener left behind on an earlier line CANNOT be closed by appending
+  // at the end of the tail once another block has started: the closer would
+  // bind inside that later block, painting a delimiter the source does not
+  // have and consuming one it does.
+  {
+    name: 'emphasis opener in an earlier list item is not closed in the next',
+    tail: '- item one *emph\n- item two',
+    text: '- item one *emph\n- item two',
+    appended: '',
+    touched: 0,
+  },
+  {
+    // Item 2 still repairs its OWN trailing opener; item 1's '_' stays
+    // literal rather than eating the '_' of '_rev'.
+    name: 'list item closes only its own opener',
+    tail: '- The _id field is required\n- The _rev field too',
+    text: '- The _id field is required\n- The _rev field too_',
+    appended: '_',
+  },
+  {
+    name: 'heading opener is not closed in the paragraph after it',
+    tail: '# Heading *emph\nplain paragraph line',
+    text: '# Heading *emph\nplain paragraph line',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'ATX heading closes its own opener',
+    tail: '## Heading *emph',
+    text: '## Heading *emph*',
+    appended: '*',
+  },
+  {
+    // Consecutive '>' lines are one paragraph inside the quote, so emphasis
+    // binds across the line break exactly as it does unquoted.
+    name: 'emphasis binds across soft line breaks inside a blockquote',
+    tail: '> quoted *emph\n> continues here',
+    text: '> quoted *emph\n> continues here*',
+    appended: '*',
+  },
+  {
+    name: 'a blockquote after prose starts a fresh inline region',
+    tail: 'prose *open\n> quoted line',
+    text: 'prose *open\n> quoted line',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'table rows do not share an inline region',
+    tail: '| a | *b |\n| c | d |',
+    text: '| a | *b |\n| c | d |',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'thematic break ends the paragraph before it',
+    tail: 'prose *open\n---\nafter the break',
+    text: 'prose *open\n---\nafter the break',
+    appended: '',
+    touched: 0,
+  },
+
+  // --- fences inside list items ---------------------------------------------
+  {
+    name: 'fence on a list-marker line closes at the item content column',
+    tail: '- ```js\nconst a = 1',
+    text: '- ```js\nconst a = 1\n  ```',
+    appended: '\n  ```',
+    touched: 1,
+  },
+  {
+    name: 'ordered list-item fence closes at its own column',
+    tail: '1. ```py\nx = 1',
+    text: '1. ```py\nx = 1\n   ```',
+    appended: '\n   ```',
+    touched: 1,
+  },
+  {
+    name: 'closed list-item fence re-enables inline repairs after it',
+    tail: '- ```js\n  code\n  ```\n\ndone **x',
+    text: '- ```js\n  code\n  ```\n\ndone **x**',
+    appended: '**',
+  },
+  {
+    // A "- ```" line INSIDE a fenced block is content, not a closer: the
+    // fence must stay open (markdown-about-markdown is common in LLM
+    // output).
+    name: 'a list-marker fence line inside a fence is content',
+    tail: '```md\n- ```\nstill code',
+    text: '```md\n- ```\nstill code\n```',
+    appended: '\n```',
+    touched: 1,
+  },
+
   // --- hide options: URI-like labels (app-mask doc-comment corpus) -----------
   // Non-URI labels keep the default treatment in each of the three
   // unfinished-link states: strip, hold, virtual close.
@@ -694,7 +1073,373 @@ const cases: Case[] = [
     appended: '',
     touched: 1,
   },
+
+  // --- table cells are separate inline contexts -----------------------------
+  //
+  // GFM splits a row into cells before any inline parsing runs, and every
+  // virtual closer is appended in the LAST cell, so an opener in an earlier
+  // one can never be closed by it: doing so ate the real '_' of '_d' and
+  // painted a '*' the source never had.
+  {
+    name: 'an opener in an earlier cell of a table row gets no closer',
+    tail: '| a | b |\n| --- | --- |\n| *x | y',
+    text: '| a | b |\n| --- | --- |\n| *x | y',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'an opener in the last cell still closes',
+    tail: '| a | b |\n| --- | --- |\n| c | *d',
+    text: '| a | b |\n| --- | --- |\n| c | *d*',
+    appended: '*',
+  },
+  {
+    name: 'only the last cell of a row keeps its opener',
+    tail: '| a | b |\n| --- | --- |\n| a _b | c _d',
+    text: '| a | b |\n| --- | --- |\n| a _b | c _d_',
+    appended: '_',
+    touched: 1,
+  },
+  {
+    // No delimiter row, so this is a paragraph full of literal pipes, not a
+    // table: emphasis binds right across them and both openers close.
+    name: 'a pipe line with no delimiter row under it is still a paragraph',
+    tail: '| a _b | c _d |',
+    text: '| a _b | c _d |__',
+    appended: '__',
+  },
+
+  // --- HTML blocks start a new leaf block -----------------------------------
+  {
+    name: 'an HTML block start ends the paragraph above it',
+    tail: 'para *emph\n<div>',
+    text: 'para *emph\n<div>',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'a raw-text HTML block start ends it too',
+    tail: 'para *emph\n<script>',
+    text: 'para *emph\n<script>',
+    appended: '',
+    touched: 0,
+  },
+  {
+    // Not on CommonMark's block-tag list, so it is inline HTML inside the
+    // same paragraph and the emphasis still closes.
+    name: 'an unknown tag is inline, not a block boundary',
+    tail: 'para *emph\n<notatag>',
+    text: 'para *emph\n<notatag>*',
+    appended: '*',
+  },
+
+  // --- spoilers only stand down inside a REAL table -------------------------
+  //
+  // The guard used to be lexical ("the line starts with a pipe"), which is
+  // exactly how a spoiler opening its own line looks — so the body leaked in
+  // the clear for the whole stream in the commonest shape there is.
+  {
+    name: 'a spoiler opening its line closes',
+    tail: '||hunter2',
+    options: withSpoilers,
+    text: '||hunter2||',
+    appended: '||',
+  },
+  {
+    name: 'a spoiler opening a list item closes',
+    tail: '- ||hunter2',
+    options: withSpoilers,
+    text: '- ||hunter2||',
+    appended: '||',
+  },
+  {
+    name: 'a spoiler under an indent closes',
+    tail: '  ||secret',
+    options: withSpoilers,
+    text: '  ||secret||',
+    appended: '||',
+  },
+  {
+    name: 'a spoiler opening the second line closes',
+    tail: 'ok\n||secret',
+    options: withSpoilers,
+    text: 'ok\n||secret||',
+    appended: '||',
+  },
+  {
+    name: 'a third marker on a line that opens with one closes',
+    tail: '||a|| and ||b',
+    options: withSpoilers,
+    text: '||a|| and ||b||',
+    appended: '||',
+  },
+  {
+    name: 'pipes in a CRLF table row are still cell syntax',
+    tail: '| a | b |\r\n| --- | --- |\r\n| c || d',
+    options: withSpoilers,
+    text: '| a | b |\r\n| --- | --- |\r\n| c || d',
+    appended: '',
+    touched: 0,
+  },
+  {
+    // `applySpoilers` gives up on a text node holding an escaped pipe, so a
+    // closer appended for it would paint two pipes and build no spoiler.
+    name: 'an escaped pipe in the region suppresses the close',
+    tail: 'a \\||b ||c',
+    options: withSpoilers,
+    text: 'a \\||b ||c',
+    appended: '',
+    touched: 0,
+  },
+  {
+    // md4c reads '<x||y>' as ordinary text, not a tag, so its pipes are
+    // markers like any others and pair with each other. Skipping every
+    // '<...>' region wholesale hid them, left '||z' looking like the only
+    // marker on the line, and appended a closer that painted two pipes the
+    // source never had.
+    name: 'pipes inside a region that is not a tag are still markers',
+    tail: 'a <x||y> then ||z',
+    options: withSpoilers,
+    text: 'a <x||y> then ||z',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'a real tag is still opaque',
+    tail: 'a <b class="x">bold ||s',
+    options: withSpoilers,
+    text: 'a <b class="x">bold ||s||',
+    appended: '||',
+  },
+  {
+    name: 'an autolink is still opaque',
+    tail: 'a <http://ex.com> then ||z',
+    options: withSpoilers,
+    text: 'a <http://ex.com> then ||z||',
+    appended: '||',
+  },
+  {
+    name: 'emphasis binds across a "<" that opens no tag',
+    tail: 'a < b > c *emph',
+    text: 'a < b > c *emph*',
+    appended: '*',
+  },
+  {
+    // …but only over the text the closer would pair across. An escaped pipe
+    // inside a CODE SPAN is a different text node, which `applySpoilers`
+    // judges separately: it builds the spoiler, so standing the repair down
+    // here only left the body in the clear.
+    name: 'an escaped pipe inside a code span does not suppress the close',
+    tail: 'a `x \\| y` and ||secret',
+    options: withSpoilers,
+    text: 'a `x \\| y` and ||secret||',
+    appended: '||',
+  },
+  {
+    name: 'an escaped pipe after the opener still suppresses the close',
+    tail: 'a `x` and ||sec \\| ret',
+    options: withSpoilers,
+    text: 'a `x` and ||sec \\| ret',
+    appended: '',
+    touched: 0,
+  },
+  {
+    // A header row whose delimiter row has not arrived yet: its empty cell
+    // is table punctuation, not a spoiler opener, and closing it hid the
+    // cell behind a spoiler and painted a pipe the source never had.
+    name: 'an empty cell in a header row still arriving is not a spoiler',
+    tail: '| a || c |',
+    options: withSpoilers,
+    text: '| a || c |',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'the same header row after prose',
+    tail: 'Intro\n\n| a || c |',
+    options: withSpoilers,
+    text: 'Intro\n\n| a || c |',
+    appended: '',
+    touched: 0,
+  },
+  {
+    // …while a line that OPENS with the doubled pipe is a spoiler, which is
+    // the shape the header-row rule must not swallow.
+    name: 'a spoiler opening a line is not a header row',
+    tail: '||secret',
+    options: withSpoilers,
+    text: '||secret||',
+    appended: '||',
+  },
+  {
+    // 64 rows of lookback used to answer "table" at the ceiling, so a
+    // paragraph of pipe-bearing lines suppressed the close and streamed the
+    // body in the clear.
+    name: 'a long run of pipe-bearing prose lines is still not a table',
+    tail: `${'x | y\n'.repeat(70)}||secret`,
+    options: withSpoilers,
+    text: `${'x | y\n'.repeat(70)}||secret||`,
+    appended: '||',
+  },
+  {
+    // Handler 7 runs after the pairing, so suppressing this line would take
+    // a COMPLETED spoiler's closer with it and expose the body.
+    name: 'a spoiler closer alone on its line is not table punctuation',
+    tail: 'hint: ||one\n||',
+    options: withSpoilers,
+    text: 'hint: ||one\n||',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'the bare pipe under a header row is still suppressed with spoilers on',
+    tail: '| a | b |\n|',
+    options: withSpoilers,
+    text: '| a | b |',
+    appended: '',
+    touched: 1,
+  },
+
+  // --- withheld HTML has a bound --------------------------------------------
+  {
+    // '<!-->' and '<!--->' are empty comments: the terminator overlaps the
+    // opener, and searching past it read the rest of the paragraph as body.
+    name: 'an empty comment terminates',
+    tail: 'note <!--> x more text here',
+    text: 'note <!--> x more text here',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'the three-dash empty comment terminates too',
+    tail: 'note <!---> x more',
+    text: 'note <!---> x more',
+    appended: '',
+    touched: 0,
+  },
+  {
+    // A stray '<!' in prose is not a declaration, and withholding it to the
+    // end of the BLOCK blanked the rest of a streaming paragraph until the
+    // block ended. It is withheld to the end of its LINE instead: the line
+    // it opened on is the most a single-line declaration can occupy.
+    name: 'a declaration running into prose is withheld to the end of its line',
+    tail: 'use <!important rules here',
+    text: 'use ',
+    appended: '',
+    touched: 1,
+  },
+  {
+    name: 'a declaration whose line ended without a ">" paints as prose',
+    tail: 'use <!important rules here\nand more prose',
+    text: 'use <!important rules here\nand more prose',
+    appended: '',
+    touched: 0,
+  },
+  {
+    // The flash the line bound exists to prevent: a body with two
+    // whitespace-separated arguments used to paint while it grew and then be
+    // DELETED outright when the '?>' landed.
+    name: 'a multi-word processing instruction never paints before its "?>"',
+    tail: 'note <?php echo the thing',
+    text: 'note ',
+    appended: '',
+    touched: 1,
+  },
+  {
+    name: 'the same PI, terminated, paints its surroundings',
+    tail: 'note <?php echo the thing?> end',
+    text: 'note <?php echo the thing?> end',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'a multi-word declaration never paints before its ">"',
+    tail: 'note <!ENTITY nbsp "&#160;"',
+    text: 'note ',
+    appended: '',
+    touched: 1,
+  },
+  {
+    name: 'a processing instruction whose line ended paints as prose',
+    tail: 'note <?php echo the thing\nnext line',
+    text: 'note <?php echo the thing\nnext line',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'a real declaration is still withheld while it arrives',
+    tail: 'note <!DOCTYPE htm',
+    text: 'note ',
+    appended: '',
+    touched: 1,
+  },
+
+  // --- a destination cannot span a line break, escape or not ---------------
+  {
+    name: 'a backslash before the line ending does not escape it',
+    tail: 'a [x](/u\\\nmore prose here',
+    text: 'a [x](/u\\\nmore prose here',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'the same with CRLF',
+    tail: 'a [x](/u\\\r\nmore prose here',
+    text: 'a [x](/u\\\r\nmore prose here',
+    appended: '',
+    touched: 0,
+  },
+  {
+    // An apostrophe inside a destination is not a title opener (CommonMark
+    // needs whitespace before the quote), so the line-break stop still
+    // applies and the construct dies at the newline. Reading it as a title
+    // swallowed the break and appended "')" on the NEXT line.
+    name: "an apostrophe in the destination does not open a title",
+    tail: "See [the post](https://ex.com/don't-panic\nand more prose here",
+    text: "See [the post](https://ex.com/don't-panic\nand more prose here",
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'a double quote glued to the destination does not open a title',
+    tail: 'a [x](/u"ti\nmore prose here',
+    text: 'a [x](/u"ti\nmore prose here',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'nor does one inside a parenthesised destination',
+    tail: 'a [x](/u(v"z\nmore prose here',
+    text: 'a [x](/u(v"z\nmore prose here',
+    appended: '',
+    touched: 0,
+  },
+  {
+    name: 'a REAL title opener still consumes the break inside it',
+    tail: 'a [x](/u "ti\ntle',
+    text: 'a [x](/u "ti\ntle")',
+    appended: '")',
+  },
+  {
+    name: 'an apostrophe in a destination still closes on one line',
+    tail: "a [x](/don't-panic",
+    text: "a [x](/don't-panic)",
+    appended: ')',
+  },
 ];
+
+describe('RepairResult', () => {
+  test('a wrapper can build one without a carry', () => {
+    // `scan` is optional on the exported type: a consumer that wraps or
+    // stubs `repairTail` builds a RepairResult of its own and has no scan to
+    // hand over. Making the field required was a compile break for them, not
+    // an addition — this test is the compiler assertion that it is back.
+    const wrapped: RepairResult = { text: 'a *b', appended: '*', touched: [] };
+    expect(wrapped.scan ?? null).toBeNull();
+    // …and `repairTail` itself always fills it in.
+    expect(repairTail('a *b', SEED, base).scan).not.toBeNull();
+  });
+});
 
 describe('repairTail corpus', () => {
   test.each(cases)('$name', (c) => {
@@ -709,8 +1454,11 @@ describe('repairTail corpus', () => {
     expect(result.text.endsWith(result.appended)).toBe(true);
   });
 
-  test(`corpus holds at least 65 cases (${cases.length})`, () => {
-    expect(cases.length).toBeGreaterThanOrEqual(65);
+  // The floor tracks the corpus: it exists to catch a deletion, so leaving
+  // it at a number the corpus passed years of rows ago protects nothing.
+  // Raise it (never lower it) when rows are added.
+  test(`corpus holds at least 225 cases (${cases.length})`, () => {
+    expect(cases.length).toBeGreaterThanOrEqual(225);
   });
 
   test('setext/hr underline arriving char by char never flashes', () => {
@@ -725,6 +1473,77 @@ describe('repairTail corpus', () => {
     }
     expect(repairTail('para\n--- x', SEED, base).text).toBe('para\n--- x');
     expect(repairTail('para\n---\n', SEED, base).text).toBe('para\n---\n');
+  });
+
+  test('a single-line PI or declaration never paints before it terminates', () => {
+    // The paint-then-vanish flash the withhold exists to prevent: every
+    // prefix of a construct that DOES terminate must keep the body out of
+    // the parse input, or the reader sees it grow and then watches it be
+    // deleted when the terminator lands.
+    for (const src of [
+      'note <?php echo the thing?> end',
+      'note <!ENTITY nbsp "&#160;"> end',
+    ]) {
+      const open = src.indexOf('<');
+      const closed = src.indexOf('>', open) + 1;
+      for (let i = open + 2; i < closed; i += 1) {
+        expect(repairTail(src.slice(0, i), SEED, base).text).toBe(
+          src.slice(0, open),
+        );
+      }
+      // …and the moment the terminator is here, everything paints.
+      expect(repairTail(src.slice(0, closed), SEED, base).text).toBe(
+        src.slice(0, closed),
+      );
+    }
+  });
+
+  test('a stray opener blanks at most its own line', () => {
+    // The other direction: '<!' or '<?' in front of ordinary prose is far
+    // more often a stray character, and the withhold must not blank the rest
+    // of a growing paragraph. One line ending with no terminator on it is
+    // the whole cost.
+    expect(repairTail('use <!important rules', SEED, base).text).toBe('use ');
+    expect(repairTail('use <!important rules\n', SEED, base).text).toBe(
+      'use <!important rules\n',
+    );
+    expect(repairTail('use <!important rules\r\nmore', SEED, base).text).toBe(
+      'use <!important rules\r\nmore',
+    );
+  });
+
+  test('a spoiler arriving char by char is closed at every prefix', () => {
+    // The body must never reach the parser without a closing run: an
+    // unpaired '||' produces no spoiler node at all, so every snapshot from
+    // the second pipe on would paint the hidden text as ordinary prose.
+    const src = 'the password is ||hunter2|| ok';
+    const open = src.indexOf('||');
+    const close = src.indexOf('||', open + 2);
+    for (let i = 1; i <= src.length; i += 1) {
+      const prefix = src.slice(0, i);
+      const { text } = repairTail(prefix, SEED, withSpoilers);
+      // Once both pipes of the opener are here and something follows them,
+      // the parse input holds a balanced pair — until the real closer
+      // completes it, after which nothing is appended.
+      const pairs = (text.match(/(?<!\|)\|\|(?!\|)/g) ?? []).length;
+      if (i > open + 2 && i <= close + 2) {
+        expect(pairs).toBe(2);
+      }
+      expect(pairs % 2).toBe(0);
+    }
+  });
+
+  test('a spoiler opened before a soft line break still closes', () => {
+    // The markers of one pair may sit in different text nodes of the same
+    // paragraph, so the region — not the line — is what has to balance.
+    const r = repairTail('hint: ||one\nstill hidden', SEED, withSpoilers);
+    expect(r.text).toBe('hint: ||one\nstill hidden||');
+    expect(r.appended).toBe('||');
+    // A blank line ends the paragraph, and `applySpoilers` never pairs
+    // across containers: appending there would paint literal pipes.
+    const across = repairTail('hint: ||one\n\nnew para', SEED, withSpoilers);
+    expect(across.text).toBe('hint: ||one\n\nnew para');
+    expect(across.touched).toHaveLength(0);
   });
 });
 
@@ -797,6 +1616,16 @@ describe('repairTail hide options', () => {
     }
   });
 
+  test('a prose label holding a colon keeps the default treatment', () => {
+    // Only the unmatched '[' is stripped; the label itself paints while it
+    // grows, exactly as it does without the option.
+    for (const tail of ['note [Bug:123', 'ratio [a:b', 'see [C:\\Users\\me']) {
+      expect(repairTail(tail, SEED, base, hideLabels).text).toBe(
+        repairTail(tail, SEED, base).text,
+      );
+    }
+  });
+
   test('bare URI arriving char by char never flashes past scheme:/', () => {
     for (const tail of ['see message:/', 'see message://', 'see message://5f3a-']) {
       expect(repairTail(tail, SEED, base, hideMessage).text).toBe('see ');
@@ -810,7 +1639,7 @@ describe('repairTail hide options', () => {
 
 describe('isUriLikeLabel', () => {
   test('matches scheme-prefixed whitespace-free labels, trimmed', () => {
-    for (const label of ['fhir:', 'fhir://Obs', 'https://x', ' fhir://Obs ', 'MESSAGE://5F']) {
+    for (const label of ['fhir:', 'fhir:/', 'fhir://Obs', 'https://x', ' fhir://Obs ', 'MESSAGE://5F']) {
       expect(isUriLikeLabel(label)).toBe(true);
     }
   });
@@ -819,6 +1648,41 @@ describe('isUriLikeLabel', () => {
     for (const label of ['Vitamin D', 'x', ' ', '', 'fhir://a b', '1abc:x', '**fhir://x']) {
       expect(isUriLikeLabel(label)).toBe(false);
     }
+  });
+
+  // A colon alone does not make prose a URI. These all matched once, so an
+  // ordinary bracketed label was blanked from the render for as long as its
+  // construct stayed unfinished and then popped in whole.
+  test('rejects prose labels that merely hold a colon', () => {
+    for (const label of ['Bug:123', 'a:b', 'C:\\Users\\me', 'TODO:fixthis', 'mailto:me@example.com']) {
+      expect(isUriLikeLabel(label)).toBe(false);
+    }
+  });
+});
+
+describe('repairTail bracket strips', () => {
+  // Every unmatched '[' is stripped from display. Rebuilding the region once
+  // per strip made the pass O(strips x region) — quadratic on prose full of
+  // them, and it runs once per streamed delta — so the strips are applied in
+  // one pass now and the offset shift is a binary search. Correctness of
+  // that rewrite is what this pins; the cost lives in bench/pathological.mjs.
+  test('thousands of unmatched brackets all strip, in order', () => {
+    const n = 2000;
+    const tail = 'x [ '.repeat(n);
+    const r = repairTail(tail, SEED, base);
+    expect(r.text).toBe('x  '.repeat(n));
+    expect(r.appended).toBe('');
+    expect(r.touched).toHaveLength(n);
+    for (let i = 0; i < n; i += 1) {
+      expect(r.touched[i]).toEqual({ start: i * 4 + 2, end: i * 4 + 3 });
+    }
+  });
+
+  test('a strip between an opener and the tail still shifts correctly', () => {
+    // '[' strips shift every later offset, so the content-empty check on the
+    // '*' has to compare through the same shift.
+    expect(repairTail('a [b [c *d', SEED, base).text).toBe('a b c *d*');
+    expect(repairTail('end *[', SEED, base).text).toBe('end ');
   });
 });
 
@@ -852,17 +1716,75 @@ describe('repairTail purity', () => {
   });
 });
 
+/**
+ * The scan behind the streaming anchor. Every state it reports open holds
+ * the anchor still for the rest of the stream, so a state that md4c does not
+ * actually have (a fence "opened" by a closing run, math carried past a
+ * blank line) costs a full reparse on every later append — quadratic, and
+ * invisible in the output.
+ */
+describe('continueSeed', () => {
+  test('a fence opened on a list-marker line is closed by its indented run', () => {
+    // "- ```js" opens the fence at the item's content column; without the
+    // marker strip the opener is missed and the indented CLOSER reads as an
+    // opener, leaving a fence open for the rest of the document.
+    expect(continueSeed(SEED, '- ```js\n  code\n  ```\n\n')).toEqual(SEED);
+    expect(continueSeed(SEED, '1. ```py\n   code\n   ```\n\n')).toEqual(SEED);
+    expect(continueSeed(SEED, '- - ```sh\n    code\n    ```\n\n')).toEqual(SEED);
+  });
+
+  test('an unclosed list-item fence still seeds, with its column', () => {
+    expect(continueSeed(SEED, '- ```js\n  code\n')).toEqual({
+      openFence: { marker: '`', length: 3, indent: 2 },
+      inMath: false,
+    });
+  });
+
+  test('a fence indent survives the seed boundary', () => {
+    const half = continueSeed(SEED, '- ```js\n  code\n');
+    expect(continueSeed(half, '  ```\n\n')).toEqual(SEED);
+  });
+
+  test('a quoted fence stays invisible to the scan, symmetrically', () => {
+    expect(continueSeed(SEED, '> ```js\n> code\n> ```\n\n')).toEqual(SEED);
+  });
+
+  test('$$ in prose does not survive a blank line', () => {
+    // md4c's math spans are inline: "costs $$5" is a paragraph with no open
+    // math region, so the carry must clear at the block boundary.
+    expect(continueSeed(SEED, 'costs $$5\n\n')).toEqual(SEED);
+    expect(continueSeed(SEED, 'It costs $$5 today\n\nnext paragraph\n\n')).toEqual(SEED);
+  });
+
+  test('open display math still carries across lines of one block', () => {
+    expect(continueSeed(SEED, '$$\nE = mc^2\n')).toEqual({
+      openFence: null,
+      inMath: true,
+    });
+    expect(continueSeed(SEED, '$$\nE = mc^2\n$$\n')).toEqual(SEED);
+  });
+
+  test('is incremental: splitting the text does not change the state', () => {
+    const parts = ['- ```js\n', '  code\n', '  ```\n\n', 'costs $$5\n\n', '$$\nx\n'];
+    let state = SEED;
+    for (const part of parts) {
+      state = continueSeed(state, part);
+    }
+    expect(state).toEqual(seedFromSettled(parts.join('')));
+  });
+});
+
 describe('seedFromSettled', () => {
   test('detects an open backtick fence', () => {
     expect(seedFromSettled('```js\ncode\n')).toEqual({
-      openFence: { marker: '`', length: 3 },
+      openFence: { marker: '`', length: 3, indent: 0 },
       inMath: false,
     });
   });
 
   test('detects an open tilde fence with run length', () => {
     expect(seedFromSettled('~~~~\ncode\n')).toEqual({
-      openFence: { marker: '~', length: 4 },
+      openFence: { marker: '~', length: 4, indent: 0 },
       inMath: false,
     });
   });
@@ -892,5 +1814,352 @@ describe('seedFromSettled', () => {
 
   test('empty settled prefix', () => {
     expect(seedFromSettled('')).toEqual({ openFence: null, inMath: false });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The carried inline scan (`RepairResult.scan` back in as `repairTail`'s fifth
+// argument).
+//
+// It exists because a paragraph that never reaches a blank line never shrinks
+// the unsettled tail: without it a 32 kB answer streamed in 18-char deltas
+// re-derives the same inline state from offset 0 about eighteen hundred times.
+// The contract is that it changes NOTHING about the answer — so every case
+// below streams a tail one delta at a time and demands the carried run agree
+// with a cold call on the same tail, character for character and span for
+// span.
+// ---------------------------------------------------------------------------
+
+describe('carried inline scan', () => {
+  function stream(
+    text: string,
+    step: number,
+    opts: ResolvedEngineOptions = base,
+    repair?: RepairOptions,
+  ): { agreed: number; resumed: number } {
+    let carry: ReturnType<typeof repairTail>['scan'] = null;
+    let agreed = 0;
+    let resumed = 0;
+    for (let end = step; ; end = Math.min(end + step, text.length)) {
+      const tail = text.slice(0, end);
+      const cold = repairTail(tail, SEED, opts, repair);
+      const warm = repairTail(tail, SEED, opts, repair, carry);
+      expect(warm.text).toBe(cold.text);
+      expect(warm.appended).toBe(cold.appended);
+      expect(warm.touched).toEqual(cold.touched);
+      agreed += 1;
+      // How often the carry was actually usable — a test that never resumed
+      // would pass while measuring nothing.
+      if (
+        carry != null &&
+        carry.regionStart === (warm.scan?.regionStart ?? -1) &&
+        carry.inline.pos > 0
+      ) {
+        resumed += 1;
+      }
+      carry = warm.scan ?? null;
+      if (end === text.length) {
+        break;
+      }
+    }
+    return { agreed, resumed };
+  }
+
+  const PROSE =
+    'the **quick** brown fox *jumps* over a `lazy` dog while the stream ' +
+    'keeps arriving token by token and the __paragraph__ never reaches a ' +
+    'blank line, so the tail stays ~~settled~~ unanchored for its whole ' +
+    'life. it holds a [link](https://example.com) and a <b>tag</b> too. ';
+
+  test('a streamed paragraph repairs identically with and without it', () => {
+    const out = stream(PROSE.repeat(4), 7);
+    expect(out.resumed).toBeGreaterThan(out.agreed / 2);
+  });
+
+  test.each([1, 2, 3, 5, 11, 18])(
+    'agrees at a delta size of %i characters',
+    (step) => {
+      stream(PROSE, step);
+    },
+  );
+
+  test.each([
+    ['emphasis that grows a run', 'a *b* c ** d *** e ****f'],
+    ['a code span that spans deltas', 'x `code` y ``two`` z ``a`b`` w `open'],
+    ['brackets that never close', 'a [b c [d e ] f [g'],
+    ['an image that completes', 'see ![alt](https://ex.com/i.png) done'],
+    ['a link destination arriving', 'see [a](https://ex.com/x) and [b](htt'],
+    ['a tag that is completed later', 'a <b>x</b> y <i c d'],
+    ['a comment that terminates', 'a <!-- c --> b <!-- open'],
+    ['an escape at the boundary', 'a \\*b\\* c \\'],
+    ['a dollar that becomes display math', 'cost $5 and $$x = 1$$ then $'],
+    ['a blank line splitting the region', 'a *b*\n\nc *d* e'],
+    ['a list item taking over the region', 'intro *x*\n- item *y*\n- item *z'],
+    ['a fence opening mid-stream', 'text *a*\n```js\ncode *b*\n'],
+    ['a table row', 'a *b*\n| x | y |\n| --- | --- |\n| 1 | 2 |\n'],
+    ['CRLF paragraphs', 'a *b*\r\n\r\nc *d'],
+    ['a setext-shaped tail line', 'Title *x*\n===='],
+    ['an autolink still arriving', 'go <https://exa'],
+    ['a URI-ish label', 'see [fhir://Obs](fhir://Ob'],
+  ])('agrees on %s', (_name, text) => {
+    for (const step of [1, 3, 7]) {
+      stream(text, step);
+    }
+  });
+
+  test('agrees with math, spoilers and strikethrough on', () => {
+    const opts = resolveOptions({
+      ...presets.llmChat,
+      extensions: {
+        ...presets.llmChat.extensions,
+        math: true,
+        spoilers: true,
+      },
+    });
+    stream('a $$x$$ b ||secret|| c ~~gone~~ d ||open $$y', 3, opts);
+    stream('||a|| ||b|| ||c', 1, opts);
+  });
+
+  test('agrees under the display-repair options', () => {
+    stream('see [fhir://Obs](fhir://Ob', 3, base, {
+      hideUriLikeLabels: true,
+      hideBareUriSchemes: ['message'],
+    });
+    stream('ref message://5f3a-99 done', 3, base, {
+      hideBareUriSchemes: ['message'],
+    });
+  });
+
+  test('refuses a carry whose tail is not a prefix of this one', () => {
+    const first = repairTail('hello *world', SEED, base);
+    expect(first.scan).not.toBeNull();
+    // Same length, different text: the fingerprint catches the swap, and a
+    // cold answer is what comes back.
+    const swapped = repairTail('HELLO *WORLDX', SEED, base, undefined, first.scan);
+    expect(swapped.text).toBe(repairTail('HELLO *WORLDX', SEED, base).text);
+  });
+
+  test('refuses a carry made under different extensions', () => {
+    const strikeOff = resolveOptions({
+      ...presets.llmChat,
+      extensions: { ...presets.llmChat.extensions, strikethrough: false },
+    });
+    const cold = repairTail('a ~~b', SEED, strikeOff);
+    const warm = repairTail('a ~~b c', SEED, base, undefined, cold.scan);
+    expect(warm.text).toBe(repairTail('a ~~b c', SEED, base).text);
+  });
+});
+
+/*
+ * The same question asked by a fuzzer rather than by hand, because the resume
+ * rule is a claim about EVERY construct: "the state arriving at an iteration
+ * was decided without looking at where the string ends". Hand-written cases
+ * check the constructs someone thought of — this one builds random markdown
+ * soup out of the fragments that make the pass change state, streams each one
+ * in 1-4 character deltas under a random option set and a random set of
+ * display repairs, and demands the carried run and the cold run produce the
+ * same text, the same appended suffix and the same touched spans at every
+ * prefix.
+ *
+ * It found the case the hand-written ones missed: a code span whose CLOSING
+ * backtick run sits at the end of the tail leaves an empty scan state, which
+ * looks like a safe place to resume from right up until the next chunk adds a
+ * backtick and the run stops closing anything.
+ *
+ * Seeded, so a failure is reproducible; 2000 trials is ~0.3 s.
+ */
+describe('carried inline scan, fuzzed', () => {
+  const FRAGMENTS = [
+    'a', 'b', ' ', ' ', 'x ', '\n', '\n\n', '*', '**', '_', '~~', '`', '``',
+    '[', ']', '(', ')', '!', '<', '>', '|', '||', '$', '$$', '\\', '\r\n',
+    '- ', '# ', '```', 'http://e.co', '<!--', '-->', 'word ', '.', ':', '"',
+  ];
+  const OPTION_SETS = [
+    resolveOptions({
+      ...presets.llmChat,
+      extensions: { ...presets.llmChat.extensions, math: true, spoilers: true },
+    }),
+    base,
+    commonmark,
+    resolveOptions({
+      ...presets.llmChat,
+      extensions: {
+        ...presets.llmChat.extensions,
+        strikethrough: false,
+        tables: false,
+      },
+    }),
+  ];
+  const REPAIRS: (RepairOptions | undefined)[] = [
+    undefined,
+    hideLabels,
+    hideMessage,
+    hideAll,
+  ];
+
+  /** Deterministic LCG — no dependency, and a failing trial is repeatable. */
+  function lcg(seed: number): () => number {
+    let state = seed >>> 0;
+    return () => {
+      state = (state * 1664525 + 1013904223) >>> 0;
+      return state / 4294967296;
+    };
+  }
+
+  test('agrees with a cold scan on 2000 random streamed documents', () => {
+    const rand = lcg(20260902);
+    for (let trial = 0; trial < 2000; trial += 1) {
+      const options = OPTION_SETS[Math.floor(rand() * OPTION_SETS.length)];
+      const repair = REPAIRS[Math.floor(rand() * REPAIRS.length)];
+      const pieces: string[] = [];
+      const length = 3 + Math.floor(rand() * 60);
+      for (let i = 0; i < length; i += 1) {
+        pieces.push(FRAGMENTS[Math.floor(rand() * FRAGMENTS.length)]);
+      }
+      const text = pieces.join('');
+      const step = 1 + Math.floor(rand() * 4);
+      let carry: ReturnType<typeof repairTail>['scan'] = null;
+      for (let end = step; end < text.length + step; end += step) {
+        const tail = text.slice(0, Math.min(end, text.length));
+        const cold = repairTail(tail, SEED, options, repair);
+        const warm = repairTail(tail, SEED, options, repair, carry);
+        // Reported as one assertion with the input in it: a bare toBe() on a
+        // random document says nothing about which document.
+        const same =
+          warm.text === cold.text &&
+          warm.appended === cold.appended &&
+          JSON.stringify(warm.touched) === JSON.stringify(cold.touched);
+        if (!same) {
+          throw new Error(
+            `carried scan diverged at ${tail.length} chars of ` +
+              `${JSON.stringify(text)}\n  cold ${JSON.stringify(cold.text)}\n` +
+              `  warm ${JSON.stringify(warm.text)}`,
+          );
+        }
+        carry = warm.scan;
+      }
+    }
+  });
+});
+
+
+/*
+ * The repair's ONE hard promise, asked of random input rather than of the
+ * shapes someone thought of: a virtual closer must be consumed as syntax.
+ * Every character `repairTail` appends is invented — it is not in the source
+ * and the reader can neither select nor copy it — so the moment md4c paints
+ * one as text, the snapshot shows a character the document does not contain.
+ *
+ * `realEnd` is where the real (possibly edited) text stops and the pure
+ * appended suffix begins, so the property is exactly "no text node reaches
+ * realEnd or beyond". Spoilers are on, because the spoiler closer is the
+ * repair with the worst failure mode: an unconsumed '||' both paints two
+ * pipes AND leaves the body it was meant to hide in the clear.
+ *
+ * THE COUNT IS NOT ZERO, and the residue is pinned rather than hidden. Five
+ * shapes survive, all of them cases where NO append could have worked and
+ * the repair should have withheld its closer instead:
+ *
+ *  - "math closer that does not bind": '$$' appended where md4c's flanking
+ *    rules refuse it ('b$$<!' -> 'b$$<!$$');
+ *  - "closer lands after whitespace": a '$$', '`' or '||' closer after a
+ *    trailing space, which cannot be trimmed away the way an emphasis
+ *    closer's is without changing what the span contains
+ *    ('\\**|| ' -> '\\**|| ||*');
+ *  - "backtick run fuses past the opener length": the tail already ends in a
+ *    LONGER backtick run than the opener, so appending more can never make
+ *    the two match ('``# ```' -> '``# `````');
+ *  - "spoiler closer that does not pair": an odd marker the transform drops
+ *    for a reason the repair did not model ('|||**>||b**');
+ *  - "trailing backslash escapes the closer": what survives the guard below,
+ *    i.e. an open code span, math span or fence, where the backslash is
+ *    literal but the closer still fails for one of the reasons above.
+ *
+ * Every one is pre-existing and none is a leak: they paint an extra marker,
+ * never a spoiler body. Raising this number is a regression; lowering it is
+ * a fix, and the pin is what makes either one visible.
+ *
+ * 2000 seeded tails; a failure prints the tail, so it is reproducible by
+ * hand.
+ */
+describeNative('repaired tails never paint an appended character', () => {
+  const FRAGMENTS = [
+    'a', 'b', ' ', ' ', 'x ', '\n', '\n\n', '*', '**', '_', '~~', '`', '``',
+    '[', ']', '(', ')', '!', '<', '>', '|', '||', '$', '$$', '\\', '\r\n',
+    '- ', '# ', '```', 'http://e.co', '<!--', '-->', 'word ', '.', ':', '"',
+    '|||', '\\|', '| - | - |', '<b>', '</b>', "'", '<?', '<!', '~',
+  ];
+  const everything = resolveOptions(presets.everything);
+
+  function lcg(seed: number): () => number {
+    let state = seed >>> 0;
+    return () => {
+      state = (state * 1664525 + 1013904223) >>> 0;
+      return state / 4294967296;
+    };
+  }
+
+  /** Text nodes that reach into the appended suffix, as source slices. */
+  function paintedBeyond(text: string, realEnd: number): string[] {
+    const doc = parseDocument(text, presets.everything);
+    const painted: string[] = [];
+    visit(doc, (node) => {
+      if (node.kind === 'text' && node.span.end > realEnd) {
+        painted.push(
+          text.slice(Math.max(node.span.start, realEnd), node.span.end),
+        );
+      }
+    });
+    return painted;
+  }
+
+  test('2000 random tails, spoilers on', () => {
+    const rand = lcg(20260903);
+    const shapes: string[] = [];
+    const examples = new Map<string, string>();
+    for (let trial = 0; trial < 2000; trial += 1) {
+      const pieces: string[] = [];
+      const length = 1 + Math.floor(rand() * 12);
+      for (let i = 0; i < length; i += 1) {
+        pieces.push(FRAGMENTS[Math.floor(rand() * FRAGMENTS.length)]);
+      }
+      const tail = pieces.join('');
+      const r = repairTail(tail, SEED, everything);
+      if (r.appended === '') {
+        continue;
+      }
+      const realEnd = r.text.length - r.appended.length;
+      if (paintedBeyond(r.text, realEnd).length === 0) {
+        continue;
+      }
+      const before = r.text.slice(0, realEnd);
+      const shape = /\\$/.test(before)
+        ? 'trailing backslash escapes the closer'
+        : /`$/.test(before) && r.appended.includes('`')
+          ? 'backtick run fuses past the opener length'
+          : /\s$/.test(before)
+            ? 'closer lands after whitespace'
+            : r.appended.startsWith('$$')
+              ? 'math closer that does not bind'
+              : 'spoiler closer or emphasis run that does not pair';
+      shapes.push(shape);
+      if (!examples.has(shape)) {
+        examples.set(
+          shape,
+          `${JSON.stringify(tail)} -> ${JSON.stringify(r.text)}`,
+        );
+      }
+    }
+    // Named so a NEW class of paint fails loudly even if the total happens
+    // to match; `examples` carries one tail per class into the diff.
+    expect([...new Set(shapes)].sort()).toEqual([
+      'backtick run fuses past the opener length',
+      'closer lands after whitespace',
+      'math closer that does not bind',
+      'spoiler closer or emphasis run that does not pair',
+      'trailing backslash escapes the closer',
+    ]);
+    expect(examples.size).toBe(5);
+    expect(shapes.length).toBe(58);
   });
 });

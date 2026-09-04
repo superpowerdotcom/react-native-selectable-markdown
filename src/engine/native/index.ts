@@ -31,7 +31,11 @@ export { PROTOCOL_VERSION } from './protocol';
 // The JS half of the platform binding. Kept in its own module so that
 // `require('react-native')` stays inside a function body — this file is
 // loaded in plain Node by the conformance runner and the benches.
-export { installNativeEngine, isNativeEngineInstalled } from './install';
+export {
+  installNativeEngine,
+  isNativeEngineInstalled,
+  isNativeEnginePermanentlyRefused,
+} from './install';
 
 /** Wrap a host parse function as an `Engine`. */
 export function createNativeEngine(
@@ -119,9 +123,28 @@ export function __linkNativeEngine(parseToBuffer: ParseToBuffer): void {
  * response is to surface that (or to fix the link/rebuild), not to render
  * something else. It is a diagnostic, not a feature flag.
  *
- * Cheap to call repeatedly, including from a render path: `installNativeEngine`
- * reads the global before it asks the platform for anything, and memoizes a
- * success. It never throws.
+ * CHEAP ONCE THE ANSWER IS FINAL, in either direction. `installNativeEngine`
+ * reads the global before it asks the platform for anything and memoizes a
+ * success, so every call after the first true is a boolean read. It also
+ * memoizes a refusal the platform reports as PERMANENT — JavaScriptCore,
+ * which cannot back an ArrayBuffer with a jsi::MutableBuffer, and a native
+ * module that will not load — because those now arrive as a distinct outcome
+ * ('refused') rather than a bare false, and the platform modules cache them
+ * too, so the warning prints once instead of once per call.
+ *
+ * What is still retried is exactly what should be: a platform that is not
+ * ready yet ('unavailable' — the bridge is still starting, a reload is in
+ * flight), and a host with no native module at all (Expo Go, web, plain
+ * Node), where the per-call cost is a cached `require` and an
+ * optional-chained miss and nothing logs. So polling this while waiting for
+ * the bridge is fine, and a render path that never gets a yes no longer
+ * floods the log.
+ *
+ * A protocol-version mismatch is a third final state: the binding is on the
+ * global, so nothing re-crosses to native, and the warning is printed once
+ * per JS context.
+ *
+ * It never throws.
  */
 export function isNativeEngineAvailable(): boolean {
   if (linkedParse !== null) return true;

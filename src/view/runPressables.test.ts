@@ -82,6 +82,44 @@ describeNative('resolveRunPressables', () => {
     }
   });
 
+  test('an autolink inside link text yields ONE range, not two over the same text', () => {
+    // The case that made "links cannot nest, so the ranges never overlap"
+    // false: md4c parses this as a link whose text is an autolink, and the
+    // projection emits a link mark for each — two marks, identical range,
+    // different hrefs. Both hosts hit-test with "the first containing range",
+    // so the second was already unreachable; sending it left the documented
+    // non-overlap guarantee false for no benefit.
+    const projected = project('[<https://a.example>](https://b.example)');
+    const linkMarks = projected.marks.filter((m) => m.kind === 'link');
+    expect(linkMarks).toHaveLength(2);
+    expect(linkMarks[0].start).toBe(linkMarks[1].start);
+    expect(linkMarks[0].end).toBe(linkMarks[1].end);
+
+    const pressables = resolveRunPressables(projected);
+    expect(pressables).toHaveLength(1);
+    // The first mark wins, which is what the hosts already resolved to.
+    expect(pressables[0].href).toBe(linkMarks[0].href);
+  });
+
+  test('an autolink with text beside it loses to the OUTER link, not the inner', () => {
+    // The companion to the case above, and the reason the dedupe is not
+    // "the inner one wins": the marks sort by start ascending then by end
+    // DESCENDING (mapSelection.ts, Projector.finish), so identical ranges keep
+    // their push order (innermost first) while a wider outer range sorts ahead
+    // of the autolink it contains. Add any text outside the autolink and the
+    // surviving pressable is the outer link over the whole display range.
+    const projected = project('[<https://a.example> tail](https://b.example)');
+    const linkMarks = projected.marks.filter((m) => m.kind === 'link');
+    expect(linkMarks).toHaveLength(2);
+
+    const pressables = resolveRunPressables(projected);
+    expect(pressables).toHaveLength(1);
+    expect(projected.text.slice(pressables[0].start, pressables[0].end)).toBe(
+      'https://a.example tail',
+    );
+    expect(pressables[0].href).toBe('https://b.example');
+  });
+
   test('a link inside emphasis keeps exactly the link range', () => {
     const projected = project('*emphasised [label](https://example.com) tail*');
     const pressables = resolveRunPressables(projected);

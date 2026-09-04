@@ -8,6 +8,7 @@ import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.bridge.ReadableType
 import com.facebook.react.uimanager.PixelUtil
+import kotlin.math.max
 
 /**
  * The `embeds` prop: reserved rectangles for one run — each a
@@ -64,32 +65,89 @@ object RunEmbeds {
         val embedId = optInt(entry, "embedId") ?: return null
         val width = optFloat(entry, "width")
         val height = optFloat(entry, "height")
-        // One placeholder character, a non-negative id, and a positive size:
-        // anything else — including the 0.0 unset sentinel the codegen
-        // struct documents — reserves nothing.
+        // One placeholder character, a non-negative id, and a size that is
+        // positive AND FINITE: anything else — including the 0.0 unset
+        // sentinel the codegen struct documents — reserves nothing.
+        //
+        // Finiteness is tested outright rather than left to `<= 0f`, which is
+        // false for both NaN and Infinity. NaN is JS's answer for a size
+        // computed from a missing measurement and Infinity is its answer for
+        // one divided by zero, and an infinite dp size does not degrade
+        // gracefully downstream: `PixelUtil.toPixelFromDIP` keeps it infinite
+        // and `toInt` saturates it to Int.MAX_VALUE, which would then be the
+        // width of a ReplacementSpan inside a measure pass. The rule this
+        // channel promises is that a bad entry reserves nothing.
         if (start < 0 || end != start + 1 || embedId < 0) return null
+        if (!width.isFinite() || !height.isFinite()) return null
         if (width <= 0f || height <= 0f) return null
         return Embed(start, end, embedId, width, height)
     }
 
     /**
-     * The layout-affecting half, applied to the spannable the one builder
-     * produced. Each valid entry replaces its placeholder's glyph with a
-     * fixed `width` × `height` box that draws nothing — the overlay paints.
+     * The line-height half of every reservation, set where the attribute it
+     * stands in for was set — after the attribute spans, before the
+     * decorations, whose row padding ADJUSTS whatever the line heights
+     * assigned and would be erased by a line height set after it.
      *
-     * THE CHARACTER GUARD IS THE SKEW GUARD: a span is only set where the
-     * text really carries U+FFFC. Offsets were computed against the text JS
-     * sent, and under prop skew — or a malformed entry from a newer JS —
-     * they can point at prose; replacing a real character with an invisible
-     * box would corrupt what the reader sees, where skipping the entry only
-     * costs the reservation.
+     * BOTH HALVES OF ONE RESERVATION ARE DECODED IN ONE UNIT, which is the
+     * whole reason this exists. A reservation is a width × height box in DIP,
+     * but its height also rides `attributes` as a `lineHeight` over the same
+     * placeholder (src/view/runAttributes.ts) — where `RunAttributedText.build`
+     * decodes it as SP, because SP is the right unit for every OTHER line
+     * height on the wire. Under a system font scale other than 1.0 the two
+     * halves of one number then disagreed: at scale 0.85 the line band came
+     * out 15% shorter than the box the overlay was told to draw, so the embed
+     * hung over the line below it; at 1.3 the band was 30% taller than the
+     * card, leaving a gap under it. A box is a box — it does not grow with the
+     * reader's text-size setting, and neither does the space held open for it
+     * — so the reservation's line height is re-decoded here through the same
+     * `toPixelFromDIP` the box goes through, and JS's SP-decoded twin is
+     * dropped.
+     *
+     * THE FLOOR IS WHY THE TWIN IS READ BEFORE IT IS DROPPED. A reservation
+     * may raise a line to fit but must never shrink one — an inline chip
+     * shorter than the prose around it would squash that prose — so what is
+     * set here is the taller of the box and every line height already covering
+     * the placeholder. That is the rule JS applies in points
+     * (`Math.max(embed.content.height, floor)`), restated in pixels because
+     * that is the only unit in which the two are comparable once the font
+     * scale is in play. The twin is identified by RANGE, not identity: it is
+     * the LAST line height covering exactly this one character, which is what
+     * JS emits for it (attributes first, embeds appended last). Anything
+     * wider — and any earlier exact-range entry, which is what a heading whose
+     * entire text is this one embed produces — is prose leading, and counts
+     * toward the floor instead.
+     */
+    internal fun applyLineHeights(out: Spannable, spec: Spec) {
+        forEachReserved(out, spec) { embed ->
+            var twin: RunLineHeightSpan? = null
+            var floorPx = 0f
+            for (span in out.getSpans(embed.start, embed.end, RunLineHeightSpan::class.java)) {
+                if (out.getSpanStart(span) == embed.start && out.getSpanEnd(span) == embed.end) {
+                    twin?.let { floorPx = max(floorPx, it.lineHeightPx.toFloat()) }
+                    twin = span
+                } else {
+                    floorPx = max(floorPx, span.lineHeightPx.toFloat())
+                }
+            }
+            twin?.let { out.removeSpan(it) }
+            val heightPx = PixelUtil.toPixelFromDIP(embed.heightDp)
+            out.setSpan(
+                RunLineHeightSpan(max(heightPx, floorPx)),
+                embed.start,
+                embed.end,
+                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+    }
+
+    /**
+     * The box half, applied to the spannable the one builder produced. Each
+     * valid entry replaces its placeholder's glyph with a fixed
+     * `width` × `height` box that draws nothing — the overlay paints.
      */
     internal fun applySpans(out: Spannable, spec: Spec) {
-        if (spec.embeds.isEmpty()) return
-        val length = out.length
-        for (embed in spec.embeds) {
-            if (embed.start >= length || embed.end > length) continue
-            if (out[embed.start] != PLACEHOLDER) continue
+        forEachReserved(out, spec) { embed ->
             out.setSpan(
                 RunEmbedSpan(
                     PixelUtil.toPixelFromDIP(embed.widthDp).toInt().coerceAtLeast(1),
@@ -99,6 +157,29 @@ object RunEmbeds {
                 embed.end,
                 Spannable.SPAN_EXCLUSIVE_EXCLUSIVE,
             )
+        }
+    }
+
+    /**
+     * The entries that really reserve something, which is what both halves
+     * above walk and what `SelectableRunHostView.reportEmbedRects` re-walks
+     * before it reports a rect: an entry that reserved nothing must report
+     * nothing.
+     *
+     * THE CHARACTER GUARD IS THE SKEW GUARD: a span is only set where the
+     * text really carries U+FFFC. Offsets were computed against the text JS
+     * sent, and under prop skew — or a malformed entry from a newer JS —
+     * they can point at prose; replacing a real character with an invisible
+     * box would corrupt what the reader sees, where skipping the entry only
+     * costs the reservation.
+     */
+    private inline fun forEachReserved(out: Spannable, spec: Spec, body: (Embed) -> Unit) {
+        if (spec.embeds.isEmpty()) return
+        val length = out.length
+        for (embed in spec.embeds) {
+            if (embed.start >= length || embed.end > length) continue
+            if (out[embed.start] != PLACEHOLDER) continue
+            body(embed)
         }
     }
 
@@ -134,14 +215,17 @@ object RunEmbeds {
  *
  * HOW THE HEIGHT ACTUALLY LANDS. `getSize` asks for the height as ascent
  * (the box sits on the baseline, rising `heightPx` above it), but the final
- * line extents belong to the `LineHeightSpan`s: JS sends a `lineHeight`
- * attribute equal to the embed height over this same character, emitted
- * AFTER the base attribute, and `RunAttributedText.build`'s insertion-order
- * rule makes that `RunLineHeightSpan` the last word on the placeholder's
- * line. Its surplus branch redistributes extra room evenly above and below
- * the baseline, so the baseline may sit mid-line — which is why
- * `reportEmbedRects` anchors the reported rect on `getLineTop`, never on
- * baseline arithmetic against this span's ascent.
+ * line extents belong to the `LineHeightSpan`s: `RunEmbeds.applyLineHeights`
+ * sets a `RunLineHeightSpan` of the same DIP-decoded height over this same
+ * character, after every attribute line height, and insertion order is what
+ * lets it raise the placeholder's line to fit the box (that function says why
+ * the reservation decodes its own height rather than taking JS's SP-decoded
+ * one, and what stops it shrinking a line). Where the line ends up taller
+ * still — an inline chip inside taller prose leading — the surplus branch
+ * redistributes the extra room evenly above and below the baseline, so the
+ * baseline may sit mid-line, which is why `reportEmbedRects` anchors the
+ * reported rect on `getLineTop` and never on baseline arithmetic against this
+ * span's ascent.
  *
  * IMMUTABLE, AND THAT IS LOAD-BEARING: the spannable carrying this span is
  * shared across the measure thread and the widget (`RunLayoutCache.styledText`

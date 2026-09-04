@@ -172,10 +172,13 @@ if (codegenConfig.android?.javaPackageName !== 'com.selectablemarkdown') {
 // the app, export `SelectableRunHostCls` — every assertion in this file and in
 // check-fabric-cpp.mjs green — and still be absent from the provider
 // dictionary. `UIManager.hasViewManagerConfig('SelectableRunHost')` then
-// answers false, RunHost falls to its `<Text selectable>` tier, and on iOS
-// Fabric that tier is not selection at all: a long-press block Copy menu, no
-// handles, no range, and `onSelectionAction` never fires. No error, no warning,
-// in a release build or a debug one. That is exactly what shipped at 0.2.0.
+// answers false and every run throws, because there is nothing under that tier
+// any more: the `<Text selectable>` fallback was removed in 0.10.0. When this
+// last shipped, at 0.2.0, the same missing registration was silent instead —
+// the fallback rendered a document that merely looked selectable (a long-press
+// block Copy menu, no handles, no range, `onSelectionAction` never firing) with
+// no error or warning in a release build or a debug one. Loud beats silent, but
+// neither belongs in a consuming app, which is what this assertion is for.
 //
 // The class name is compared against the `@implementation` rather than merely
 // being present, because `NSClassFromString` returning nil is the same silence
@@ -188,8 +191,8 @@ if (componentProvider?.SelectableRunHost !== PROVIDER_CLASS) {
       ` expected ${JSON.stringify(PROVIDER_CLASS)}.\n` +
       "    This entry is the ONLY thing that puts the component in the app's\n" +
       '    generated RCTThirdPartyComponentsProvider.mm. Without it iOS Fabric\n' +
-      '    resolves nothing, every run silently falls back to <Text selectable>,\n' +
-      '    and that fallback has no range selection and no custom menu items.',
+      '    resolves nothing, hasViewManagerConfig answers false, and every run\n' +
+      '    throws at render time — there is no JS fallback under that tier.',
   );
 } else {
   const implFile = path.join(repoRoot, 'platform/ios/fabric/RCTSelectableRunHostComponentView.mm');
@@ -360,6 +363,22 @@ const EXPECTED_ATTRIBUTE_MEMBERS = {
   textDecorationLine: 'std::string',
   color: 'SharedColor',
   backgroundColor: 'SharedColor',
+  // The semantics channel (src/view/runAttributes.ts `RunSemanticRole`): what
+  // the range IS for a screen reader, not what it looks like. A plain string
+  // for the same reason `kind` is on the decoration struct — a string union
+  // inside an array element does not compile — with "" as the absent
+  // sentinel.
+  role: 'std::string',
+  // The role's coordinates, all ints on the shared 0-is-absent sentinel. That
+  // is why every one of them is ONE-based on the wire: there is no level 0, no
+  // nesting depth 0 and no row 0, so the sentinel cannot collide, whereas a
+  // zero-based first row would be indistinguishable from an absent one. The
+  // hosts subtract one on the way into `CollectionItemInfo`.
+  roleLevel: 'int',
+  roleRow: 'int',
+  roleRowCount: 'int',
+  roleColumn: 'int',
+  roleColumnCount: 'int',
 };
 
 // The decorations struct rides the identical sentinel encoding: plain strings
@@ -670,6 +689,16 @@ if (propsH) {
   );
   expectText(
     propsH,
+    'bool exclusiveSelection{true};',
+    'Props.h',
+    'WithDefault<boolean, true> must keep defaulting to true here too: true is\n' +
+      '    the one-active-selection coordination both hosts have always performed,\n' +
+      '    so a host mounted without the prop — or by a JS bundle older than it —\n' +
+      '    has to behave exactly as it did before the prop existed. A default of\n' +
+      '    false would silently leave two live highlights on screen.',
+  );
+  expectText(
+    propsH,
     'std::vector<std::string> selectionActions{};',
     'Props.h',
     'selectionActions is an ORDERED menu. A string-literal union compiles to a\n' +
@@ -748,6 +777,23 @@ if (eventEmittersH) {
     'This is the exact signature the iOS Fabric component view calls after\n' +
       '    layout for each embed whose rect moved.',
   );
+  expectText(
+    eventEmittersH,
+    'struct OnSelectionChange',
+    'EventEmitters.h',
+    'The selection-change payload is what makes a consumer floating toolbar\n' +
+      '    possible at all (docs/SELECTION.md, "Event: onSelectionChange"). Its\n' +
+      '    two int members are already asserted above via OnSelectionAction — the\n' +
+      '    struct carries start/end and deliberately nothing else, because it\n' +
+      '    fires on every frame of a selection-handle drag.',
+  );
+  expectText(
+    eventEmittersH,
+    'void onSelectionChange(OnSelectionChange value) const;',
+    'EventEmitters.h',
+    'This is the exact signature the iOS Fabric component view calls whenever\n' +
+      "    the host's selection moves, including to empty.",
+  );
 }
 
 const eventEmittersCpp = read(iosSpec('EventEmitters.cpp'), 'EventEmitters.cpp');
@@ -773,6 +819,56 @@ if (eventEmittersCpp) {
     'EventEmitters.cpp',
     'Same three-way agreement as selectionAction, for the `topEmbedLayout`\n' +
       '    registration: view config, Android event constants, and this dispatch.',
+  );
+  expectText(
+    eventEmittersCpp,
+    'dispatchEvent("selectionChange"',
+    'EventEmitters.cpp',
+    'Same three-way agreement as selectionAction, for the `topSelectionChange`\n' +
+      '    registration: view config, Android event constants, and this dispatch.',
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 4b. The commands: the third direction of the contract (JS tells one host).
+// ---------------------------------------------------------------------------
+
+// Commands exist ONLY while the spec declares them, and their absence is
+// silent in a way that is worth pinning: with no `codegenNativeCommands`
+// export, codegen emits no RCTSelectableRunHostViewProtocol at all, the iOS
+// component view's `@interface … <RCTSelectableRunHostViewProtocol>` stops
+// compiling (that one is loud), and on Android the generated delegate simply
+// has no `receiveCommand` switch — so `Commands.clearSelection(ref)` from JS
+// reaches a delegate that drops it, with nothing in logcat.
+const componentViewHelpersH = read(iosSpec('RCTComponentViewHelpers.h'), 'RCTComponentViewHelpers.h');
+if (componentViewHelpersH) {
+  expectText(
+    componentViewHelpersH,
+    '@protocol RCTSelectableRunHostViewProtocol <NSObject>',
+    'RCTComponentViewHelpers.h',
+    'RCTSelectableRunHostComponentView declares conformance to this protocol,\n' +
+      '    which is what makes the compiler demand both command implementations.\n' +
+      '    Codegen emits it only for a component whose spec declares commands.',
+  );
+  for (const method of ['- (void)clearSelection;', '- (void)setSelection:(NSInteger)start end:(NSInteger)end;']) {
+    expectText(
+      componentViewHelpersH,
+      method,
+      'RCTComponentViewHelpers.h',
+      'This is the exact selector RCTSelectableRunHostHandleCommand calls, and\n' +
+        '    therefore the exact selector the iOS component view must implement\n' +
+        '    (docs/SELECTION.md, "Commands"). Objective-C selectors are derived from\n' +
+        "    the spec's parameter names, so renaming a command parameter silently\n" +
+        '    renames the selector.',
+    );
+  }
+  expectText(
+    componentViewHelpersH,
+    'RCTSelectableRunHostHandleCommand(',
+    'RCTComponentViewHelpers.h',
+    "The component view's -handleCommand:args: forwards to this function, which\n" +
+      '    is what validates the argument count and types before calling the\n' +
+      '    selectors above.',
   );
 }
 
@@ -886,7 +982,13 @@ if (managerInterface) {
     'void setPressables(T view, @Nullable ReadableArray value);',
     'void setEmbeds(T view, @Nullable ReadableArray value);',
     'void setSelectable(T view, boolean value);',
+    'void setExclusiveSelection(T view, boolean value);',
     'void setSelectionActions(T view, @Nullable ReadableArray value);',
+    // The commands land on the same interface as the props, so the Kotlin
+    // ViewManager is forced to implement them or fail to compile — the whole
+    // reason the interface is implemented rather than reflected over.
+    'void clearSelection(T view);',
+    'void setSelection(T view, int start, int end);',
   ]) {
     expectText(
       managerInterface,
@@ -910,7 +1012,37 @@ if (managerInterface) {
       '    would be bypassed and unset attributes would arrive as sentinels.',
   );
 }
-read(path.join(javaDir, 'SelectableRunHostManagerDelegate.java'), 'SelectableRunHostManagerDelegate.java');
+const managerDelegate = read(
+  path.join(javaDir, 'SelectableRunHostManagerDelegate.java'),
+  'SelectableRunHostManagerDelegate.java',
+);
+if (managerDelegate) {
+  // The delegate is what routes a dispatched command to the interface method.
+  // `ViewManager.receiveCommand` asks getDelegate() and forwards to it
+  // (ViewManager.java:296-301), and this manager returns the generated
+  // delegate — so the Kotlin needs no override, and this switch is the entire
+  // route. Without it a `Commands.clearSelection(ref)` from JS is dropped in
+  // silence.
+  expectText(
+    managerDelegate,
+    'public void receiveCommand(T view, String commandName, @Nullable ReadableArray args)',
+    'SelectableRunHostManagerDelegate.java',
+    'The generated delegate must carry a receiveCommand dispatcher; it is what\n' +
+      '    ViewManager.receiveCommand forwards a dispatched command to.',
+  );
+  for (const dispatch of [
+    'case "clearSelection":',
+    'case "setSelection":',
+  ]) {
+    expectText(
+      managerDelegate,
+      dispatch,
+      'SelectableRunHostManagerDelegate.java',
+      'The command name on the wire is the spec\'s property name verbatim, and\n' +
+        '    this switch is the only thing that maps it to a Kotlin method.',
+    );
+  }
+}
 
 // Android's Props.h is generated from the same schema and is what Fabric uses
 // for prop diffing there. If the two platforms ever diverge, one of them is
@@ -1010,7 +1142,48 @@ expectText(
     '    unprocessed and RunHost.toNativeAttribute must keep calling processColor.\n' +
     '    If this ever became a processed entry, colours would be converted twice.',
 );
+expectText(
+  viewConfig,
+  "topSelectionChange:{registrationName:'onSelectionChange'}",
+  'view config',
+  'This is the mapping that turns the native "selectionChange" event into the\n' +
+    '    onSelectionChange prop. Both native hosts dispatch topSelectionChange.',
+);
 expectText(viewConfig, 'selectionActions:true', 'view config', 'The ordered action list is passed through as-is.');
+expectText(
+  viewConfig,
+  'exclusiveSelection:true',
+  'view config',
+  'The one-active-selection opt-out is a plain boolean attribute; without an\n' +
+    '    entry here the prop never reaches the host and the opt-out silently does\n' +
+    '    nothing.',
+);
+// The commands half of the JS surface. The babel plugin DELETES the
+// `codegenNativeCommands` declaration in the source and re-emits an equivalent
+// `Commands` object from the schema (index.js:167-172), so what ships is this
+// generated one — and `RunHost` reads it off the same require it reads the
+// component from. If it stopped being emitted, every imperative call would be
+// a TypeError on `undefined` at the first `clearSelection()`.
+expectText(
+  viewConfig,
+  'Commands',
+  'view config',
+  'The generated view config must still export `Commands`; RunHost dispatches\n' +
+    '    every imperative selection call through it.',
+);
+for (const dispatch of [
+  'dispatchCommand(ref,"clearSelection",[])',
+  'dispatchCommand(ref,"setSelection",[start,end])',
+]) {
+  expectText(
+    viewConfig.replace(/\s+/g, ''),
+    dispatch.replace(/\s+/g, ''),
+    'view config',
+    'The command name and its argument order are the wire contract: the same\n' +
+      '    strings key the generated Android delegate switch and the iOS\n' +
+      '    RCTSelectableRunHostHandleCommand dispatcher.',
+  );
+}
 expectText(viewConfig, 'pressables:true', 'view config', 'The tappable ranges are passed through as-is.');
 expectText(viewConfig, 'embeds:true', 'view config', 'The embedded ranges are passed through as-is.');
 expectText(

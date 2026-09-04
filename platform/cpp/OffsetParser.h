@@ -86,7 +86,8 @@ enum class NodeType : uint8_t {
 enum class TextKind : uint8_t {
   Normal,
   /* A NUL byte in the source; CommonMark requires rendering U+FFFD. The
-   * event's byte range covers the NUL byte, literalString holds "�". */
+   * event's byte range covers the NUL byte, stringA holds "�" (and only
+   * that: the raw byte is not interned as well). */
   NullChar,
   HardBreak,
   SoftBreak,
@@ -125,9 +126,10 @@ struct NodeEvent {
   uint32_t orderedStart = 1;              /* OrderedList */
   char fenceChar = '\0';                  /* CodeBlock: '`'/'~'; 0 = indented */
   TaskState task = TaskState::NotTask;    /* ListItem */
-  uint32_t taskMarkByte = kNoByteOffset;  /* ListItem: byte of the char between '[' and ']' */
+  /* ListItem: byte of the char between '[' and ']'. Folded into the item's
+   * own range rather than encoded on the wire — see packDetailA. */
+  uint32_t taskMarkByte = kNoByteOffset;
   CellAlign align = CellAlign::Default;   /* TableHeaderCell / TableCell */
-  uint32_t columnCount = 0;               /* Table */
   bool autolink = false;                  /* Link: recognized without [](), e.g. <https://…> */
 
   /* Indices into ParseResult::strings; -1 = none.
@@ -146,7 +148,9 @@ struct ExtensionFlags {
   bool tables = false;         /* MD_FLAG_TABLES */
   bool strikethrough = false;  /* MD_FLAG_STRIKETHROUGH */
   bool tasklists = false;      /* MD_FLAG_TASKLISTS */
-  bool autolinks = false;      /* MD_FLAG_PERMISSIVEURLAUTOLINKS | MD_FLAG_PERMISSIVEWWWAUTOLINKS */
+  bool autolinks = false;      /* MD_FLAG_PERMISSIVEURLAUTOLINKS | MD_FLAG_PERMISSIVEWWWAUTOLINKS
+                                * | MD_FLAG_PERMISSIVEEMAILAUTOLINKS (GFM's autolink extension,
+                                * all three forms: `https://x`, `www.x`, `user@host.tld`) */
   bool math = false;           /* MD_FLAG_LATEXMATHSPANS */
   bool underline = false;      /* MD_FLAG_UNDERLINE */
 };

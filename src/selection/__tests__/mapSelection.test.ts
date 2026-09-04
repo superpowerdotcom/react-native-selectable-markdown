@@ -1,4 +1,5 @@
 import type {
+  Block,
   BlockquoteNode,
   CodeBlockNode,
   HeadingNode,
@@ -212,6 +213,46 @@ describe('projectRun', () => {
     ]);
   });
 
+  it('replaces the ORDINAL too when an ordered item is a task', () => {
+    // `item.task` is tested before `node.ordered`, so an ordered task item
+    // projects the checkbox alone and its number is gone from the display.
+    // The ordinal is still in the source, so copying the item yields it; what
+    // the reader sees is one marker rather than two.
+    const source = '1. [x] done\n2. [ ] todo';
+    const list: ListNode = {
+      kind: 'list',
+      ordered: true,
+      start: 1,
+      tight: true,
+      span: { start: 0, end: source.length },
+      items: [
+        {
+          kind: 'listItem',
+          task: 'checked',
+          span: spanOf(source, '1. [x] done'),
+          children: [plainParagraph(source, 'done')],
+        },
+        {
+          kind: 'listItem',
+          task: 'unchecked',
+          span: spanOf(source, '2. [ ] todo'),
+          children: [plainParagraph(source, 'todo')],
+        },
+      ],
+    };
+    const doc = makeDoc(source, [list]);
+    const projected = projectRun(onlyRun(doc), doc);
+
+    expect(projected.text).toBe('\u2611 done\n\u2610 todo');
+    expect(projected.text).not.toContain('1.');
+    expect(
+      projected.marks.filter((mark) => mark.kind === 'listMarker'),
+    ).toEqual([
+      { kind: 'listMarker', start: 0, end: 2 },
+      { kind: 'listMarker', start: 7, end: 9 },
+    ]);
+  });
+
   it('projects blockquote content without the > chrome', () => {
     const source = 'Above.\n\n> quoted text';
     const quote: BlockquoteNode = {
@@ -247,6 +288,267 @@ describe('projectRun', () => {
     expect(projected.pieces).toEqual([
       { textStart: 0, textEnd: 13, source: { start: 6, end: 19 } },
     ]);
+  });
+
+  it('pins a fenced code block past its info string, not inside it', () => {
+    // The node's source slice opens with the fence line, so a body that also
+    // occurs inside the INFO STRING used to win the search: this block pinned
+    // to the "js\n" of "```js\n" instead of to the code. The lengths matched,
+    // so the piece read as linear and every offset in the block mapped one
+    // construct to the left — copying the block duplicated the code line and
+    // dropped the opening fence.
+    const source = '```js\njs\n```';
+    const code: CodeBlockNode = {
+      kind: 'codeBlock',
+      language: 'js',
+      literal: 'js\n',
+      fenced: true,
+      closed: true,
+      span: { start: 0, end: source.length },
+    };
+    const doc = makeDoc(source, [code]);
+    const projected = projectRun(segmentRuns(doc)[0], doc);
+
+    expect(projected.text).toBe('js\n');
+    expect(projected.pieces).toEqual([
+      { textStart: 0, textEnd: 3, source: { start: 6, end: 9 } },
+    ]);
+    expect(source.slice(6, 9)).toBe('js\n');
+  });
+
+  it('pins an indented code block from the start of its slice', () => {
+    // The fence-line skip is for FENCED blocks only: an indented block has no
+    // fence line, and skipping its first line would lose the first line of
+    // the code.
+    const source = '    js\n    js\n';
+    const code: CodeBlockNode = {
+      kind: 'codeBlock',
+      literal: 'js\njs\n',
+      fenced: false,
+      closed: true,
+      span: { start: 0, end: source.length },
+    };
+    const doc = makeDoc(source, [code]);
+    const projected = projectRun(segmentRuns(doc)[0], doc);
+
+    expect(projected.text).toBe('js\njs\n');
+    // The literal is nowhere verbatim (the source indents every line), so it
+    // is covered by one linear piece per line, each pinned past its indent.
+    expect(projected.pieces).toEqual([
+      { textStart: 0, textEnd: 3, source: { start: 4, end: 7 } },
+      { textStart: 3, textEnd: 6, source: { start: 11, end: 14 } },
+    ]);
+    expect(source.slice(4, 7)).toBe('js\n');
+  });
+
+  it('never claims a whole-span pin is linear when the indent moved', () => {
+    // CommonMark example 1, and the shape that made this a correctness bug
+    // rather than a granularity one. The slice keeps the indent and drops the
+    // trailing newline (`widenCodeBlock`); md4c's literal drops the indent
+    // and keeps the newline. ONE LEADING TAB FOR ONE TRAILING NEWLINE, so the
+    // two are the same length — and a piece whose display length equals its
+    // source length is exactly what `mapSelectionToSource` maps through one
+    // for one. Pinned to the whole span, every offset in the block came back
+    // one character to the left.
+    const source = '\tfoo\tbaz\t\tbim\n';
+    const code: CodeBlockNode = {
+      kind: 'codeBlock',
+      literal: 'foo\tbaz\t\tbim\n',
+      fenced: false,
+      closed: true,
+      // What the decoder produces: the indent in, the trailing newline out.
+      span: { start: 0, end: source.length - 1 },
+    };
+    const doc = makeDoc(source, [code]);
+    const projected = projectRun(segmentRuns(doc)[0], doc);
+
+    expect(projected.text).toBe('foo\tbaz\t\tbim\n');
+    expectTiling(projected);
+    // One piece, pinned PAST the tab, and indivisible (13 display characters
+    // for 12 source ones) because the trailing newline is not in the slice.
+    expect(projected.pieces).toEqual([
+      { textStart: 0, textEnd: 13, source: { start: 1, end: 13 } },
+    ]);
+
+    // The selection that used to come back shifted.
+    expect(mapSelectionToSource(projected, { start: 0, end: 3 })).toEqual({
+      start: 1,
+      end: 13,
+    });
+    expect(source.slice(1, 13)).toBe('foo\tbaz\t\tbim');
+  });
+
+  it('maps a synthesized indent to no source at all', () => {
+    // CommonMark example 274: `1.      indented code` gives the code block a
+    // slice starting at the content, and md4c SYNTHESIZES one leading space
+    // for the indent columns left over after the item's own indent. That
+    // space is on screen and in no slice — a glyph, like a bullet.
+    //
+    // Matching it against the space inside `indented code` is what a resync
+    // that only ever moves the source cursor does, and it skipped eight real
+    // characters to get there: the whole block then mapped three to the
+    // right, silently, because the pieces still tiled and still looked
+    // linear.
+    const source = '1.      indented code\n';
+    const code: CodeBlockNode = {
+      kind: 'codeBlock',
+      literal: ' indented code\n',
+      fenced: false,
+      closed: true,
+      span: { start: 8, end: 21 },
+    };
+    const doc = makeDoc(source, [code]);
+    const projected = projectRun(segmentRuns(doc)[0], doc);
+
+    expect(projected.text).toBe(' indented code\n');
+    expectTiling(projected);
+    expect(projected.pieces).toEqual([
+      { textStart: 0, textEnd: 1, source: null },
+      { textStart: 1, textEnd: 15, source: { start: 8, end: 21 } },
+    ]);
+    expect(source.slice(8, 21)).toBe('indented code');
+
+    // A selection inside the code maps into the code, not past it.
+    const at = projected.text.indexOf('code');
+    expect(
+      mapSelectionToSource(projected, { start: at, end: at + 4 }),
+    ).toEqual({ start: 8, end: 21 });
+  });
+
+  it('splits a text node around an escape, so the escape costs only itself', () => {
+    // The native decoder merges an escape's text events into ONE text node
+    // over the whole run, with the backslash gone from `value` — in plain
+    // prose that node is the entire paragraph. Pinning it whole made every
+    // selection in the paragraph copy the whole paragraph.
+    const source = 'The pattern \\*.log matches every log file.';
+    const display = 'The pattern *.log matches every log file.';
+    const para: ParagraphNode = {
+      kind: 'paragraph',
+      span: { start: 0, end: source.length },
+      children: [
+        { kind: 'text', value: display, span: { start: 0, end: source.length } },
+      ],
+    };
+    const doc = makeDoc(source, [para]);
+    const projected = projectRun(onlyRun(doc), doc);
+
+    expect(projected.text).toBe(display);
+    expectTiling(projected);
+    expect(projected.pieces).toEqual([
+      { textStart: 0, textEnd: 12, source: { start: 0, end: 12 } },
+      {
+        textStart: 12,
+        textEnd: display.length,
+        source: { start: 13, end: source.length },
+      },
+    ]);
+
+    // A selection past the escape maps to itself, not to the paragraph.
+    const at = display.indexOf('every');
+    expect(
+      mapSelectionToSource(projected, { start: at, end: at + 5 }),
+    ).toEqual({ start: at + 1, end: at + 6 });
+    expect(source.slice(at + 1, at + 6)).toBe('every');
+  });
+
+  it('splits a text node around an entity the source spells out', () => {
+    // `&amp;` decodes to a character the slice already contains, so both
+    // halves stay linear and only the entity itself is skipped.
+    const source = 'Tom &amp; Jerry';
+    const display = 'Tom & Jerry';
+    const para: ParagraphNode = {
+      kind: 'paragraph',
+      span: { start: 0, end: source.length },
+      children: [
+        { kind: 'text', value: display, span: { start: 0, end: source.length } },
+      ],
+    };
+    const doc = makeDoc(source, [para]);
+    const projected = projectRun(onlyRun(doc), doc);
+
+    expect(projected.text).toBe(display);
+    expectTiling(projected);
+    expect(projected.pieces).toEqual([
+      { textStart: 0, textEnd: 5, source: { start: 0, end: 5 } },
+      { textStart: 5, textEnd: 11, source: { start: 9, end: 15 } },
+    ]);
+
+    // Selecting across the entity bridges it: the copied markdown is the
+    // entity plus what follows, which re-parses to exactly what was selected.
+    expect(mapSelectionToSource(projected, { start: 4, end: 7 })).toEqual({
+      start: 4,
+      end: 11,
+    });
+    expect(source.slice(4, 11)).toBe('&amp; J');
+  });
+
+  it('pins a respelled character to itself, not to its whole node', () => {
+    // `&hellip;` spells a character that is nowhere in the slice, so no
+    // linear run covers it — but the prose on either side is spelled
+    // verbatim, so only the entity itself is indivisible. Before this the
+    // whole node was one piece, and selecting the ellipsis copied the
+    // paragraph.
+    const source = 'a &hellip; b';
+    const display = 'a … b';
+    const para: ParagraphNode = {
+      kind: 'paragraph',
+      span: { start: 0, end: source.length },
+      children: [
+        { kind: 'text', value: display, span: { start: 0, end: source.length } },
+      ],
+    };
+    const doc = makeDoc(source, [para]);
+    const projected = projectRun(onlyRun(doc), doc);
+
+    expect(projected.text).toBe(display);
+    expectTiling(projected);
+    expect(projected.pieces).toEqual([
+      { textStart: 0, textEnd: 2, source: { start: 0, end: 2 } },
+      // The one indivisible piece: one display character for eight of source.
+      { textStart: 2, textEnd: 3, source: { start: 2, end: 10 } },
+      { textStart: 3, textEnd: 5, source: { start: 10, end: 12 } },
+    ]);
+
+    // Selecting the ellipsis copies the entity that spells it, and nothing
+    // else; selecting past it maps offset for offset.
+    expect(mapSelectionToSource(projected, { start: 2, end: 3 })).toEqual({
+      start: 2,
+      end: 10,
+    });
+    expect(source.slice(2, 10)).toBe('&hellip;');
+    expect(mapSelectionToSource(projected, { start: 4, end: 5 })).toEqual({
+      start: 11,
+      end: 12,
+    });
+    expect(source.slice(11, 12)).toBe('b');
+  });
+
+  it('merges a one-for-one respelling into the linear prose around it', () => {
+    // Smart punctuation replaces one source character with one display
+    // character, so the resynced piece is linear and `emit` merges it
+    // straight into its neighbours: a paragraph of curly quotes maps offset
+    // for offset instead of being one indivisible block.
+    const source = 'He said "hi" now.';
+    const display = 'He said “hi” now.';
+    const para: ParagraphNode = {
+      kind: 'paragraph',
+      span: { start: 0, end: source.length },
+      children: [
+        { kind: 'text', value: display, span: { start: 0, end: source.length } },
+      ],
+    };
+    const doc = makeDoc(source, [para]);
+    const projected = projectRun(onlyRun(doc), doc);
+
+    expect(projected.text).toBe(display);
+    expect(projected.pieces).toEqual([
+      { textStart: 0, textEnd: 17, source: { start: 0, end: 17 } },
+    ]);
+    expect(mapSelectionToSource(projected, { start: 8, end: 12 })).toEqual({
+      start: 8,
+      end: 12,
+    });
+    expect(source.slice(8, 12)).toBe('"hi"');
   });
 
   it('pins code span content inside the backticks', () => {
@@ -489,11 +791,28 @@ describe('mapSelectionToSource', () => {
     expect(source.slice(2, 5)).toBe('one');
   });
 
-  it('clamps a selection that starts on a bullet glyph into the item text', () => {
+  it('gives a whole item back its marker, which no piece carries', () => {
+    // The bullet is a synthetic glyph, so the pieces under this selection
+    // reach only 'one' — but the selection covers the item's WHOLE projected
+    // range, so the item's own source span is unioned in and the copy is a
+    // list item rather than a line of prose. Selecting the same three
+    // characters WITHOUT the glyph still maps to the text alone (above).
     expect(mapSelectionToSource(projected, { start: 0, end: 5 })).toEqual({
-      start: 2,
+      start: 0,
       end: 5,
     });
+    expect(source.slice(0, 5)).toBe('- one');
+  });
+
+  it('leaves a partly-covered construct to its pieces', () => {
+    // Half a list is not a list: this selection covers the whole of item one
+    // and only part of item two, so item one's marker comes back and item
+    // two's does not.
+    expect(mapSelectionToSource(projected, { start: 0, end: 9 })).toEqual({
+      start: 0,
+      end: 9,
+    });
+    expect(source.slice(0, 9)).toBe('- one\n- t');
   });
 
   it('bridges synthetic glyphs strictly inside the selection', () => {
@@ -518,7 +837,7 @@ describe('mapSelectionToSource', () => {
 
   it('normalizes reversed selections and clamps to the text bounds', () => {
     expect(mapSelectionToSource(projected, { start: 5, end: 0 })).toEqual({
-      start: 2,
+      start: 0,
       end: 5,
     });
     expect(mapSelectionToSource(projected, { start: -4, end: 3 })).toEqual({
@@ -574,6 +893,153 @@ describe('mapSelectionToSource', () => {
       end: 4,
     });
     expect(mapSelectionToSource(tailProjected, { start: 4, end: 5 })).toBeNull();
+  });
+});
+
+/**
+ * EXTENTS: the syntax a construct owns and its projection never shows.
+ *
+ * A heading's `# `, a quote's `> `, a list item's marker, a fence, a code
+ * span's backticks — none of it projects any text, so none of it belongs to a
+ * piece, and the hull of the pieces a selection touched could never contain
+ * it. `projectRun` records each such construct's own source span, and
+ * `mapSelectionToSource` unions one back in when the selection covers that
+ * construct's whole projected range.
+ */
+describe('extents', () => {
+  it('records a heading with its marker and unions it back on a full sweep', () => {
+    const source = '## Title\n\nBody text here.';
+    const heading: HeadingNode = {
+      kind: 'heading',
+      level: 2,
+      span: spanOf(source, '## Title'),
+      children: [textNode(source, 'Title')],
+    };
+    const doc = makeDoc(source, [
+      heading,
+      plainParagraph(source, 'Body text here.'),
+    ]);
+    const projected = projectRun(onlyRun(doc), doc);
+
+    // The paragraph records nothing: its pieces already reach both ends of
+    // its span, so there is no syntax to put back.
+    expect(projected.extents).toEqual([
+      { start: 0, end: 5, source: { start: 0, end: 8 } },
+    ]);
+    // The whole heading — the marker comes back.
+    expect(mapSelectionToSource(projected, { start: 0, end: 5 })).toEqual({
+      start: 0,
+      end: 8,
+    });
+    // Part of it — it does not.
+    expect(mapSelectionToSource(projected, { start: 1, end: 5 })).toEqual({
+      start: 4,
+      end: 8,
+    });
+  });
+
+  it('puts a code span\u2019s backticks back, and nothing else', () => {
+    const source = 'Use `npm i` now.';
+    const para: ParagraphNode = {
+      kind: 'paragraph',
+      span: { start: 0, end: source.length },
+      children: [
+        textNode(source, 'Use '),
+        { kind: 'codeSpan', value: 'npm i', span: spanOf(source, '`npm i`') },
+        textNode(source, ' now.'),
+      ],
+    };
+    const doc = makeDoc(source, [para]);
+    const projected = projectRun(onlyRun(doc), doc);
+
+    expect(projected.text).toBe('Use npm i now.');
+    expect(projected.extents).toEqual([
+      { start: 4, end: 9, source: spanOf(source, '`npm i`') },
+    ]);
+    expect(mapSelectionToSource(projected, { start: 4, end: 9 })).toEqual({
+      start: 4,
+      end: 11,
+    });
+    expect(source.slice(4, 11)).toBe('`npm i`');
+    // One character short of the whole span: the backticks stay out.
+    expect(mapSelectionToSource(projected, { start: 5, end: 9 })).toEqual({
+      start: 6,
+      end: 10,
+    });
+  });
+
+  it('records an inline link but not a reference one', () => {
+    // An inline link carries its destination, so copying `[text](url)` pastes
+    // a link. A reference link's destination is a definition elsewhere in the
+    // document, which no slice of this selection can carry — copying `[text]`
+    // would paste literal brackets, so the words win.
+    const source = 'See [docs](/a) and [ref] here.';
+    const inline: LinkNode = {
+      kind: 'link',
+      href: '/a',
+      span: spanOf(source, '[docs](/a)'),
+      children: [textNode(source, 'docs')],
+    };
+    const reference: LinkNode = {
+      kind: 'link',
+      href: '/b',
+      span: spanOf(source, '[ref]'),
+      children: [textNode(source, 'ref')],
+    };
+    const para: ParagraphNode = {
+      kind: 'paragraph',
+      span: { start: 0, end: source.length },
+      children: [
+        textNode(source, 'See '),
+        inline,
+        textNode(source, ' and '),
+        reference,
+        textNode(source, ' here.'),
+      ],
+    };
+    const doc = makeDoc(source, [para]);
+    const projected = projectRun(onlyRun(doc), doc);
+
+    expect(projected.text).toBe('See docs and ref here.');
+    expect(projected.extents).toEqual([
+      { start: 4, end: 8, source: spanOf(source, '[docs](/a)') },
+    ]);
+    expect(mapSelectionToSource(projected, { start: 4, end: 8 })).toEqual(
+      spanOf(source, '[docs](/a)'),
+    );
+    expect(mapSelectionToSource(projected, { start: 13, end: 16 })).toEqual(
+      spanOf(source, 'ref', source.indexOf('[ref]')),
+    );
+  });
+
+  it('records nothing for a construct the stream has not finished', () => {
+    // An incomplete construct's span is still moving and its closing syntax
+    // is not written yet — a repaired code span whose backtick the repair
+    // supplied. Copying `` `npm i `` would copy a delimiter the author has
+    // not typed, so the extent is refused and the content stands alone.
+    const source = 'Use `npm i';
+    const para: ParagraphNode = {
+      kind: 'paragraph',
+      span: { start: 0, end: source.length },
+      children: [
+        textNode(source, 'Use '),
+        {
+          kind: 'codeSpan',
+          value: 'npm i',
+          incomplete: true,
+          span: { start: 4, end: source.length },
+        },
+      ],
+    };
+    const doc = makeDoc(source, [para]);
+    const projected = projectRun(onlyRun(doc), doc);
+
+    expect(projected.text).toBe('Use npm i');
+    expect(projected.extents).toBeUndefined();
+    expect(mapSelectionToSource(projected, { start: 4, end: 9 })).toEqual({
+      start: 5,
+      end: 10,
+    });
   });
 });
 
@@ -730,6 +1196,46 @@ describe('embeds', () => {
     expectTiling(projected);
   });
 
+  it('gives every embed a one-character placeholder, in ascending order', () => {
+    // A LOAD-BEARING INVARIANT, not a description. Consumers sweep
+    // `projected.embeds` in one pass and rely on `end` being non-decreasing as
+    // well as `start` — `embedLineHeightFloors` (src/view/runAttributes.ts)
+    // retires the covering attributes by `end` as it walks, and would
+    // understate a later embed's line height if a wide placeholder ever sorted
+    // first; `selectionDisplayText` substitutes right-to-left so earlier
+    // offsets stay valid. `end === start + 1` for every entry is what makes
+    // ascending `start` imply both.
+    const twoSource = '[1](cite://a) and [2](cite://b)';
+    const first: LinkNode = {
+      kind: 'link',
+      href: 'cite://a',
+      span: spanOf(twoSource, '[1](cite://a)'),
+      children: [textNode(twoSource, '1')],
+    };
+    const second: LinkNode = {
+      kind: 'link',
+      href: 'cite://b',
+      span: spanOf(twoSource, '[2](cite://b)'),
+      children: [textNode(twoSource, '2', twoSource.indexOf('[2]'))],
+    };
+    const para: ParagraphNode = {
+      kind: 'paragraph',
+      span: { start: 0, end: twoSource.length },
+      children: [first, textNode(twoSource, ' and '), second],
+    };
+    const twoDoc = makeDoc(twoSource, [para]);
+    const runs = segmentRuns(twoDoc, { embed: claimCitations });
+    const embeds = projectRun(runs[0], twoDoc, { embed: claimCitations }).embeds;
+
+    expect(embeds).toHaveLength(2);
+    let previousEnd = -1;
+    for (const embed of embeds ?? []) {
+      expect(embed.end).toBe(embed.start + 1);
+      expect(embed.start).toBeGreaterThanOrEqual(previousEnd);
+      previousEnd = embed.end;
+    }
+  });
+
   it('keeps a one-code-unit node’s placeholder piece unmerged', () => {
     // The atomicity of an embed piece is contractual, not inferred from the
     // display/source length inequality — a node whose span is exactly one
@@ -813,5 +1319,351 @@ describe('embeds', () => {
         end: placeholderAt + 1,
       }),
     ).toEqual(link.span);
+  });
+});
+
+/**
+ * NESTING DEPTH IS UNTRUSTED INPUT.
+ *
+ * Three kilobytes of `'> '` is 1500 levels of blockquote, and nothing caps
+ * it: the native decoder builds its tree off an explicit stack, so it returns
+ * a tree as deep as the source asks for. Every walk on the selection path
+ * therefore has to survive one — a RangeError here would surface inside the
+ * `useMemo` that projects a run during React render, which is a torn-down
+ * tree rather than a dropped frame. The tree is hand-built so the test needs
+ * no parser and costs no parse.
+ */
+describe('unbounded nesting depth', () => {
+  const DEPTH = 20_000;
+  const source = '> '.repeat(DEPTH) + 'echo';
+  const textSpan = { start: DEPTH * 2, end: source.length };
+
+  function deepDocument(): ParsedDocument {
+    let block: Block = {
+      kind: 'paragraph',
+      span: textSpan,
+      children: [{ kind: 'text', value: 'echo', span: textSpan }],
+    };
+    for (let level = DEPTH - 1; level >= 0; level -= 1) {
+      block = {
+        kind: 'blockquote',
+        span: { start: level * 2, end: source.length },
+        children: [block],
+      };
+    }
+    return makeDoc(source, [block]);
+  }
+
+  it('segments, projects and maps a 20000-deep blockquote', () => {
+    const doc = deepDocument();
+
+    // segmentRuns walks the whole subtree looking for standalone constructs.
+    const runs = segmentRuns(doc);
+    expect(runs).toHaveLength(1);
+    expect(runs[0].standalone).toBe(false);
+
+    const projected = projectRun(runs[0], doc);
+    expect(projected.text).toBe('echo');
+    expect(projected.pieces).toEqual([
+      { textStart: 0, textEnd: 4, source: textSpan },
+    ]);
+    // One 'blockquote' mark per level, all over the same four characters.
+    expect(
+      projected.marks.filter((mark) => mark.kind === 'blockquote'),
+    ).toHaveLength(DEPTH);
+    // One 'blockquote' EXTENT per level too, and selecting the four visible
+    // characters covers every one of them — so the copied markdown is the
+    // whole 20000-deep quote, not the bare word. The union walks 20000
+    // extents without recursing, same as everything else here.
+    expect(mapSelectionToSource(projected, { start: 0, end: 4 })).toEqual({
+      start: 0,
+      end: source.length,
+    });
+  });
+});
+
+/**
+ * INCREMENTAL PROJECTION: `projectRun` handed the projection of a prefix of
+ * the same run must produce exactly what it produces from scratch.
+ *
+ * This is the whole safety property of the `previous` option, and it is not
+ * obvious: the projector merges a chunk into the preceding piece when the two
+ * are linear in the source, records marks as their construct closes and sorts
+ * them at the end, numbers embeds by their position in the run, and refuses to
+ * grow an embed's piece. All four are state carried ACROSS a block boundary, so
+ * a resumed projection that got any of them wrong would still tile, still map,
+ * and still look right — it would just disagree with the from-scratch answer by
+ * a piece boundary or a mark order. So the assertion is deep equality at EVERY
+ * split point, not a spot check.
+ *
+ * The corpus-scale counterpart, over documents from a real parse, is
+ * conformance/selection/incremental-projection.test.ts.
+ */
+describe('projectRun (incremental)', () => {
+  /** `run` restricted to its first `count` blocks. */
+  function prefixRun(run: RunSegment, count: number): RunSegment {
+    const blocks = run.blocks.slice(0, count);
+    return {
+      ...run,
+      blocks,
+      span: {
+        start: blocks[0].span.start,
+        end: blocks[blocks.length - 1].span.end,
+      },
+    };
+  }
+
+  /**
+   * Projects `run` from scratch and again by growing it one block at a time,
+   * asserting the two agree after every step — which also asserts that the
+   * intermediate projections are the ones a shorter run would have produced.
+   */
+  function expectIncrementalMatchesFull(
+    run: RunSegment,
+    doc: ParsedDocument,
+    options?: { embed?: EmbedLookup },
+  ): void {
+    expect(run.blocks.length).toBeGreaterThan(1);
+    let previous = projectRun(prefixRun(run, 1), doc, options);
+    expect(previous).toEqual(projectRun(prefixRun(run, 1), doc, options));
+
+    for (let count = 2; count <= run.blocks.length; count += 1) {
+      const grown = prefixRun(run, count);
+      const full = projectRun(grown, doc, options);
+      const incremental = projectRun(grown, doc, {
+        ...options,
+        previous: { blocks: run.blocks.slice(0, count - 1), projected: previous },
+      });
+
+      expect(incremental).toEqual(full);
+      expectTiling(incremental);
+      previous = incremental;
+    }
+  }
+
+  const source = [
+    '# Heading one',
+    'Alpha *beta* and `code`.',
+    '> quoted line',
+    '- one\n- two',
+    '```js\nconst x = 1;\n```',
+    '| a | b |\n| - | - |\n| c | d |',
+    '---',
+    '<div>raw</div>',
+    'Final [link](https://example.com) end.',
+  ].join('\n\n');
+
+  function mixedDocument(): ParsedDocument {
+    const heading: HeadingNode = {
+      kind: 'heading',
+      level: 1,
+      span: spanOf(source, '# Heading one'),
+      children: [textNode(source, 'Heading one')],
+    };
+    const prose: ParagraphNode = {
+      kind: 'paragraph',
+      span: spanOf(source, 'Alpha *beta* and `code`.'),
+      children: [
+        textNode(source, 'Alpha '),
+        {
+          kind: 'emphasis',
+          span: spanOf(source, '*beta*'),
+          children: [textNode(source, 'beta')],
+        },
+        textNode(source, ' and '),
+        { kind: 'codeSpan', value: 'code', span: spanOf(source, '`code`') },
+        textNode(source, '.'),
+      ],
+    };
+    const quote: BlockquoteNode = {
+      kind: 'blockquote',
+      span: spanOf(source, '> quoted line'),
+      children: [plainParagraph(source, 'quoted line')],
+    };
+    const list: ListNode = {
+      kind: 'list',
+      ordered: false,
+      tight: true,
+      span: spanOf(source, '- one\n- two'),
+      items: [
+        {
+          kind: 'listItem',
+          span: spanOf(source, '- one'),
+          children: [plainParagraph(source, 'one')],
+        },
+        {
+          kind: 'listItem',
+          span: spanOf(source, '- two'),
+          children: [plainParagraph(source, 'two')],
+        },
+      ],
+    };
+    const code: CodeBlockNode = {
+      kind: 'codeBlock',
+      language: 'js',
+      literal: 'const x = 1;\n',
+      fenced: true,
+      closed: true,
+      span: spanOf(source, '```js\nconst x = 1;\n```'),
+    };
+    const cell = (value: string): TableNode['header']['cells'][number] => ({
+      kind: 'tableCell',
+      span: spanOf(source, value),
+      children: [textNode(source, value)],
+    });
+    const table: TableNode = {
+      kind: 'table',
+      align: [null, null],
+      span: spanOf(source, '| a | b |\n| - | - |\n| c | d |'),
+      header: {
+        kind: 'tableRow',
+        span: spanOf(source, '| a | b |'),
+        cells: [cell('a'), cell('b')],
+      },
+      rows: [
+        {
+          kind: 'tableRow',
+          span: spanOf(source, '| c | d |'),
+          cells: [cell('c'), cell('d')],
+        },
+      ],
+    };
+    const rule: Block = { kind: 'thematicBreak', span: spanOf(source, '---') };
+    const html: Block = {
+      kind: 'htmlBlock',
+      literal: '<div>raw</div>',
+      span: spanOf(source, '<div>raw</div>'),
+    };
+    const link: LinkNode = {
+      kind: 'link',
+      href: 'https://example.com',
+      span: spanOf(source, '[link](https://example.com)'),
+      children: [textNode(source, 'link')],
+    };
+    const closing: ParagraphNode = {
+      kind: 'paragraph',
+      span: spanOf(source, 'Final [link](https://example.com) end.'),
+      children: [textNode(source, 'Final '), link, textNode(source, ' end.')],
+    };
+    return makeDoc(source, [
+      heading,
+      prose,
+      quote,
+      list,
+      code,
+      table,
+      rule,
+      html,
+      closing,
+    ]);
+  }
+
+  it('matches the full projection at every block boundary', () => {
+    const doc = mixedDocument();
+    expectIncrementalMatchesFull(onlyRun(doc), doc);
+  });
+
+  it('matches across embeds, whose ids and atomic pieces continue', () => {
+    const doc = mixedDocument();
+    // Claims the code block and the link — one top-level, one inline — so the
+    // seam is crossed with an embed on both sides of it.
+    const embed: EmbedLookup = (node) =>
+      node.kind === 'codeBlock' || node.kind === 'link'
+        ? { width: 120, height: 60, text: '[card]' }
+        : undefined;
+    const run = segmentRuns(doc, { embed })[0];
+
+    expectIncrementalMatchesFull(run, doc, { embed });
+
+    const projected = projectRun(run, doc, { embed });
+    expect(projected.embeds?.map((entry) => entry.embedId)).toEqual([0, 1]);
+  });
+
+  it('matches when the seam falls after a synthetic glyph', () => {
+    // The one place the resumed projector could diverge on its very first
+    // emit: the block separator carries no source, and so does a bullet glyph,
+    // so the two MERGE into one piece — which means the resumed projector has
+    // to be holding the same last piece the from-scratch one would be.
+    const emptySource = '-\n\nAfter the list.';
+    const list: ListNode = {
+      kind: 'list',
+      ordered: false,
+      tight: true,
+      span: spanOf(emptySource, '-'),
+      items: [{ kind: 'listItem', span: spanOf(emptySource, '-'), children: [] }],
+    };
+    const after = plainParagraph(emptySource, 'After the list.');
+    const doc = makeDoc(emptySource, [list, after]);
+    const run = onlyRun(doc);
+    const full = projectRun(run, doc);
+
+    expect(
+      projectRun(run, doc, {
+        previous: { blocks: [list], projected: projectRun(prefixRun(run, 1), doc) },
+      }),
+    ).toEqual(full);
+    expectTiling(full);
+  });
+
+  it('returns the same object when nothing was appended', () => {
+    const doc = mixedDocument();
+    const run = onlyRun(doc);
+    const first = projectRun(run, doc);
+    const again = projectRun(run, doc, {
+      previous: { blocks: run.blocks, projected: first },
+    });
+
+    // Identity, not equality: every memo downstream keys on the projection
+    // object, so a re-segmentation that changed nothing must cost nothing.
+    expect(again).toBe(first);
+  });
+
+  it('leaves the previous projection untouched when it grows', () => {
+    const doc = mixedDocument();
+    const run = onlyRun(doc);
+    const short = projectRun(prefixRun(run, 2), doc);
+    const snapshot = JSON.parse(JSON.stringify(short)) as unknown;
+
+    projectRun(prefixRun(run, 4), doc, {
+      previous: { blocks: run.blocks.slice(0, 2), projected: short },
+    });
+
+    // The projector grows the last piece in place when the next chunk
+    // continues it, so a shared piece object would corrupt whoever still
+    // holds the shorter projection.
+    expect(JSON.parse(JSON.stringify(short))).toEqual(snapshot);
+  });
+
+  it('ignores a previous projection that is not a prefix by identity', () => {
+    const doc = mixedDocument();
+    const run = onlyRun(doc);
+    const full = projectRun(run, doc);
+
+    // Structurally identical blocks from a second build of the same document
+    // are NOT the same objects, and must not be spliced onto.
+    const other = mixedDocument();
+    const decoys = [
+      { blocks: other.blocks.slice(0, 3), projected: projectRun(prefixRun(onlyRun(other), 3), other) },
+      { blocks: [], projected: full },
+      { blocks: [...run.blocks, run.blocks[0]], projected: full },
+    ];
+    for (const previous of decoys) {
+      expect(projectRun(run, doc, { previous })).toEqual(full);
+    }
+  });
+
+  it('refuses a prefix that reaches past the end of the source', () => {
+    const doc = mixedDocument();
+    const run = onlyRun(doc);
+    const short = projectRun(prefixRun(run, 2), doc);
+    // The shape a diverging `replace` leaves behind: blocks held from a parse
+    // of a longer source than the document now carries.
+    const truncated = makeDoc(source.slice(0, 20), run.blocks);
+
+    expect(
+      projectRun(prefixRun(run, 3), truncated, {
+        previous: { blocks: run.blocks.slice(0, 2), projected: short },
+      }),
+    ).toEqual(projectRun(prefixRun(run, 3), truncated));
   });
 });

@@ -1,13 +1,136 @@
 name: Release
 
 # Tag-triggered only — `git tag v0.1.0 && git push origin v0.1.0`. Nothing
-# here runs on an ordinary push or pull request.
+# here runs on an ordinary push or pull request. `npm run release <bump>` is
+# the local half: it bumps, verifies and packs a dry-run tarball, then prints
+# the commit/tag/push commands that get here. README.md's "Releasing" section
+# is the same sequence in prose.
 on:
   push:
     tags: ['v*']
 
 jobs:
+  # ---- preflight: the checks that cost seconds ----------------------------
+  #
+  # Its own job so a mistyped tag or a missing changelog section fails in under
+  # a minute instead of after the macOS gates below. Nothing here needs
+  # `npm ci`, which is why it does not run one.
+  preflight:
+    name: Preflight (tag, lockfile, changelog)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # The podspec reads its version out of package.json, so a tag that
+      # disagrees with it ships a pod CocoaPods cannot resolve.
+      - name: Check the tag matches package.json
+        run: |
+          declared=$(node -p "require('./package.json').version")
+          if [ "$GITHUB_REF_NAME" != "v$declared" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $declared (expected v$declared)"
+            exit 1
+          fi
+
+      # `npm ci` installs from the lockfile and never compares the manifest's
+      # peerDependencies against it, so the lock's root entry kept claiming
+      # `react-native: >=0.73` through both 0.10.0 and 0.11.0 — a floor the
+      # package stopped supporting in 0.10.0 — with nothing anywhere going red.
+      # npm never publishes the lockfile, so the drift never reaches a
+      # consumer; it just makes the repository's own metadata lie. This is the
+      # only place it is checked.
+      #
+      # The comparison lives in a script rather than inline `node -e` because
+      # the inline version compared JSON.stringify output, which is key-ORDER
+      # sensitive: npm writes the lock's blocks alphabetically and a human
+      # appends to package.json, so an ordinary hand edit failed this step with
+      # a message showing two objects that read as identical. The script
+      # normalises key order and names the keys that actually differ, and being
+      # a file it can be run — and tested — outside a workflow.
+      - name: Check package-lock.json mirrors the manifest
+        run: node scripts/check-lock-sync.mjs
+
+      # Release notes come from CHANGELOG.md. The same script runs again in the
+      # publish job, where its output becomes the notes file; here it is a
+      # gate, so a forgotten section costs seconds instead of a re-tag after a
+      # publish. `--generate-notes` would summarise the commits in the tag
+      # range, which on a squashed main is one commit message.
+      - name: Check CHANGELOG.md has a section for this tag
+        run: node scripts/changelog-section.mjs "$GITHUB_REF_NAME" > /dev/null
+
+      # The other half of the same question. The step above proves the tag HAS
+      # notes; this one proves a breaking change is not shipping OUTSIDE them.
+      # Everything still sitting under `## [Unreleased]` when a tag is cut is in
+      # that tarball, so a line there saying BREAKING is a break published under
+      # a version whose notes never mention it — which is the state the last
+      # audit left behind (nineteen names dropped from the package root, an
+      # export renamed, a deep path that stopped resolving, all under an
+      # unbumped 0.11.0). The tag is passed explicitly because `actions/checkout`
+      # fetches the pushed ref and need not have any other tag locally.
+      - name: Check no BREAKING change ships under an already-tagged version
+        run: node scripts/check-unreleased-breaking.mjs --tag "$GITHUB_REF_NAME"
+
+  # ---- the macOS gates ----------------------------------------------------
+  #
+  # These used to be omitted from the release on the grounds that "CI runs both
+  # on macOS on every push to main and every pull request, which is where those
+  # regressions should be caught" — which assumes the tagged commit is one CI
+  # saw and saw pass. It is not: the trigger is `push: tags: ['v*']` with no
+  # branch constraint, so a tag can be pushed at any commit, on any branch,
+  # including one whose macOS legs were red. The omission rested on exactly the
+  # premise the comment below it rejects, and it meant a release could publish
+  # with the Swift selection host and the iOS renderer pass never compiled.
+  #
+  # So they run here too. The cost is real — this job is the long pole between
+  # pushing a tag and having an artifact — and it is the right trade for the
+  # last check before the npm registry.
+  macos-gates:
+    name: macOS gates (Swift + the iOS header set)
+    needs: preflight
+    runs-on: macos-latest
+    env:
+      # Turns the Swift script's "no Xcode, skipping" path into a failure. On
+      # this runner a skip would mean the image changed under us, and a
+      # silently skipped gate is worse than none — the same reasoning as
+      # ci.yml's swift job.
+      RNSM_REQUIRE_SWIFT: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      # Boost is the only dependency check-fabric-cpp.mjs will not fetch for
+      # itself; everything else React Native pins is downloaded and cached by
+      # the script.
+      - run: brew install boost
+      # On macOS this compiles BOTH platform header sets — the iOS pass needs
+      # an Apple SDK and is the half the ubuntu job below cannot run.
+      - run: npm run check:fabric-cpp
+      - run: npm run check:fabric-cpp:selftest
+      # The engine, at the podspec's C++ standard. See the same step in ci.yml
+      # for why platform/cpp needs its own invocation, and why the file list is
+      # built with `find` rather than a non-recursive shell glob.
+      - name: Compile the markdown engine (iOS header set)
+        run: |
+          files=$(find platform/cpp -path platform/cpp/vendor -prune -o -name '*.cpp' -print | sort)
+          if [ -z "$files" ]; then
+            echo "no .cpp found under platform/cpp — this gate would pass having compiled nothing"
+            exit 1
+          fi
+          echo "$files"
+          npm run check:fabric-cpp -- --syntax-only --platform ios $files
+      # The selection host itself: type-checked against React Native's real
+      # UIView (React) category, RCTViewManager and RCTUIManager, at the
+      # podspec's own deployment target and Swift version.
+      - run: npm run check:swift
+      - run: npm run check:swift:selftest
+
   release:
+    needs: macos-gates
     runs-on: ubuntu-latest
     permissions:
       contents: write # attach the packed tarball to the GitHub release
@@ -20,38 +143,46 @@ jobs:
           cache: npm
           registry-url: https://registry.npmjs.org
 
-      # The podspec reads its version out of package.json, so a tag that
-      # disagrees with it ships a pod CocoaPods cannot resolve.
-      - name: Check the tag matches package.json
-        run: |
-          declared=$(node -p "require('./package.json').version")
-          if [ "$GITHUB_REF_NAME" != "v$declared" ]; then
-            echo "tag $GITHUB_REF_NAME does not match package.json version $declared (expected v$declared)"
-            exit 1
-          fi
-
       - run: npm ci
+
+      # Preflight already proved this section exists; this run is the one whose
+      # output `gh release create --notes-file` reads.
+      #
+      # `set -o pipefail` is load-bearing: GitHub's default shell is
+      # `bash -e {0}`, where a pipeline's status is `tee`'s — always 0 — so a
+      # failure in changelog-section.mjs would leave an EMPTY notes file, pass
+      # this step, and publish a release with no notes. Preflight makes that
+      # unreachable in practice (same script, same checkout); it is one line to
+      # make the failure impossible rather than merely unlikely.
+      - name: Extract the release notes for this tag
+        run: |
+          set -o pipefail
+          node scripts/changelog-section.mjs "$GITHUB_REF_NAME" | tee "${RUNNER_TEMP:-/tmp}/release-notes.md"
 
       # THE SAME GATES CI RUNS, NOT A SUBSET. A tag can be pushed at any
       # commit — including one CI never saw, or one CI saw fail — and this
       # workflow is the last thing between the code and the npm registry.
       # Running only `npm test` here meant a release could ship a type error,
       # a codegen shape change that silently disables the component, or C++
-      # that no longer compiles against React Native's headers.
-      #
-      # Everything below runs on this ubuntu runner. Two gates need macOS and
-      # are deliberately not repeated here, because adding a job the publish
-      # depends on doubles the time between pushing a tag and having an
-      # artifact: the Swift gate (Xcode), and the iOS half of check:fabric-cpp
-      # (React Native's iOS renderer headers need an Apple SDK, so on this
-      # runner the script skips that pass out loud and gates the Android
-      # pass). CI runs both on macOS on every push to main and every pull
-      # request, which is where those regressions should be caught.
+      # that no longer compiles against React Native's headers. The two gates
+      # that need macOS ran in the job this one depends on.
       - run: npm run typecheck
       - run: npm run check:codegen
       - run: sudo apt-get update && sudo apt-get install -y libboost-dev
       - run: npm run check:fabric-cpp
       - run: npm run check:fabric-cpp:selftest
+      # The engine, under Linux clang and libstdc++ — the Android-side reading
+      # of the same translation units the macOS job checked against the iOS
+      # header set. Same `find` enumeration as ci.yml, for the same reason.
+      - name: Compile the markdown engine (Android header set)
+        run: |
+          files=$(find platform/cpp -path platform/cpp/vendor -prune -o -name '*.cpp' -print | sort)
+          if [ -z "$files" ]; then
+            echo "no .cpp found under platform/cpp — this gate would pass having compiled nothing"
+            exit 1
+          fi
+          echo "$files"
+          npm run check:fabric-cpp -- --syntax-only --platform android $files
 
       # HARD GATE, AND IT MUST COME BEFORE `npm test` — the same reasoning as
       # ci.yml. `describeNative` in src/engine/native/__tests__/support.ts is
@@ -64,9 +195,25 @@ jobs:
       - run: node scripts/build-node-addon.mjs
       - run: npm test
 
-      # dist/ is never committed: `npm pack` runs prepare/prepack, which build
-      # it, and verify:pack proves the resulting tarball is consumable.
+      # dist/ is never committed: `npm pack` runs `prepare`, which builds it,
+      # and verify:pack proves the resulting tarball is consumable.
       - run: npm run verify:pack
+      # Gates: adversarial input stays cheap in every stage, a never-anchoring
+      # stream stays cheap per chunk, and incremental projection still tracks
+      # the deltas rather than the document. Same steps, same thresholds and
+      # same reasoning as ci.yml.
+      - run: >-
+          npm run bench:pathological --
+          --require-engine
+          --budget-parse 750 --budget-repair 750 --budget-segment 200 --budget-project 750
+      # And the adversarial STREAMING shape, on the never-anchoring transcript.
+      # Same step, same budgets and same reasoning as ci.yml.
+      - run: >-
+          npm run bench:streaming --
+          --transcript conformance/fixtures/transcript-giant-list.json
+          --require-engine --repeat 1
+          --budget-chunk 20 --budget-finalize 50
+      - run: npm run bench:projection -- --require-engine
       - run: npm pack
 
       # The prebuilt tarball is the fast pin for consumers who cannot use the
@@ -79,7 +226,8 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" ./*.tgz --clobber
           else
-            gh release create "$GITHUB_REF_NAME" ./*.tgz --generate-notes --verify-tag
+            gh release create "$GITHUB_REF_NAME" ./*.tgz \
+              --notes-file "${RUNNER_TEMP:-/tmp}/release-notes.md" --verify-tag
           fi
 
       # Skipped, not failed, when no NPM_TOKEN secret is configured — the

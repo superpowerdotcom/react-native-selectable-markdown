@@ -100,6 +100,14 @@ class RNSMRunTextMeasurer {
    * layout context the content depends on — which is precisely what lets
    * RNSMRunHostShadowNode memoise the prepared content on that one scalar
    * and carry it across a clone.
+   *
+   * It is the Dynamic Type scale, and the two implementations apply it in
+   * the two places their platforms put it: iOS multiplies every font size
+   * and line height by it while building the string, and Android ignores the
+   * parameter because its builder sizes in SP (`PixelUtil.toPixelFromSP`,
+   * RunAttributedText.kt), which the platform scales by the same system font
+   * scale. Both therefore render a run at the user's text size, which is
+   * what the `<Text>` blocks around a run have always done.
    */
   std::shared_ptr<void> prepareContent(
       const SelectableRunHostProps& props,
@@ -107,6 +115,18 @@ class RNSMRunTextMeasurer {
 
   /*
    * Measures a prepared content handle against `layoutConstraints`.
+   *
+   * THE ANSWER IS THE RUN'S HEIGHT, NOT ITS TEXT'S. Both implementations add
+   * the vertical room a box decoration at the very EDGE of the run needs — a
+   * table that closes an answer has nothing under its bottom border, a code
+   * block that opens one has nothing above its top border, and everywhere
+   * else a box's padding is painted into the blank line the projection's
+   * '\n\n' block separator leaves and costs no height at all. The two hosts
+   * offset their text by the same amount so it lands inside that room
+   * (`RNSMAttributedText.runEdgeInsets(of:)` on iOS,
+   * `RunDecorations.edgePaddingDp` on Android), and each platform derives it
+   * ONCE, from the artefact its measure and draw paths already share: the
+   * prepared string on iOS, the one decorations parser on Android.
    *
    * `surfaceId` is not decoration. Android's implementation is a call to
    * `FabricUIManager.measure(surfaceId, componentName, …)`

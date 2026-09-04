@@ -387,13 +387,27 @@ const SETEXT_UNDERLINE = /^[ \t]{0,3}(=+|-+)[ \t]*$/;
  * grows left over its `#` run and right over the optional closing run,
  * setext grows down over its underline. Level alone cannot tell them apart
  * (a level-2 heading is either `##` or `---`), so both are probed.
+ *
+ * `hasContent` is what keeps an EMPTY ATX heading (`##`, `## ##`) out of the
+ * setext probe, and it has to be told rather than inferred. Such a heading
+ * has no content offsets at all, so the span handed here is the line the
+ * decoder LOCATED for it — the marker itself — and the backward scan for a
+ * `#` run finds nothing before it. That leaves `start === span.start`, which
+ * is also the signature of a setext heading, so the probe fired and `##\n-\n`
+ * read the `-` below as an underline: `heading[0,4]`, a slice holding a line
+ * the heading does not contain, with the list on that line then placed after
+ * it and landing on whatever came NEXT. Inside a container the damage reached
+ * further out — `> ##\n-\n` gave the heading, and so the blockquote around it,
+ * a `-` belonging to a list OUTSIDE the quote, leaving that list unanchored.
+ * A setext heading always has content, so refusing the probe when there is
+ * none costs nothing.
  */
-export function widenHeading(source: string, span: SourceSpan): SourceSpan {
+export function widenHeading(source: string, span: SourceSpan, hasContent = true): SourceSpan {
   if (!isAnchored(span)) return span;
   const start = widenAtxMarker(source, span.start);
   let end = trimSpanEnd(source, { start, end: lineEnd(source, span.end) }).end;
-  if (start === span.start) {
-    // No `#` run: setext, if the next line is an underline.
+  if (hasContent && start === span.start) {
+    // No `#` run before the content: setext, if the next line is an underline.
     const under = nextLineStart(source, span.end);
     if (under < source.length) {
       const underEnd = lineEnd(source, under);
@@ -422,11 +436,22 @@ function widenAtxMarker(source: string, contentStart: number): number {
  * Returns `closed` too, because "is the fence closed" is the same scan and
  * the document model needs it for streaming (`closed: false` renders as an
  * open block instead of flashing literal backticks).
+ *
+ * `hasContent` says where `span` came from, and it is load-bearing for an
+ * EMPTY fence. A block with code in it is reported by md4c with the offsets
+ * of that code, one line below the opening fence, so the fence is found by
+ * scanning the line above. A block with no code has no offsets at all and the
+ * decoder places it with `locateFirstNonBlankLine`, which lands on the fence
+ * line ITSELF — scanning the line above then walks out of the block entirely.
+ * `` ```js\nx\n```\n```\n `` did exactly that: the trailing empty fence found
+ * the *previous* block's closing fence and came back as `codeBlock[8,15]`,
+ * a span whose slice is "```\n```" and which overlaps the block before it.
  */
 export function widenCodeBlock(
   source: string,
   span: SourceSpan,
   fenceChar: string | null,
+  hasContent = true,
 ): { span: SourceSpan; closed: boolean } {
   if (!isAnchored(span)) return { span, closed: fenceChar === null };
   if (fenceChar === null) {
@@ -439,7 +464,7 @@ export function widenCodeBlock(
   // for the fence run inside that line rather than anchoring at its start,
   // so a fenced block inside a blockquote keeps the `> ` outside its span.
   const contentLineStart = lineStart(source, span.start);
-  const start = contentLineStart > 0
+  const start = hasContent && contentLineStart > 0
     ? findFenceStart(source, lineStart(source, contentLineStart - 1), contentLineStart, fenceChar)
     : span.start;
 
@@ -468,6 +493,25 @@ function findFenceStart(source: string, from: number, to: number, fenceChar: str
   return at !== -1 && at < to ? at : to;
 }
 
+/**
+ * The start of an indented code block: back to the line start when everything
+ * before md4c's content offset on that line is space or tab, and the content
+ * offset otherwise (a list item's `1.      ` prefix, a blockquote's `> `).
+ *
+ * THE INDENT IS INSIDE THE SPAN ON PURPOSE, and it is worth saying because it
+ * looks like an off-by-one against the node's `literal`. `\tfoo` gives a span
+ * whose slice is `\tfoo` — the whole construct, per `NodeBase.span` — while
+ * the literal is `foo\n`: md4c strips the indent that made it code and
+ * terminates every line itself. So slice and literal DIVERGE for this block
+ * in both directions at once, and at `\tfoo\tbaz\t\tbim` they even come out
+ * the same length (one leading tab traded for one trailing newline).
+ *
+ * That divergence is `mapSelection.ts`'s problem, not this function's:
+ * `literal()` aligns the two and pins the piece past the indent. Narrowing
+ * the span to the content instead would break the invariant every other block
+ * keeps — that `source.slice(span)` is the construct — and cost the copy path
+ * the indent that makes the paste re-parse as code.
+ */
 function indentedCodeStart(source: string, contentStart: number): number {
   const from = lineStart(source, contentStart);
   if (from === contentStart) return contentStart;

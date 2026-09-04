@@ -1,23 +1,36 @@
 import type { ComponentType, ReactNode, Ref, RefAttributes } from 'react';
-import { useMemo } from 'react';
+import { forwardRef, useImperativeHandle, useMemo, useRef } from 'react';
 import {
   Platform,
   UIManager,
   processColor,
 } from 'react-native';
-import type { NativeSyntheticEvent, StyleProp, ViewStyle } from 'react-native';
+import type {
+  NativeSyntheticEvent,
+  StyleProp,
+  ViewProps,
+  ViewStyle,
+} from 'react-native';
 import type { RunTextAttribute } from './runAttributes';
 import type { RunDecoration } from './runDecorations';
+import { isReservableEmbedSize } from './runEmbeds';
 import type { RunEmbed } from './runEmbeds';
 import type { RunPressable } from './runPressables';
-import { DEFAULT_SELECTION_ACTIONS } from './selectionActions';
-import type { SelectionAction } from './selectionActions';
+import { memoizedProcessColor } from './processedColors';
+import {
+  DEFAULT_SELECTION_ACTIONS,
+  encodeSelectionActions,
+} from './selectionActions';
+import type {
+  SelectionActionId,
+  SelectionActionInput,
+} from './selectionActions';
 
 export interface EmbedLayoutEvent {
-  /** The identifier `RunHost` sent with the range: its index into the
-   * `embeds` prop as passed, echoed back verbatim by the host. Handlers must
-   * bounds-check it — a report can race a prop swap by a frame, exactly like
-   * `pressableId`. */
+  /** The identifier `RunHost` sent with the range — the `embedId` of the
+   * `RunEmbed` it came from, echoed back verbatim by the host. Handlers must
+   * bounds-check it against the list the reporting projection sent: a report
+   * can race a prop swap by a frame, exactly like `pressableId`. */
   embedId: number;
   /** The reserved rect in the host view's coordinate space, points. */
   x: number;
@@ -42,14 +55,82 @@ export interface SelectionActionEvent {
   start: number;
   end: number;
   /**
-   * Which selection-menu action fired. Absent only under version skew (a
-   * native binary older than the `action` field, whose sole custom item was
-   * "Copy Markdown"); `handleSelectionAction` normalizes missing/unknown
-   * values to 'copy-markdown'.
+   * Which selection-menu action fired: the identifier half of the
+   * `selectionActions` entry the item was built from, so a consumer-defined
+   * action reports its own id here.
+   *
+   * Absent only under version skew (a native binary older than the `action`
+   * field, whose sole custom item was "Copy Markdown"), which is the one case
+   * `handleSelectionAction` resolves to 'copy-markdown'; every id that is
+   * actually present is reported unchanged.
    */
-  action?: SelectionAction;
+  action?: SelectionActionId;
   /** Informational (debugging/analytics); offsets are authoritative. */
   selectedText: string;
+}
+
+export interface SelectionChangeEvent {
+  /**
+   * Where the run's selection stands now: UTF-16 offsets into its projected
+   * display text, end-exclusive, clamped and ordered — the same unit and the
+   * same guarantees as `SelectionActionEvent`, with ONE difference that is
+   * the entire point of the event. `start === end` is a real payload here and
+   * means "nothing is selected in this run", which is what a floating toolbar
+   * has to hear to dismiss itself; `onSelectionAction` never emits an empty
+   * range.
+   *
+   * There is no `selectedText`: this fires on every frame of a
+   * selection-handle drag, and the caller already holds the projected text.
+   */
+  start: number;
+  end: number;
+}
+
+/**
+ * What `RunHost`'s ref exposes — the imperative half of the selection API for
+ * ONE run, dispatched as codegen commands to the native host.
+ *
+ * Offsets are the run's own display offsets, the unit every event on this
+ * component reports. `<SelectableMarkdown>` is the layer that speaks
+ * `SourceSpan`; a caller driving `RunHost` itself holds its own projection
+ * and can map with `mapSourceToRunRange`.
+ *
+ * Every method is a no-op — never a throw — when the host is not mounted, so
+ * a handle held across an unmount stays safe to call.
+ */
+export interface RunHostHandle {
+  /** Drop this run's selection and dismiss its menu. */
+  clearSelection(): void;
+  /**
+   * Select `[start, end)` of this run's current display text, returning
+   * whether the command was DISPATCHED to the host.
+   *
+   * FALSE MEANS NOTHING WAS ASKED OF THE PLATFORM, and it is a real answer:
+   * the host is not mounted yet (or no longer is), the run is not selectable
+   * on this platform — which includes the unsettled streaming tail on Android,
+   * where the whole tail policy is that a selection must not sit over text
+   * that is still being swapped — or the offsets are not finite. The native
+   * side refuses a non-selectable run too, so returning true for it would be
+   * reporting success for a call that provably did nothing.
+   *
+   * TRUE IS NOT A PROMISE ABOUT THE RESULTING RANGE. The host clamps and
+   * orders the offsets against the text it currently holds, so a range that
+   * survives as empty selects nothing — and on iOS collapses the run's
+   * selection to zero length rather than leaving the previous one alone. The
+   * command returns nothing, so this answer is JS's model of the host and not
+   * a report from it: it mirrors the `isSelectable`/`isTextSelectable` guard
+   * (which subsumes Android's `text as? Spannable` refusal — a `TextView`
+   * holds a non-spannable buffer only while `setTextIsSelectable(false)`), but
+   * it cannot see a `selectable` change that has committed here and not yet
+   * been pushed to the host.
+   *
+   * It presents no menu — the platform menu belongs to the user's gesture —
+   * and it issues no scroll of its own. It does take focus (iOS first
+   * responder, Android view focus), which is what makes a selection visible
+   * at all on both platforms, and a scrolling ancestor is entitled to react
+   * to that.
+   */
+  setSelection(start: number, end: number): boolean;
 }
 
 /**
@@ -109,13 +190,15 @@ interface NativeRunEmbedRange {
   /** UTF-16 offsets into `text`, end-exclusive; end === start + 1. */
   start: number;
   end: number;
-  /** Index into the `embeds` prop this component was given. */
+  /** The `embedId` of the `RunEmbed` this range came from. An index into
+   * `ProjectedRun.embeds`, which is not always this array's own index: an
+   * unreservable claim is dropped without renumbering the rest. */
   embedId: number;
   width: number;
   height: number;
 }
 
-interface NativeRunHostProps {
+interface NativeRunHostProps extends RunHostAccessibilityProps {
   text: string;
   /**
    * Styled ranges over `text`. The host renders the text verbatim either
@@ -139,19 +222,86 @@ interface NativeRunHostProps {
    */
   embeds: readonly NativeRunEmbedRange[];
   selectable: boolean;
-  selectionActions: readonly SelectionAction[];
+  /** Whether this host takes part in the process-wide one-active-selection
+   * coordination. See `RunHostProps.exclusiveSelection`. */
+  exclusiveSelection: boolean;
+  /** The wire form: one string per menu item, `id` or `id + U+001F + title`
+   * (see `encodeSelectionActions`), in menu order. */
+  selectionActions: readonly string[];
   onSelectionAction?: (e: NativeSyntheticEvent<SelectionActionEvent>) => void;
   onInlinePress?: (e: NativeSyntheticEvent<InlinePressEvent>) => void;
   onEmbedLayout?: (e: NativeSyntheticEvent<EmbedLayoutEvent>) => void;
+  onSelectionChange?: (e: NativeSyntheticEvent<SelectionChangeEvent>) => void;
   style?: StyleProp<ViewStyle>;
   testID?: string;
 }
+
+/**
+ * The generated `Commands` object from the same codegen spec — how JS tells
+ * one mounted host to do something now.
+ *
+ * Restated here for the same reason `NativeRunHostProps` is: nothing may
+ * `import` the spec module (see `loadNativeHost`), so what comes back from
+ * the call-expression `require` is cast to this shape. The first argument of
+ * each is the native component's ref, which is why `RunHost` forwards one.
+ */
+interface NativeHostCommands {
+  clearSelection(ref: unknown): void;
+  setSelection(ref: unknown, start: number, end: number): void;
+}
+
+/**
+ * The accessibility props a run host accepts and forwards VERBATIM to the
+ * native view.
+ *
+ * They cost nothing to support and were unreachable anyway: the codegen spec's
+ * `NativeProps extends ViewProps`, so the native host has always accepted the
+ * whole RN accessibility surface — but `RunHost` enumerates the props it
+ * passes (there is no spread of `props`), so nothing a consumer set could ever
+ * reach it. This type is what those props travel in, and it is a `Pick` rather
+ * than the whole of `ViewProps` on purpose: `style` and `testID` are declared
+ * separately with their own contracts, and layout/pointer props on a run's box
+ * are not something this component can honour without breaking the run's
+ * geometry.
+ *
+ * WHAT A SCREEN READER GETS WITHOUT THEM, so a consumer knows what these add.
+ * Each host is a plain `UITextView`/`TextView`, so its text is already read
+ * out and nothing is hidden — and headings and links inside it are not merely
+ * styled text: `resolveRunAttributes` marks heading ranges with `role`/
+ * `roleLevel` on the wire, and each host vends a real element per heading (a
+ * `UIAccessibilityElement` carrying the `.header` trait on iOS, a virtual node
+ * through the ExploreByTouch helper on Android), with link ranges vended the
+ * same way from `pressables`, and list items and table cells cross as
+ * `role: 'listItem'` / `role: 'tableCell'` (Android announces them through
+ * `CollectionItemInfo`, iOS vends an element per item or cell). What is
+ * missing is code-block and blockquote STRUCTURE: both read as one stretch of
+ * text.
+ *
+ * These props are the channel for saying what a run IS when that matters —
+ * labelling a document, or marking one run as a header. Use them knowing that
+ * `accessible` and `accessibilityRole` are the platform's "this subtree is one
+ * element" switch: setting either collapses the host to a single label and the
+ * per-heading and per-link elements below it stop being reachable.
+ */
+export type RunHostAccessibilityProps = Pick<
+  ViewProps,
+  | 'accessible'
+  | 'accessibilityLabel'
+  | 'accessibilityHint'
+  | 'accessibilityRole'
+  | 'accessibilityState'
+  | 'accessibilityValue'
+  | 'accessibilityLanguage'
+  | 'accessibilityElementsHidden'
+  | 'accessibilityLiveRegion'
+  | 'importantForAccessibility'
+>;
 
 const NATIVE_HOST_NAME = 'SelectableRunHost';
 
 /** Menu config sent when no listener exists: a menu item that visibly does
  * nothing is worse than no item, and the host cannot copy on its own. */
-const NO_ACTIONS: readonly SelectionAction[] = Object.freeze([]);
+const NO_ACTIONS: readonly string[] = Object.freeze([]);
 
 /** Shared empty attribute list, so an unstyled run does not allocate one. */
 const NO_ATTRIBUTES: readonly RunTextAttribute[] = Object.freeze([]);
@@ -169,36 +319,6 @@ const NO_PRESSABLES: readonly never[] = Object.freeze([]);
 /** Shared empty embed list; `never[]` for the same double duty as
  * NO_PRESSABLES. */
 const NO_EMBEDS: readonly never[] = Object.freeze([]);
-
-/**
- * `processColor` results, keyed by the colour string that produced them.
- *
- * The attribute array is rebuilt and re-sent on every streamed snapshot, and
- * every colour in it is one of a dozen constant theme tokens — the same
- * '#1f2328' re-normalized over and over, because `processColor` re-parses its
- * argument on every call. Measurement of a real streamed transcript put
- * `.map(toNativeAttribute)` at 3.5x the cost of `resolveRunAttributes` itself
- * for that reason alone, which made colour conversion the most expensive step
- * in a pipeline that also parses markdown.
- *
- * Keyed by the string and not by the attribute object, because the strings are
- * what repeat: two marks that both resolve to `theme.colors.codeText` are two
- * distinct objects carrying one identical colour. So the map is bounded by how
- * many distinct colour strings a theme ever produces, not by the length of the
- * stream — a handful, for the lifetime of the process.
- */
-const processedColors = new Map<string, ReturnType<typeof processColor>>();
-
-function memoizedProcessColor(color: string): ReturnType<typeof processColor> {
-  // `has`, not a truthiness test on `get`: `processColor` returns null for a
-  // string it cannot parse, and that null is worth caching too — otherwise a
-  // theme with one unparseable token pays the full parse on every snapshot,
-  // which is the exact cost this exists to remove.
-  if (!processedColors.has(color)) {
-    processedColors.set(color, processColor(color));
-  }
-  return processedColors.get(color);
-}
 
 function toNativeAttribute(attribute: RunTextAttribute): NativeTextAttribute {
   const { color, backgroundColor, ...rest } = attribute;
@@ -237,9 +357,21 @@ type NativeHostComponent = ComponentType<
 let cachedNativeHost: NativeHostComponent | null | undefined;
 
 /**
+ * The generated `Commands` object, resolved alongside the component and cached
+ * with it. Null when the spec did not resolve, and — separately — null when it
+ * resolved but carries no `Commands`, which is what a bundle built from an
+ * older version of this package's spec looks like. Both are the same answer
+ * here: no command can be dispatched, so the imperative handle's methods are
+ * no-ops rather than a TypeError inside a consumer's callback.
+ */
+let cachedNativeCommands: NativeHostCommands | null | undefined;
+
+/**
  * Resolves the native selection host once per JS runtime. Every step is
- * guarded: when the native module is not linked (Expo Go, web, tests) the JS
- * fallback renders instead of red-screening.
+ * guarded so the probe itself never throws: when the native module is not
+ * linked (Expo Go, web, tests) this returns null, and the caller turns that
+ * null into the named throw in the component body. There is no JS fallback to
+ * degrade into, so a null here is always a hard, visible failure.
  */
 function loadNativeHost(): NativeHostComponent | null {
   if (cachedNativeHost !== undefined) {
@@ -250,14 +382,27 @@ function loadNativeHost(): NativeHostComponent | null {
 }
 
 /**
+ * The commands half of the same resolution. It goes through `loadNativeHost`
+ * rather than requiring the spec a second time so that the `require` — and its
+ * failure — happen exactly once, in the one place that documents why it is a
+ * `require` at all.
+ */
+function loadNativeCommands(): NativeHostCommands | null {
+  if (cachedNativeCommands !== undefined) {
+    return cachedNativeCommands;
+  }
+  loadNativeHost();
+  return cachedNativeCommands ?? null;
+}
+
+/**
  * THE PROBE IS `hasViewManagerConfig`, NOT `getViewManagerConfig`, AND THAT IS
  * THE POINT. Under bridgeless — every new-architecture app — `getViewManagerConfig`
  * does not consult the Fabric component registry at all: with no ViewConfig
  * interop layer installed it raises a soft error and returns null
  * (BridgelessUIManager.js:273-291). A correctly linked Fabric component would
- * therefore be reported as missing, every run would drop to the
- * `<Text selectable>` fallback, and `onSelectionAction` and both custom menu
- * items would silently be gone on exactly the architecture this component was
+ * therefore be reported as missing, the host would never resolve, and every
+ * run would throw at render on exactly the architecture this component was
  * ported for. `hasViewManagerConfig` exists on both UIManager implementations
  * and asks the right registry on each: a lazy ViewManager lookup on paper
  * (PaperUIManager.js:105-107), `unstable_hasComponent` under bridgeless
@@ -314,6 +459,7 @@ function loadNativeHost(): NativeHostComponent | null {
  *    tier 2 and gets the throw, which says what to fix.
  */
 function resolveNativeHost(): NativeHostComponent | null {
+  cachedNativeCommands = null;
   let registered: boolean | undefined;
   try {
     registered = UIManager.hasViewManagerConfig?.(NATIVE_HOST_NAME);
@@ -327,8 +473,15 @@ function resolveNativeHost(): NativeHostComponent | null {
   try {
     const spec = require('./SelectableRunHostNativeComponent') as {
       default?: ComponentType<NativeRunHostProps>;
+      Commands?: NativeHostCommands;
     };
     if (spec.default) {
+      // Read off the SAME module object as the component, in the same tier.
+      // The babel plugin emits both from one rewrite of this file, so a spec
+      // that produced a component and no `Commands` is a version skew (a
+      // bundle built against a spec older than the commands) rather than a
+      // state this package can reach — hence the guard, not an assertion.
+      cachedNativeCommands = spec.Commands ?? null;
       return spec.default;
     }
   } catch {
@@ -339,14 +492,14 @@ function resolveNativeHost(): NativeHostComponent | null {
   return null;
 }
 
-export interface RunHostProps {
+export interface RunHostProps extends RunHostAccessibilityProps {
   /** The run's projected plain display text (drives the native host). */
   text: string;
   /**
    * Styled ranges over `text` for the native host, from
-   * `resolveRunAttributes`. The JS fallback ignores them — it renders the
-   * rich `children` tree instead, which carries the same styling as real
-   * React Native elements.
+   * `resolveRunAttributes`. This is the only channel that styles a run: the
+   * host renders `text` plus these ranges and nothing else, so a run handed
+   * no attributes draws as unstyled plain text.
    */
   attributes?: readonly RunTextAttribute[];
   /**
@@ -359,10 +512,8 @@ export interface RunHostProps {
   decorations?: readonly RunDecoration[];
   /**
    * Tappable ranges over `text` for the native host, from
-   * `resolveRunPressables`. The JS fallback ignores them for the same reason
-   * it ignores `attributes`: its rich `children` tree already carries a per-
-   * node `onPress`. Without an `onInlinePress` listener the list is not sent,
-   * so the host never intercepts a tap it has nothing to do with.
+   * `resolveRunPressables`. Without an `onInlinePress` listener the list is
+   * not sent, so the host never intercepts a tap it has nothing to do with.
    */
   pressables?: readonly RunPressable[];
   /**
@@ -378,25 +529,95 @@ export interface RunHostProps {
   selectable: boolean;
   /**
    * Which custom items the platform selection menu offers, in order.
-   * Defaults to both actions. The system Copy item is always kept on both
-   * platforms regardless of this list.
+   * Defaults to both built-in actions. The system Copy item is always kept
+   * on both platforms regardless of this list.
+   *
+   * An entry is a bare identifier — which keeps the host's own localised
+   * title, and is what the two built-ins want — or an `{ id, title }` pair,
+   * which is how the menu gets its strings from JS (and the only way to
+   * localise both platforms from one place). A consumer-defined id needs a
+   * title: neither host has a string for an id it does not know, so an
+   * untitled one is dropped from the menu. See
+   * {@link SelectionActionSpec}.
    */
-  selectionActions?: readonly SelectionAction[];
-  /** True while the run still contains unsettled streaming content. */
+  selectionActions?: readonly SelectionActionInput[];
+  /**
+   * True while the run still contains unsettled streaming content — what
+   * `<SelectableMarkdown>` passes as `streaming && run.span.end > settledUntil`.
+   *
+   * IT OVERRIDES `selectable`, per platform, rather than combining with it:
+   * set, the run is selectable on iOS and not on Android regardless of what
+   * `selectable` says (see `effectiveSelectable` in the component body for
+   * why each platform answers the way it does). A host rendering runs directly
+   * that leaves this unset gets `selectable` verbatim and owns the tail policy
+   * itself.
+   */
   unsettledTail?: boolean;
+  /**
+   * Whether this host takes part in the process-wide one-active-selection
+   * coordination. Defaults to true, which is the behaviour that predates the
+   * prop.
+   *
+   * Both platforms let two text views hold a selection at once — neither
+   * clears one because the other started — so each host records itself as the
+   * process's one selection owner and clears the host that held the slot
+   * before. What that buys is one selection in STATE: focus is what already
+   * kept the screen to one highlight (see below), so without the coordination
+   * a transcript would carry live invisible ranges in every run the reader had
+   * ever swept.
+   *
+   * FALSE OPTS THIS HOST OUT IN BOTH DIRECTIONS: it clears nobody, and
+   * because it never takes the slot, nobody clears it. Two selections held at
+   * once is only reachable that way — an opt-out that only stopped the
+   * clearing would still lose the first selection to the next host that
+   * selected.
+   *
+   * WHAT SURVIVES IS THE RANGE, NOT THE HIGHLIGHT. Both platforms draw a
+   * selection only in the view that holds focus: a non-editable `UITextView`
+   * paints no selection, no handles and no menu unless it is first responder,
+   * and Android's `TextView` draws one only while it is focused or pressed. So
+   * once a second host takes focus the first host's selection is still THERE —
+   * its `selectedRange`/`Selection` stands, `onSelectionChange` has already
+   * reported it, `getSelection()` still answers with it, and its copy payload
+   * is still exact — but the user sees no highlight on it. That is what makes
+   * "select in A, select in B, merge the two payloads" reachable in code while
+   * looking to the reader like only one selection exists.
+   *
+   * So it is opt-in and off by default, and a consumer using it owns the
+   * feedback: draw your own highlight from the reported spans if the first
+   * selection has to stay visible.
+   *
+   * The coordination is per PROCESS, not per document, which is the other
+   * reason this prop exists: two unrelated `<SelectableMarkdown>` trees in a
+   * split view clear each other without it.
+   */
+  exclusiveSelection?: boolean;
   onSelectionAction?: (e: SelectionActionEvent) => void;
+  /**
+   * Fired whenever this run's selection changes — a gesture, a command, a
+   * text swap that moved it, or another host taking the one-active-selection
+   * slot. Unlike `onSelectionAction` it reports EMPTY selections, which is
+   * how a consumer's own toolbar learns to dismiss itself.
+   *
+   * Both hosts dedupe before dispatching: an unchanged range is not
+   * re-announced, so a streamed snapshot that re-applies identical text emits
+   * nothing. iOS re-announces an unchanged RANGE when the characters under it
+   * were rewritten, because the payload a caller derives from those offsets
+   * would otherwise be stale; Android needs no such rule, since `setText`
+   * there drops the selection outright.
+   */
+  onSelectionChange?: (e: SelectionChangeEvent) => void;
   /**
    * Fired by the native host when a single tap lands inside one of
    * `pressables`. `pressableId` is the range's index into that array, which
    * is how the caller gets back to the URL it kept: the href deliberately
-   * never crosses the bridge. Native host only — the JS fallback's links
-   * press through their own `<Text onPress>`.
+   * never crosses the bridge.
    */
   onInlinePress?: (e: InlinePressEvent) => void;
   /**
    * Fired by the native host, per embed, after layout with the reserved
-   * rect (re-fired only when the rect moved). `embedId` is the range's index
-   * into `embeds`, which is how the caller gets back to the node and render
+   * rect (re-fired only when the rect moved). `embedId` is the range's own
+   * `embedId`, which is how the caller gets back to the node and render
    * function it kept: only offsets and sizes cross the bridge.
    */
   onEmbedLayout?: (e: EmbedLayoutEvent) => void;
@@ -434,8 +655,18 @@ export interface RunHostProps {
  * what lets a run carry code blocks, tables and thematic breaks: they project
  * text and marks like anything else, whereas their `children` renderers emit
  * views that could never have lived inside a text host.
+ *
+ * IT FORWARDS A REF, and the ref is a `RunHostHandle` rather than the native
+ * view. Commands dispatch on the native component's own ref, which this
+ * component holds privately: handing it out would put the generated
+ * `Commands` object, the native offsets and the "is it even mounted" question
+ * into every caller. The handle is two methods with the same clamping
+ * contract as the events.
  */
-export function RunHost(props: RunHostProps): ReactNode {
+function RunHostWithRef(
+  props: RunHostProps,
+  ref: Ref<RunHostHandle>,
+): ReactNode {
   const {
     text,
     attributes = NO_ATTRIBUTES,
@@ -443,24 +674,93 @@ export function RunHost(props: RunHostProps): ReactNode {
     pressables = NO_PRESSABLES,
     embeds = NO_EMBEDS,
     selectable,
+    exclusiveSelection = true,
     selectionActions = DEFAULT_SELECTION_ACTIONS,
     unsettledTail = false,
     onSelectionAction,
     onInlinePress,
     onEmbedLayout,
+    onSelectionChange,
     style,
     testID,
+    // Everything the interface still holds is a `RunHostAccessibilityProps`
+    // field, forwarded verbatim below. A rest element rather than ten more
+    // names, so a prop added to that type reaches the host without a second
+    // edit here — the whole reason the type is a `Pick` and not `ViewProps`.
+    ...accessibility
   } = props;
+
+  // The native component's ref, kept private (see the class doc). Null
+  // whenever nothing is mounted — before the first commit, and after
+  // unmount — which is what makes every handle method a no-op rather than a
+  // throw at those moments.
+  const nativeRef = useRef<unknown>(null);
 
   // Per-platform tail policy (runs.ts emits tail runs with selectable:false
   // as a conservative default; the view decides). Android's selection
   // ActionMode misbehaves (and in some OEM builds crashes) when the text
   // under an active selection is swapped, so the unsettled tail is not
-  // selectable there until it settles. iOS's host preserves selection across
-  // text swaps, so the tail stays selectable.
+  // selectable there until it settles.
+  //
+  // iOS keeps it selectable because its host carries a selection across a
+  // text swap: an append splices the new tail in and leaves the selection
+  // alone, and a swap that is not an append clamps it into the new text. That
+  // holds only for as long as the HOST LIVES, which is why the tail run's
+  // React key is its role and not its start offset (`runKey`): keyed on the
+  // start it moved at every settle, and a remounted host is reset — text
+  // cleared, `selectedRange` zeroed, first responder resigned — so a
+  // selection made in the live tail was destroyed by the next settled block
+  // rather than clamped through it.
   const effectiveSelectable = unsettledTail
     ? Platform.OS === 'ios'
     : selectable;
+
+  // Read by `setSelection` below at CALL time. The policy flips once per
+  // settle for the tail run, and rebuilding the handle each time would break
+  // the promise that a caller may hold one across a whole stream, so the
+  // current answer is parked in a ref instead of in the handle's deps.
+  const selectableRef = useRef(effectiveSelectable);
+  selectableRef.current = effectiveSelectable;
+
+  // The handle is rebuilt on no dependency at all: it reads `nativeRef.current`
+  // at call time, so it never goes stale and never has to be re-created when
+  // the run's text changes. A caller may therefore hold it across an entire
+  // stream.
+  useImperativeHandle(
+    ref,
+    () => ({
+      clearSelection() {
+        const commands = loadNativeCommands();
+        if (!commands || nativeRef.current === null) return;
+        commands.clearSelection(nativeRef.current);
+      },
+      setSelection(start: number, end: number): boolean {
+        const commands = loadNativeCommands();
+        if (!commands || nativeRef.current === null) return false;
+        // The same answer the host would give, given here so the caller hears
+        // it. Both hosts refuse the command on a non-selectable text view
+        // (`guard textView.isSelectable` / `if (!textView.isTextSelectable)`),
+        // and JS is the side that knows the tail policy produced that state —
+        // see `effectiveSelectable` above. Reporting true here would tell
+        // `<SelectableMarkdown>` that a run had taken a span it cannot show.
+        if (!selectableRef.current) return false;
+        // Integers only. The generated Android delegate reads the arguments
+        // with `ReadableArray.getInt`, which throws on a fractional number,
+        // and a fractional UTF-16 offset is meaningless anyway. Ordering and
+        // clamping to the text are the hosts' job — they alone know what the
+        // text currently is — but a non-finite value cannot survive that, so
+        // it is refused here.
+        if (!Number.isFinite(start) || !Number.isFinite(end)) return false;
+        commands.setSelection(
+          nativeRef.current,
+          Math.trunc(Math.min(start, end)),
+          Math.trunc(Math.max(start, end)),
+        );
+        return true;
+      },
+    }),
+    [],
+  );
 
   // Colour conversion is per attribute and this array is re-sent on every
   // streamed snapshot, so it is memoized on the identity `resolveRunAttributes`
@@ -495,9 +795,25 @@ export function RunHost(props: RunHostProps): ReactNode {
   // The node and copy text are dropped here the way pressables drop the
   // href: the host gets ranges, sizes and ids, nothing else. Memoized like
   // the rest — the array is re-sent on every streamed snapshot.
+  //
+  // The size filter is for the callers that skip `resolveRunEmbeds`: this
+  // component is exported, so a consumer can hand `embeds` straight to it, and
+  // a size that cannot be reserved (non-positive, or infinite) must not reach
+  // a platform text store — see `isReservableEmbedSize`. Ids are carried, not
+  // re-indexed, so a filtered entry never renumbers the rest.
+  // Packed to the wire form once per list identity. The hosts diff this prop
+  // by VALUE (a `std::vector<std::string>` comparison on iOS, a list equality
+  // check on Android), so a fresh array of equal strings would cost nothing
+  // even unmemoized — this is here to keep an inline `['copy-text']` from
+  // re-packing on every streamed snapshot, like the arrays above.
+  const nativeSelectionActions = useMemo<readonly string[]>(
+    () => encodeSelectionActions(selectionActions),
+    [selectionActions],
+  );
+
   const nativeEmbeds = useMemo<readonly NativeRunEmbedRange[]>(
     () =>
-      embeds.map((embed) => ({
+      embeds.filter(isReservableEmbedSize).map((embed) => ({
         start: embed.start,
         end: embed.end,
         embedId: embed.embedId,
@@ -541,12 +857,20 @@ export function RunHost(props: RunHostProps): ReactNode {
 
   return (
     <Native
+      {...accessibility}
       attributes={nativeAttributes}
       decorations={nativeDecorations}
       // Always sent, unlike pressables: the reservation is layout-affecting,
       // so gating it on the listener would make the run measure differently
       // depending on whether anyone positions overlays.
       embeds={nativeEmbeds}
+      // Always sent, and NOT gated on a listener the way `selectionActions`
+      // and `pressables` are. Those two are gated because sending them turns
+      // something ON in the host (a menu item, a tap interception) that would
+      // then report nowhere. This one turns a coordination OFF, so a host
+      // that does not hear it must keep coordinating — which is what the
+      // codegen default of true already says.
+      exclusiveSelection={exclusiveSelection}
       onEmbedLayout={
         onEmbedLayout ? (event) => onEmbedLayout(event.nativeEvent) : undefined
       }
@@ -558,12 +882,33 @@ export function RunHost(props: RunHostProps): ReactNode {
           ? (event) => onSelectionAction(event.nativeEvent)
           : undefined
       }
+      // WHAT LEAVING THIS UNDEFINED SAVES, AND WHAT IT DOES NOT. Fabric has
+      // no channel for telling a host whether JS is listening — event
+      // handlers are not props on the C++ side — so both hosts dispatch a
+      // selection change whether or not anyone reads it, exactly as React
+      // Native's own TextInput does. What the gate saves is everything ABOVE
+      // the bridge: with no handler nothing maps the offsets through the
+      // piece table or slices the display text, which is the per-frame cost
+      // during a handle drag. The hosts' own dedupe is what keeps the
+      // dispatch itself down to genuine changes.
+      onSelectionChange={
+        onSelectionChange
+          ? (event) => onSelectionChange(event.nativeEvent)
+          : undefined
+      }
       pressables={onInlinePress ? nativePressables : NO_PRESSABLES}
+      ref={nativeRef}
       selectable={effectiveSelectable}
-      selectionActions={onSelectionAction ? selectionActions : NO_ACTIONS}
+      selectionActions={onSelectionAction ? nativeSelectionActions : NO_ACTIONS}
       style={style}
       testID={testID}
       text={text}
     />
   );
 }
+
+export const RunHost = forwardRef(RunHostWithRef);
+// Without this React DevTools and every error boundary say
+// `ForwardRef(RunHostWithRef)`, which names an implementation detail in a
+// stack trace a consumer reads.
+RunHost.displayName = 'RunHost';

@@ -8,6 +8,7 @@ import type {
 } from '../document/nodes';
 import type { Engine } from '../engine/Engine';
 import { parseDocument } from '../engine/Engine';
+import type { ResolvedEngineOptions } from '../engine/options';
 import {
   describeNative,
   linkNativeEngineAsDefault,
@@ -253,10 +254,16 @@ describe('StreamSession (fake engine)', () => {
     expect(s.snapshot().settledUntil).toBe(0);
   });
 
-  test('open display math blocks settlement only when math is enabled', () => {
+  test('an unclosed $$ is not a reason to hold the anchor', () => {
+    // A `$$…$$` span is INLINE: it ends with its block, so a paragraph left
+    // holding one unclosed is finished text the moment a blank line follows
+    // it — nothing appended later can reopen it — and it settles with math
+    // on exactly as with math off. Carrying the state across the blank line
+    // instead froze the anchor at 0 for the rest of the stream on prose that
+    // merely contained a doubled currency sign.
     const withMath = make({ options: { extensions: { math: true } } });
     withMath.append('$$\nx\n\ny');
-    expect(withMath.snapshot().settledUntil).toBe(0);
+    expect(withMath.snapshot().settledUntil).toBe(6);
 
     const withoutMath = make();
     withoutMath.append('$$\nx\n\ny');
@@ -359,6 +366,158 @@ describe('StreamSession (fake engine)', () => {
     expect(snap.phase).toBe('streaming');
     expect(snap.document.source).toBe('done. more **open**');
   });
+
+  test('snapshot() is referentially stable before the first commit', () => {
+    // `useSyncExternalStore((cb) => s.subscribe(cb), () => s.snapshot())` is
+    // the documented integration, and React re-renders until getSnapshot
+    // stops handing back a new object — so the pre-stream snapshot of a row
+    // that mounted before its answer started must be one object, not one per
+    // render.
+    const s = make();
+    const first = s.snapshot();
+    expect(s.snapshot()).toBe(first);
+    expect(first.revision).toBe(0);
+    expect(first.phase).toBe('streaming');
+    s.append('x');
+    expect(s.snapshot()).not.toBe(first);
+    expect(s.snapshot()).toBe(s.snapshot());
+  });
+
+  test('a listener that appends does not overtake the listeners after it', () => {
+    const s = make();
+    const later: Array<[number, string]> = [];
+    let reentered = false;
+    s.subscribe(() => {
+      if (reentered) {
+        return;
+      }
+      reentered = true;
+      s.append(' and more');
+    });
+    s.subscribe((snap) => later.push([snap.revision, snap.document.source]));
+    s.append('first');
+    // Revision 2 was committed from inside revision 1's delivery. The second
+    // listener must still see 1 before 2: handed them the other way round, a
+    // listener that stores its argument (every React store does) would end on
+    // the stale document while the session says otherwise.
+    expect(later).toEqual([
+      [1, 'first'],
+      [2, 'first and more'],
+    ]);
+    expect(s.snapshot().revision).toBe(2);
+  });
+
+  test('a listener that mutates unconditionally throws instead of spinning', () => {
+    const s = make();
+    const seen: number[] = [];
+    s.subscribe((snap) => {
+      seen.push(snap.revision);
+      s.append('.'); // never stops re-entering
+    });
+    // Delivering in revision order means the nested commit is drained by the
+    // outer loop rather than the stack, so this cannot end in a stack
+    // overflow any more; without a bound it would simply hang.
+    expect(() => s.append('first')).toThrow(/kept mutating the session/);
+    expect(seen.length).toBeGreaterThan(1000);
+  });
+
+  test('a throwing listener does not leave the listeners after it a revision behind', () => {
+    const s = make();
+    const early: number[] = [];
+    const late: number[] = [];
+    let reentered = false;
+    s.subscribe((snap) => {
+      early.push(snap.revision);
+      if (!reentered) {
+        reentered = true;
+        s.append(' and more'); // commits revision 2 mid-pass
+      }
+      throw new Error('listener boom');
+    });
+    s.subscribe((snap) => late.push(snap.revision));
+    // The error still surfaces to the caller…
+    expect(() => s.append('first')).toThrow('listener boom');
+    // …but delivery finished: both listeners saw both revisions, in order,
+    // and nobody is left behind the session's own snapshot.
+    expect(early).toEqual([1, 2]);
+    expect(late).toEqual([1, 2]);
+    expect(s.snapshot().revision).toBe(2);
+  });
+
+  test('an append whose whole tail is suppressed never reaches the engine', () => {
+    const parsed: string[] = [];
+    const recording: Engine = {
+      name: 'recording',
+      parse(source: string, options: ResolvedEngineOptions): ParsedDocument {
+        parsed.push(source);
+        return fakeEngine.parse(source, options);
+      },
+    };
+    const s = new StreamSession({ engine: recording });
+    // A bare marker line is suppressed whole (repair handler 7), leaving
+    // empty parse input — which `parse` short-circuits. So it is the first
+    // append with non-empty REPAIRED input, not the first non-empty append,
+    // that reaches the engine (and that an unlinked engine would throw on).
+    s.append('#');
+    expect(parsed).toEqual([]);
+    expect(s.length).toBe(1);
+    expect(s.snapshot().revision).toBe(1);
+    expect(s.snapshot().document.source).toBe('');
+    s.append(' Title');
+    expect(parsed).toEqual(['# Title']);
+  });
+
+  test('an engine that throws leaves the session exactly as it was', () => {
+    let boom = false;
+    const throwing: Engine = {
+      name: 'throws-on-demand',
+      parse(source: string, options: ResolvedEngineOptions): ParsedDocument {
+        if (boom) {
+          throw new Error('engine boom');
+        }
+        return fakeEngine.parse(source, options);
+      },
+    };
+    const s = new StreamSession({ engine: throwing });
+    s.append('one.\n\ntwo.\n\nthree');
+    const before = s.snapshot();
+    expect(before.settledUntil).toBe(12);
+
+    boom = true;
+    expect(() => s.append(' more.')).toThrow('engine boom');
+    // The append is atomic up to its commit: `length` must not count text no
+    // snapshot contains, and the anchor must not have advanced over a parse
+    // that never happened.
+    expect(s.length).toBe(17);
+    expect(s.snapshot()).toBe(before);
+    expect(s.snapshot().settledUntil).toBe(12);
+
+    boom = false;
+    s.append(' more.');
+    expect(s.length).toBe(23);
+    expect(s.snapshot().document.source).toBe('one.\n\ntwo.\n\nthree more.');
+  });
+
+  test('dispose() makes the session inert and drops its subscribers', () => {
+    const s = make();
+    const seen: number[] = [];
+    s.subscribe((snap) => seen.push(snap.revision));
+    s.append('one');
+    s.dispose();
+    s.append(' two');
+    s.finalize();
+    s.replace('something else entirely');
+    expect(seen).toEqual([1]);
+    expect(s.length).toBe(3);
+    expect(s.snapshot().document.source).toBe('one');
+    expect(s.snapshot().phase).toBe('streaming');
+    // Idempotent, and it cannot be undone by subscribing again.
+    s.dispose();
+    const later: number[] = [];
+    s.subscribe((snap) => later.push(snap.revision));
+    s.append('x');
+    expect(later).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -444,6 +603,37 @@ describe('StreamSession repair options', () => {
 linkNativeEngineAsDefault();
 
 describeNative('StreamSession + the md4c engine (integration)', () => {
+  /*
+   * Nesting depth is whatever the model emitted, and md4c parses 40 kB of
+   * '> ' without complaint, so every JavaScript walk the session makes over
+   * the result has to survive it too. This is the whole session path at
+   * once: the splice (`shiftSpans`), the placeholder trim, the anchor scan,
+   * and — because the quote is followed by a blank line, so it FREEZES — the
+   * settled-block identity check in `finalize`, which is the last of them
+   * that recursed. Each one of them threw `RangeError: Maximum call stack
+   * size exceeded` at some depth, from an ordinary streamed append or from
+   * finalize, long after the parser itself had coped.
+   */
+  test('a 20000-level blockquote streams, freezes and finalizes', () => {
+    const source = `${'> '.repeat(20_000)}echo\n\nnext paragraph\n`;
+    const session = new StreamSession();
+    for (let i = 0; i < source.length; i += 64) {
+      session.append(source.slice(i, i + 64));
+    }
+    const streamed = session.snapshot();
+    expect(streamed.document.source).toBe(source);
+    expect(streamed.settledUntil).toBeGreaterThan(0);
+
+    // Finalize re-parses and swaps the frozen block back in by structure,
+    // which is the walk that used to throw here even though the whole
+    // document had already streamed.
+    session.finalize();
+    const done = session.snapshot();
+    expect(done.document.source).toBe(source);
+    expect(done.document.blocks).toHaveLength(2);
+    expect(done.document.blocks[0].kind).toBe('blockquote');
+  });
+
   test('char-by-char stream finalizes to the same document as a fresh parse', () => {
     const source = '# Title\n\nHello **world** and `code`.\n\n- one\n- two\n';
     const session = new StreamSession();
@@ -487,6 +677,171 @@ describeNative('StreamSession + the md4c engine (integration)', () => {
     session.append(' continues');
     const b = session.snapshot();
     expect(b.document.blocks[0]).toBe(a.document.blocks[0]);
+  });
+
+  test('a link reference definition unfreezes the prefix it rewrites', () => {
+    // A definition acts at a distance: this one turns the `[foo]` in the
+    // FIRST paragraph — long since frozen by the anchor, and streamed as
+    // literal text for most of the run — into a resolved reference link. The
+    // session therefore stops freezing the moment it sees a definition, so
+    // the snapshot (and finalize) show what a fresh parse shows rather than
+    // the settled-but-stale literal.
+    const source = 'See [foo] here.\n\nmiddle paragraph\n\n[foo]: https://example.com\n';
+    const session = new StreamSession();
+    for (const ch of source) {
+      session.append(ch);
+    }
+    const mid = session.snapshot();
+    expect(mid.settledUntil).toBe(0);
+    const para = mid.document.blocks[0] as ParagraphNode;
+    expect(para.children.map((c) => c.kind)).toEqual(['text', 'link', 'text']);
+    expect(para.children[1]).toMatchObject({ href: 'https://example.com' });
+
+    session.finalize();
+    expect(JSON.parse(JSON.stringify(session.snapshot().document.blocks))).toEqual(
+      JSON.parse(JSON.stringify(parseDocument(source).blocks)),
+    );
+  });
+
+  test.each([
+    [
+      'a list item',
+      'See [foo] here.\n\nmiddle paragraph\n\n- [foo]: https://example.com\n',
+    ],
+    [
+      'a blockquote',
+      'See [foo] here.\n\nmiddle paragraph\n\n> [foo]: https://example.com\n',
+    ],
+    [
+      'a label spanning a line break',
+      'See [foo bar] here.\n\nmiddle paragraph\n\n[foo\nbar]: https://example.com\n',
+    ],
+    [
+      "a list item's content indent, with no marker of its own",
+      'See [foo] here.\n\n- item\n\n    [foo]: https://example.com\n',
+    ],
+    [
+      'a nested list item, four columns in',
+      'See [foo] here.\n\n- outer\n  - inner\n\n    [foo]: https://example.com\n',
+    ],
+  ])(
+    'a definition inside %s unfreezes the prefix it rewrites too',
+    (_shape, source) => {
+      // md4c honours a definition behind a container marker and one whose
+      // label spans a line break; a scanner that only recognised
+      // `^ {0,3}[label]:` on a top-level line left the settled paragraph
+      // showing literal '[foo]' while a fresh parse of the same text showed
+      // the resolved link.
+      const session = new StreamSession();
+      for (const ch of source) {
+        session.append(ch);
+      }
+      const mid = session.snapshot();
+      expect(mid.settledUntil).toBe(0);
+      // The first paragraph — frozen literal text before the definition was
+      // seen — now shows the resolved reference link a fresh parse shows.
+      // (Only the paragraph: a trailing container holding nothing but the
+      // definition is an empty placeholder block, which the streaming
+      // document trims and a fresh parse keeps.)
+      const para = mid.document.blocks[0] as ParagraphNode;
+      expect(JSON.parse(JSON.stringify(para))).toEqual(
+        JSON.parse(JSON.stringify(parseDocument(source).blocks[0])),
+      );
+      expect(para.children.map((c) => c.kind)).toEqual(['text', 'link', 'text']);
+
+      session.finalize();
+      expect(
+        JSON.parse(JSON.stringify(session.snapshot().document.blocks)),
+      ).toEqual(JSON.parse(JSON.stringify(parseDocument(source).blocks)));
+    },
+  );
+
+  test.each([
+    ['one code point at a time', (t: string) => [...t]],
+    ['line by line', (t: string) => t.split(/(?<=\n)/)],
+    ['all at once', (t: string) => [t]],
+  ])(
+    'a content-indented definition is found the same way, %s',
+    (_name, split) => {
+      // Where the deltas fall must not change the answer. It used to: a line
+      // first seen as '    ' or '- ' skipped the "could this be a
+      // definition" test on every later append, so a char-by-char stream
+      // found definitions a line-by-line stream missed AND ruled in prose
+      // that is not one.
+      const source =
+        'See [foo] here.\n\n- item\n\n    [foo]: https://example.com\n\ntail text\n';
+      const session = new StreamSession();
+      const settled: number[] = [];
+      for (const delta of split(source)) {
+        session.append(delta);
+        settled.push(session.snapshot().settledUntil);
+      }
+      // The definition rewrites the first paragraph, so nothing may stay
+      // frozen once it is here.
+      expect(session.snapshot().settledUntil).toBe(0);
+      const para = session.snapshot().document.blocks[0] as ParagraphNode;
+      expect(para.children.map((c) => c.kind)).toEqual(['text', 'link', 'text']);
+      session.finalize();
+      expect(
+        JSON.parse(JSON.stringify(session.snapshot().document.blocks)),
+      ).toEqual(JSON.parse(JSON.stringify(parseDocument(source).blocks)));
+    },
+  );
+
+  test.each([
+    ['a list item holding a colon', '- see [a]: b'],
+    ['a second list item holding one', '- item one\n- item two [x]: y'],
+    ['a quoted line holding one', '> see [a]: b'],
+    ['an indented code line', '    arr[0]: x'],
+    ['a year at the start of a line', '2024 was [a]: year'],
+  ])('%s is not a definition, however it is chunked', (_name, opener) => {
+    // The same divergence in the other direction: none of these is a link
+    // reference definition (a fresh parse of each finds no link), so none of
+    // them may stand the anchor down — which is what a resumed scan that
+    // only hunts for ']:' did on a one-code-point-per-append stream.
+    const source = `${opener}\n\nsecond paragraph\n\nthird paragraph\n\ntail`;
+    expect(JSON.stringify(parseDocument(source))).not.toContain('"kind":"link"');
+    const highWater = (deltas: string[]): number => {
+      const session = new StreamSession();
+      let best = 0;
+      for (const delta of deltas) {
+        session.append(delta);
+        best = Math.max(best, session.snapshot().settledUntil);
+      }
+      return best;
+    };
+    const byChar = highWater([...source]);
+    expect(byChar).toBeGreaterThan(0);
+    expect(byChar).toBe(highWater(source.split(/(?<=\n)/)));
+    expect(byChar).toBe(highWater([source]));
+  });
+
+  test('prose that merely contains brackets still settles', () => {
+    // The definition scan must not stand the anchor down for every `[`: a
+    // bracket in ordinary prose is not a definition, and treating it as one
+    // would cost every LLM answer with a citation marker its whole anchor.
+    const session = new StreamSession();
+    session.append('Plain [not a ref] text.\n\nSecond paragraph.\n\nThird');
+    expect(session.snapshot().settledUntil).toBe(44);
+  });
+
+  test('settledUntil after finalize is an end marker, not a high-water mark', () => {
+    const session = new StreamSession();
+    session.append('A\n\nsecond *part');
+    session.finalize();
+    // finalize reports the full length: everything it parsed is settled *as
+    // long as the stream stays over*.
+    expect(session.snapshot().settledUntil).toBe(15);
+
+    session.append('*');
+    const resumed = session.snapshot();
+    // Resuming drops it back to the incremental anchor, and the text between
+    // the two offsets genuinely reparses: flat text becomes text + emphasis.
+    // Consumers must not treat settledUntil as monotone across a
+    // finalize → append cycle.
+    expect(resumed.settledUntil).toBe(3);
+    const para = resumed.document.blocks[1] as ParagraphNode;
+    expect(para.children.map((c) => c.kind)).toEqual(['text', 'emphasis']);
   });
 
   test('mid-stream repairs are flagged and vanish on finalize', () => {

@@ -16,10 +16,19 @@
  *    `**x**`, not the asterisks. Construct spans are recovered here (see
  *    `widen.ts`), so by the time a node exists its span already covers the
  *    whole construct and `source.slice(span.start, span.end)` round-trips.
- * 2. **Text.** No source text crosses the boundary — only offsets do. Text
- *    nodes are built by slicing the JS source string the caller already
- *    holds, which is why entity decoding, escape handling and smart
- *    punctuation all live on this side of the crossing rather than in C.
+ * 2. **Text.** No source *slice* crosses the boundary: prose reaches this
+ *    file as offsets, and a text node's value is cut from the JS source
+ *    string the caller already holds. That is what makes escape handling and
+ *    smart punctuation this side's work. Entity decoding is the deliberate
+ *    exception — the decoded value of `&hellip;` arrives interned in the
+ *    string table, because md4c already ships the whole HTML5 name table and
+ *    a JS copy of it would outweigh this decoder (see
+ *    `appendDecodedEntity` in platform/cpp/OffsetParser.cpp, and the
+ *    ownership table in docs/NATIVE.md). Hrefs, titles and info strings
+ *    cross as strings for the same reason: they are values, not ranges, and
+ *    md4c resolved their escapes and entities while building the attribute.
+ *    `entities.ts` is not on any of those paths — it is only the defensive
+ *    fallback for an entity event that arrives with no interned value.
  * 3. **Policy.** The URL allowlist and the HTML strip/raw decision are
  *    applied at parse time, while the node is being built: a blocked link
  *    degrades to its text, a blocked image to its alt, stripped HTML
@@ -51,7 +60,7 @@ import type {
 import { isBlock } from '../../document/nodes';
 import type { SourceSpan } from '../../document/span';
 import type { ResolvedEngineOptions } from '../options';
-import { decodeEntityAt, decodeRawString } from '../entities';
+import { decodeEntityAt } from '../entities';
 import { isUrlAllowed, sanitizeUrl } from '../urlPolicy';
 import * as P from './protocol';
 import * as W from './widen';
@@ -124,6 +133,16 @@ function newFrame(
  * `source` must be the exact string that was parsed: the decoder slices it
  * for every text node, and the header's UTF-16 length is checked against it
  * so a mismatched pair fails loudly instead of producing shifted spans.
+ *
+ * EVERY WAY THE BUFFER CAN BE WRONG IS A THROW, never a shorter document.
+ * `readHeader` rejects the header words (magic, version, the parse-failure
+ * flag, the length that ties the buffer to this string); the loop below
+ * rejects an unbalanced Leave and, at the end, frames still open when the
+ * events run out. Each of those otherwise decodes as a plausible document
+ * silently missing its tail — a truncated event list yields the heading and
+ * nothing else — which is the failure mode `nativeEngine` in ./index refuses
+ * on principle, because a blank or short screen sends the reader to their own
+ * data layer instead of to the parser.
  */
 export function decodeFlatBuffer(
   source: string,
@@ -185,6 +204,17 @@ export function decodeFlatBuffer(
     }
   }
 
+  if (stack.length > 1) {
+    // Enter events with no matching Leave. The frames left open hold every
+    // node built inside them, so returning `stack[0].children` here would
+    // hand back a document that stops at the last construct that happened to
+    // close — in-bounds, well-formed, and missing its tail without saying so.
+    throw new NativeProtocolError(
+      `native parse buffer ended with ${stack.length - 1} node(s) still open: the ` +
+        'event list is truncated',
+    );
+  }
+
   const root = stack[0];
   flushText(root, ctx);
   return { source, blocks: root.children as Block[] };
@@ -209,7 +239,6 @@ interface DecodeContext {
 // ---------------------------------------------------------------------------
 
 interface Header {
-  ok: boolean;
   eventCount: number;
   eventsOffset: number;
   stringCount: number;
@@ -235,6 +264,24 @@ function readHeader(buffer: ArrayBuffer, source: string): Header {
         `v${P.PROTOCOL_VERSION}: rebuild the app against the matching native module`,
     );
   }
+  /* Header word 3, bit 0 (`kFlagParseOk`). Checked BEFORE the length word,
+   * because the encoder's failure buffer reports utf16Length 0 and would
+   * otherwise be blamed on the caller as "a different string".
+   *
+   * A clear flag means md4c gave up mid-parse (allocation) or the encoder
+   * could not lay the document out; either way `events` holds at most the
+   * prefix emitted before that happened (OffsetParser.h, `ParseResult::ok`).
+   * Decoding it anyway would produce a well-formed document silently missing
+   * its tail — or an empty one — which is the signal `nativeEngine` in
+   * ./index deliberately refuses to send, because a blank screen sends the
+   * reader to their own data layer instead of to the parser. */
+  if ((h[P.HEADER_FLAGS] & P.FLAG_PARSE_OK) === 0) {
+    throw new NativeProtocolError(
+      'the native parser reported failure (md4c could not allocate, or the document ' +
+        'overflowed the wire format): its event list is a truncated prefix, so no ' +
+        'document is decoded from it',
+    );
+  }
   if (h[P.HEADER_UTF16_LENGTH] !== source.length) {
     throw new NativeProtocolError(
       `native parse covered ${h[P.HEADER_UTF16_LENGTH]} UTF-16 units but the source ` +
@@ -242,7 +289,6 @@ function readHeader(buffer: ArrayBuffer, source: string): Header {
     );
   }
   return {
-    ok: (h[P.HEADER_FLAGS] & P.FLAG_PARSE_OK) !== 0,
     eventCount: h[P.HEADER_EVENT_COUNT],
     eventsOffset: h[P.HEADER_EVENTS_OFFSET],
     stringCount: h[P.HEADER_STRING_COUNT],
@@ -253,10 +299,22 @@ function readHeader(buffer: ArrayBuffer, source: string): Header {
 }
 
 /**
- * Lazily decoded UTF-8 string table. Only link hrefs, titles, info strings
- * and the rare non-source-anchored text land here, so the common document
- * decodes zero strings; the decoder is deliberately written not to depend
- * on TextDecoder, which Hermes does not guarantee.
+ * Lazily decoded UTF-8 string table: the values that are NOT source slices —
+ * link hrefs, titles, info strings, an entity's decoded value, and the text
+ * md4c synthesizes rather than pointing at.
+ *
+ * That last class is not rare, whatever the name "synthesized" suggests:
+ * md4c reports every soft break, hard break, code-block line and HTML-block
+ * line as the same static "\n", the largest single class of value the table
+ * is offered. Its share of the ENTRIES is much smaller: the native side
+ * interns a run of identical values once (`SaxState::intern` in
+ * platform/cpp/OffsetParser.cpp), which is what makes this cache able to hit
+ * for them at all — it is keyed by index, so the same text at a thousand
+ * distinct indices always missed — and `textOf` only asks for the ones a
+ * branch actually reads.
+ *
+ * The decoder is deliberately written not to depend on TextDecoder, which
+ * Hermes does not guarantee.
  */
 class StringTable {
   private readonly index: Uint32Array;
@@ -351,6 +409,28 @@ function isLiteralFrame(node: P.NodeType): boolean {
   );
 }
 
+/**
+ * The event's display text: a slice of the source string the caller already
+ * holds when the event is anchored, and the parser's interned copy when it
+ * is not (synthesized text, and the "\n" md4c reports for every break).
+ *
+ * Called from the branches that consume it, never computed up front. Breaks
+ * are the most common text event in ordinary prose and they discard it
+ * entirely — they carry an interned "\n" that no branch reads — so computing
+ * it for every event paid a string-table decode per line of every document.
+ * Doing that eagerly measured 1.6x the decode time of a break-heavy document.
+ */
+function textOf(
+  anchored: boolean,
+  start: number,
+  end: number,
+  stringA: number,
+  ctx: DecodeContext,
+): string {
+  if (anchored) return ctx.source.slice(start, end);
+  return stringA >= 0 ? ctx.strings.get(stringA) : '';
+}
+
 function onText(
   frame: Frame,
   textKind: P.TextKind,
@@ -360,23 +440,30 @@ function onText(
   ctx: DecodeContext,
 ): void {
   const anchored = start >= 0;
-  const interned = stringA >= 0 ? ctx.strings.get(stringA) : null;
-  const literal = anchored ? ctx.source.slice(start, end) : (interned ?? '');
   const span: SourceSpan = anchored ? { start, end } : W.NO_SPAN;
 
   if (anchored && end > ctx.cursor) ctx.cursor = end;
 
   if (isLiteralFrame(frame.node)) {
-    // Inside code/HTML/math, every text kind is verbatim content: a soft
-    // break is a newline, an entity stays raw (md4c does not decode inside
-    // code), and structure is flattened.
+    // Inside code/HTML/math, every text kind is verbatim content: an entity
+    // stays raw (md4c does not decode inside code) and structure is
+    // flattened.
+    //
+    // A LINE BREAK IS A NEWLINE ONLY IN A VERBATIM *BLOCK* (md4c.c:5363). A
+    // code or math *SPAN* is a different rule one level down: md4c collapses
+    // its interior line endings to a literal space (md4c.c:5063-5083), so
+    // `$a\nb$` decodes to the value `a b`, `` `a\nb` `` to `a b`, and only a
+    // fenced or indented block keeps the `\n`. Nothing here has to do the
+    // collapsing — md4c has already reported the space as text by the time
+    // this runs — but a reader who takes 'a soft break is a newline' at face
+    // value will look for the bug in the wrong layer.
     if (textKind === P.TextKind.NullChar) {
       const nul = synthesizeCharSpan(span, ctx, '\u0000');
       frame.literal += '\ufffd';
       frame.literalSpan = W.unionSpan(frame.literalSpan, nul);
       return;
     }
-    frame.literal += literal;
+    frame.literal += textOf(anchored, start, end, stringA, ctx);
     frame.literalSpan = W.unionSpan(frame.literalSpan, span);
     return;
   }
@@ -393,15 +480,9 @@ function onText(
         span: W.widenHardBreak(ctx.source, synthesizeBreakSpan(span, ctx)),
       });
       break;
-    case P.TextKind.Html:
+    case P.TextKind.Html: {
       flushText(frame, ctx);
-      // Under `html: 'strip'` the node is dropped entirely. md4c still
-      // *parsed* the HTML (see HTML_PARSED in protocol.ts) — stripping means
-      // removing the construct, not re-rendering its source as prose — so the
-      // block structure around it is the same either way, and only the node
-      // disappears. The surrounding text runs stay separate rather than
-      // merging across the hole, so spans still cover exactly what they
-      // render and a selection across the gap copies back the raw HTML.
+      const literal = textOf(anchored, start, end, stringA, ctx);
       if (ctx.options.html === 'raw') {
         // md4c synthesizes the text of an HTML span that crosses a line
         // break, so the event arrives with no offsets. The literal is still
@@ -413,8 +494,33 @@ function onText(
           span: W.isAnchored(span) ? span : locateLiteral(literal, ctx),
           literal,
         });
+        break;
+      }
+      // Under `html: 'strip'` the node is dropped entirely, with ONE
+      // exception below. md4c still *parsed* the HTML (see HTML_PARSED in
+      // protocol.ts) — stripping means removing the construct, not
+      // re-rendering its source as prose — so the block structure around it
+      // is the same either way, and only the node disappears. The
+      // surrounding text runs stay separate rather than merging across the
+      // hole, so spans still cover exactly what they render and a selection
+      // across the gap copies back the raw HTML.
+      //
+      // The exception is `<br>`: it is a line break rather than markup, and
+      // dropping it is not "the construct disappears" but "two words are
+      // silently joined" — `line one<br>line two` would render as
+      // `line oneline two`. Models emit it constantly, and inside a GFM
+      // table cell it is the only way to break a line at all. So under
+      // 'strip' it becomes a `hardBreak` over the same span the tag
+      // occupies: the break the author asked for, with no HTML on the node.
+      // Only an anchored event qualifies — an unanchored one (md4c
+      // synthesizes the text of a span that crosses a line break) has no
+      // offsets to give the node, and `locateLiteral` may not find the
+      // normalized literal, which would leave a zero-width break behind.
+      if (W.isAnchored(span) && isHtmlLineBreak(literal)) {
+        frame.children.push({ kind: 'hardBreak', span });
       }
       break;
+    }
     case P.TextKind.NullChar:
       // CommonMark renders a NUL as U+FFFD; the span still covers the one
       // source character it replaces, so the text run around it stays whole.
@@ -422,12 +528,23 @@ function onText(
       break;
     case P.TextKind.Entity:
       // The span keeps covering the raw `&amp;`; the value is md4c's
-      // decoding of it, which knows the whole HTML5 table.
-      appendText(frame, span, interned ?? decodeEntity(literal), ctx);
+      // decoding of it, which knows the whole HTML5 table. The JS fallback
+      // behind it is defensive only — the parser interns a decoded value for
+      // every entity event it emits.
+      appendText(
+        frame,
+        span,
+        stringA >= 0
+          ? ctx.strings.get(stringA)
+          : decodeEntity(textOf(anchored, start, end, stringA, ctx)),
+        ctx,
+      );
       break;
-    default:
+    default: {
+      const literal = textOf(anchored, start, end, stringA, ctx);
       appendText(frame, span, maybeSmartPunctuation(literal, span, frame, ctx), ctx);
       break;
+    }
   }
 }
 
@@ -488,6 +605,29 @@ function locateLiteral(literal: string, ctx: DecodeContext): SourceSpan {
   if (at === -1) return { start: ctx.cursor, end: ctx.cursor };
   ctx.cursor = at + literal.length;
   return { start: at, end: at + literal.length };
+}
+
+/**
+ * True for an inline `<br>` in any of its written forms — `<br>`, `<br/>`,
+ * `<br />`, `<BR>`, `<br class="x">`.
+ *
+ * The lookahead is what keeps every other tag out, and it has to be a
+ * lookahead for a character class rather than `\b`: a hyphen is a legal
+ * CommonMark tag-name character (`[A-Za-z][A-Za-z0-9-]*`), and `\b` matches
+ * between `r` and `-`, so `<br-thing>` and any other custom element named
+ * `br-*` used to be read as a line break and silently inserted one. A real
+ * `<br>` tag name can only end at whitespace, at `/`, or at `>`.
+ *
+ * `</br>` is deliberately not a break, matching every HTML parser, which
+ * treats a void element's end tag as nothing at all. `[^>]*` cannot cross a
+ * `>` inside a quoted attribute value either, so the (legal, vanishingly
+ * rare) `<br title="x>y">` is not recognized and is stripped like any other
+ * markup — the failure is a missing break, never a spurious one.
+ */
+const HTML_LINE_BREAK = /^<br(?=[\s/>])[^>]*>$/i;
+
+function isHtmlLineBreak(literal: string): boolean {
+  return HTML_LINE_BREAK.test(literal);
 }
 
 function decodeEntity(raw: string): string {
@@ -654,10 +794,46 @@ function anchoredSpan(frame: Frame, ctx: DecodeContext): SourceSpan {
   return located ?? span;
 }
 
+/**
+ * Build the frame's node, then advance the cursor past what it really covers.
+ *
+ * THE CURSOR HAS TO BE ADVANCED FROM THE *FINAL* SPAN, not from the content
+ * range the frame was reported with. Widening can move a span's end: a fenced
+ * code block's content stops at the last code character, but `widenCodeBlock`
+ * takes the closing fence line with it. Advancing from the content range left
+ * the cursor pointing at the closing fence, so the next unanchored construct
+ * — an empty heading, an empty list item, anything `anchoredSpan` places by
+ * `locateFirstNonBlankLine` — resolved to the ``` line itself and landed
+ * *inside* the code block. That is not a cosmetic offset: the empty item's
+ * list then starts there too, so copying it reproduces the previous block's
+ * fence instead of the list.
+ *
+ * The advance therefore happens after `buildFrame` has pushed, over the spans
+ * of whatever it pushed. `buildFrame` keeps its own pre-advance from the
+ * content range, because a frame can legitimately push nothing (a table head,
+ * a stripped HTML block) and the source it consumed must still be behind the
+ * cursor.
+ */
 function closeFrame(frame: Frame, parent: Frame, ctx: DecodeContext): void {
+  const firstBuilt = parent.children.length;
+  buildFrame(frame, parent, ctx);
+  for (let i = firstBuilt; i < parent.children.length; i += 1) {
+    const built = parent.children[i].span;
+    if (W.isAnchored(built) && built.end > ctx.cursor) ctx.cursor = built.end;
+  }
+}
+
+function buildFrame(frame: Frame, parent: Frame, ctx: DecodeContext): void {
   const { source } = ctx;
   const span = anchoredSpan(frame, ctx);
+  // Whether `span` is the frame's own content range or a line `anchoredSpan`
+  // LOCATED for a construct that reported none. Two wideners need to know: an
+  // empty heading and an empty fence are both handed their own marker line,
+  // which is not where a heading's content or a fence's first code line sits.
+  const located = !W.isAnchored(contentSpan(frame));
   const children = frame.children;
+  // A floor, not the final word: `closeFrame` re-advances from the built
+  // node's span, which a widener may have pushed further right.
   if (W.isAnchored(span)) ctx.cursor = Math.max(ctx.cursor, span.end);
 
   switch (frame.node) {
@@ -669,7 +845,7 @@ function closeFrame(frame: Frame, parent: Frame, ctx: DecodeContext): void {
     case P.NodeType.Heading:
       push(parent, {
         kind: 'heading',
-        span: W.widenHeading(source, span),
+        span: W.widenHeading(source, span, !located),
         level: clampLevel(frame.detailA),
         children: children as Inline[],
       });
@@ -677,7 +853,13 @@ function closeFrame(frame: Frame, parent: Frame, ctx: DecodeContext): void {
 
     case P.NodeType.CodeBlock: {
       const fenceChar = frame.detailA === 0 ? null : String.fromCharCode(frame.detailA);
-      const { span: widened, closed } = W.widenCodeBlock(source, span, fenceChar);
+      // An empty fence has no content offsets, so `span` above is the line
+      // `anchoredSpan` LOCATED for it — the opening fence itself. The widener
+      // has to be told, or it looks for the fence on the line above and finds
+      // the previous block's closing one.
+      const { span: widened, closed } = W.widenCodeBlock(source, span, fenceChar, !located);
+      // Already decoded: md4c resolved the info string's escapes and
+      // entities while building the attribute (see the Link case below).
       const language = frame.stringA >= 0 ? ctx.strings.get(frame.stringA).trim() : '';
       push(parent, {
         kind: 'codeBlock',
@@ -685,7 +867,7 @@ function closeFrame(frame: Frame, parent: Frame, ctx: DecodeContext): void {
         literal: frame.literal,
         fenced: fenceChar !== null,
         closed,
-        ...(language ? { language: decodeRawString(language) } : {}),
+        ...(language ? { language } : {}),
       });
       return;
     }
@@ -865,11 +1047,17 @@ function closeFrame(frame: Frame, parent: Frame, ctx: DecodeContext): void {
 
     case P.NodeType.Link: {
       const autolink = (frame.detailFlags & P.DETAIL_AUTOLINK) !== 0;
-      // An autolink's URI is literal: CommonMark does not resolve backslash
-      // escapes inside `<...>`, so `?find=\*` keeps its backslash. Inline
-      // link destinations do resolve them.
-      const raw = ctx.strings.get(frame.stringA);
-      const href = sanitizeUrl(autolink ? raw : decodeRawString(raw));
+      // The destination arrives DECODED, and is decoded exactly once. md4c
+      // resolves backslash escapes while building the attribute and hands
+      // the entity substrings to `internAttribute`
+      // (platform/cpp/OffsetParser.cpp), which resolves them against the
+      // full HTML5 table; the autolink case is handled there too, by md4c's
+      // MD_BUILD_ATTR_NO_ESCAPES — an autolink's URI is literal, so
+      // `<...?find=\*>` keeps its backslash. Running a JS decoder over the
+      // result as well would resolve a second layer that the author wrote
+      // deliberately: a destination written `?x=1&amp;amp;y=2` must yield
+      // `?x=1&amp;y=2`, and one written `/a\\*b` must yield `/a\*b`.
+      const href = sanitizeUrl(ctx.strings.get(frame.stringA));
       const allowed = isUrlAllowed(href, ctx.options.urlPolicy.linkPrefixes);
       const widened = autolink
         ? W.widenAutolink(source, span)
@@ -887,7 +1075,7 @@ function closeFrame(frame: Frame, parent: Frame, ctx: DecodeContext): void {
         push(parent, { kind: 'autolink', span: widened, href });
         return;
       }
-      const title = frame.stringB >= 0 ? decodeRawString(ctx.strings.get(frame.stringB)) : '';
+      const title = frame.stringB >= 0 ? ctx.strings.get(frame.stringB) : '';
       push(parent, {
         kind: 'link',
         span: widened,
@@ -900,7 +1088,8 @@ function closeFrame(frame: Frame, parent: Frame, ctx: DecodeContext): void {
     }
 
     case P.NodeType.Image: {
-      const src = sanitizeUrl(decodeRawString(ctx.strings.get(frame.stringA)));
+      // Decoded once, natively — same as a link's destination above.
+      const src = sanitizeUrl(ctx.strings.get(frame.stringA));
       const widened = W.widenLink(source, span, true);
       // An image's alt text is a *string*, but md4c reports its inline
       // structure (`![foo *bar*]`), so it is flattened here rather than
@@ -911,7 +1100,7 @@ function closeFrame(frame: Frame, parent: Frame, ctx: DecodeContext): void {
         push(parent, { kind: 'text', span: widened, value: alt });
         return;
       }
-      const title = frame.stringB >= 0 ? decodeRawString(ctx.strings.get(frame.stringB)) : '';
+      const title = frame.stringB >= 0 ? ctx.strings.get(frame.stringB) : '';
       push(parent, {
         kind: 'image',
         span: widened,
@@ -1017,10 +1206,32 @@ function clampLevel(level: number): HeadingLevel {
   return l as HeadingLevel;
 }
 
-/** Flattened text of an inline subtree — the fallback for blocked links. */
+/**
+ * Flattened text of an inline subtree — the fallback for blocked links and
+ * the string form of an image's alt.
+ *
+ * AN EXPLICIT STACK, NOT RECURSION, because inline nesting is unbounded and
+ * comes straight from untrusted markdown: `[***…***](…)` opens one emphasis
+ * node per delimiter pair, so a 21 kB label nests ~10,000 deep. This runs on
+ * the parse path — `parseDocument` calls it for every blocked link and every
+ * image — so recursing here blew the JS stack while building the tree, one
+ * stage before any of the walks above the engine could bound anything.
+ *
+ * Each frame is one child list plus the index reached in it, so a node's
+ * children are appended between the text before them and the text after,
+ * exactly as the recursive form did.
+ */
 function plainText(nodes: readonly Inline[]): string {
   let out = '';
-  for (const node of nodes) {
+  const stack: { nodes: readonly Inline[]; index: number }[] = [{ nodes, index: 0 }];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (frame.index >= frame.nodes.length) {
+      stack.pop();
+      continue;
+    }
+    const node = frame.nodes[frame.index];
+    frame.index += 1;
     switch (node.kind) {
       case 'text':
         out += node.value;
@@ -1042,7 +1253,7 @@ function plainText(nodes: readonly Inline[]): string {
         out += node.href;
         break;
       default:
-        if ('children' in node) out += plainText(node.children);
+        if ('children' in node) stack.push({ nodes: node.children, index: 0 });
         break;
     }
   }

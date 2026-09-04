@@ -8,7 +8,10 @@
 //       allocation of the buffer that crosses.
 //   (b) JS decode -> AST — decodeFlatBuffer over a PRE-COMPUTED buffer, so
 //       nothing native is running inside the measurement. This is the JS half
-//       of the protocol: span widening, text slicing, entity decoding, policy.
+//       of the protocol: span widening, text slicing, the string table's UTF-8
+//       decode, policy. Entity resolution is NOT here — md4c resolves entities
+//       and the native side interns the decoded value (OffsetParser.cpp), so
+//       the JS side only reads it out of the string table.
 //   (c) total — the engine's real parse() call, (a) + (b) plus the glue.
 //
 // Reading it: if (a) dominates, the parser is the bottleneck and a faster
@@ -53,7 +56,11 @@ const P = loadNativeProtocol();
 const { decodeFlatBuffer, resolveOptions, presets } = lib;
 const options = resolveOptions(presets.llmChat);
 const extBits = P.extensionBits(options);
-const htmlPolicy = P.htmlPolicyBit(options);
+// No argument: `htmlPolicyBit()` takes none, on purpose. The native side
+// ignores the word and `html` is applied in the decoder, so nothing about the
+// resolved options can change it — passing `options` here read as if the
+// mapping were still open.
+const htmlPolicy = P.htmlPolicyBit();
 const rawParse = native.parse;
 const engine = native.engine;
 

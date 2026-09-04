@@ -18,9 +18,8 @@
  * The consequence is the property docs/FABRIC-PLAN.md §4 cares most about:
  * measure/draw agreement on Android is not maintained by keeping two engines
  * configured identically, it is structural, because there is only one engine
- * and both sides call it. Paper's `SelectableRunHostShadowNode` calls the same
- * `RunTextMeasure.measure`, so a run does not even change height when an app
- * flips `newArchEnabled`.
+ * and both sides call it — the shadow node through this file, and the mounted
+ * `SelectableRunHostView` directly.
  *
  * THIS FILE ENCODES NOTHING AND KNOWS NOTHING ABOUT ATTRIBUTES. It forwards
  * `props.rawProps` — the exact `folly::dynamic` of the JS props, populated by

@@ -1,10 +1,22 @@
-import type { ProcessedColorValue, ViewProps } from 'react-native';
+// `React.ElementRef<…>` is the shape codegen demands of a command's first
+// parameter, and it checks the AST for that exact qualified name
+// (@react-native/codegen/…/typescript/components/commands.js:20-40) — a bare
+// `ElementRef` import would parse as TypeScript and be rejected by the
+// generator. A namespace type import is the one spelling that satisfies both
+// and still erases completely.
+import type * as React from 'react';
+import type {
+  HostComponent,
+  ProcessedColorValue,
+  ViewProps,
+} from 'react-native';
 import type {
   DirectEventHandler,
   Float,
   Int32,
   WithDefault,
 } from 'react-native/Libraries/Types/CodegenTypes';
+import codegenNativeCommands from 'react-native/Libraries/Utilities/codegenNativeCommands';
 import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNativeComponent';
 
 /**
@@ -28,6 +40,15 @@ import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNati
  * without a native counterpart is a build failure on both platforms rather
  * than a prop that silently stops arriving.
  *
+ * THE FLOW RUNS BOTH WAYS. Props and events are JS → native and native → JS;
+ * `Commands` at the bottom of this file is the third direction — JS telling
+ * one mounted host to do something now (`clearSelection`, `setSelection`).
+ * Commands are generated from the same schema and carry the same compile-time
+ * link: the Android interface gains a method the Kotlin ViewManager must
+ * implement, and iOS gains `RCTSelectableRunHostViewProtocol` plus the
+ * `RCTSelectableRunHostHandleCommand` dispatcher, which the component view
+ * conforms to and calls.
+ *
  * THIS FILE MUST REACH METRO UNTRANSPILED, AND THE FAILURE IF IT DOES NOT IS
  * SILENT. `@react-native/babel-plugin-codegen` rewrites the default export only
  * when it sees an `ExportDefaultDeclaration` whose callee is
@@ -39,11 +60,12 @@ import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNati
  * (Libraries/Utilities/codegenNativeComponent.js:67-70). Under bridgeless that
  * is dead: `requireNativeComponent` reads its config through
  * `UIManager.getViewManagerConfig`, which soft-errors and returns null
- * (BridgelessUIManager.js:273-291). The component never resolves, every run
- * drops to the `<Text selectable>` fallback, and `onSelectionAction` and both
- * custom menu items are simply gone. The only signal is a `console.warn` under
- * `__DEV__` (codegenNativeComponent.js:38-43) — nothing at all in a release
- * build. Build-time codegen is equally blind to a transpiled copy:
+ * (BridgelessUIManager.js:273-291). The component never resolves, so `RunHost`
+ * finds no native host and throws at render — every run, on exactly the
+ * architecture this component was ported for. The only signal before that
+ * throw is a `console.warn` under `__DEV__` (codegenNativeComponent.js:38-43)
+ * — nothing at all in a release build. Build-time codegen is equally blind
+ * to a transpiled copy:
  * `combine-js-to-schema.js:81-85` parses a file only if its source text matches
  * `/export\s+default\s+\(?codegenNativeComponent</`, which erased type
  * arguments do not. Three things hold the line, and all three are load-bearing:
@@ -85,8 +107,9 @@ import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNati
  *
  * So sparseness survives the wire — an omitted key leaves the default in place
  * — and every field here has a default that cannot collide with a real value:
- * `""` for a family/weight/style/decoration, `0.0` for a font size or line
- * height (a 0pt one of either is meaningless), and for colours
+ * `""` for a family/weight/style/decoration or a semantic role, `0.0` for a
+ * font size or line height (a 0pt one of either is meaningless), `0` for a
+ * role level (level 0 is not a heading level), and for colours
  * `SharedColor`'s undefined value, whose `operator bool()` *is* the is-set
  * test (react/renderer/graphics/Color.h:48-50).
  *
@@ -150,6 +173,77 @@ type NativeRunTextAttribute = Readonly<{
   textDecorationLine?: string;
   color?: ProcessedColorValue;
   backgroundColor?: ProcessedColorValue;
+  /**
+   * What this range IS, for a screen reader, as opposed to what it looks
+   * like: `'heading'`, `'listItem'`, `'tableCell'`, or absent.
+   * `src/view/runAttributes.ts`'s `RunSemanticRole` owns the set and says
+   * what bounds it — every value maps to a platform primitive the reader
+   * announces in its own language, so this library ships no role strings.
+   *
+   * WHY THE WIRE NEEDS IT AT ALL. A run is one platform text view holding
+   * what the document had as several blocks, so the roles the JS renderer
+   * tree sets (`accessibilityRole="header"`) never run for a block that
+   * flows — and neither host can recover the role from the styling. Android
+   * used to guess: `RunAccessibility.kt` looked for the font-size + line-
+   * height + weight shape that only a heading and the base run emit, which
+   * any `attributeForMark` could counterfeit or erase. This field replaces
+   * the guess on both platforms.
+   *
+   * A PLAIN STRING, for the reason `NativeRunDecoration.kind` is: a string
+   * union inside an array element is one of the two shapes banned above —
+   * `generateEnumString` never recurses into an array's element type, and
+   * emits a declared-nowhere type initialised with an invalid identifier.
+   * The permitted values are enforced by `RunSemanticRole` in TypeScript,
+   * which is what `resolveRunAttributes` produces, and `""` is the absent
+   * sentinel exactly like `fontFamily`'s. A host that does not recognise a
+   * value must ignore it — that is the forward-compatibility rule for this
+   * field, and it degrades to the announcement the range had before.
+   */
+  role?: string;
+  /**
+   * The role's DEPTH where it has one — a heading's level (1-6), or a list
+   * item's nesting depth (1 at top level) — with `0` as the absent sentinel
+   * that `Float`/`Int32` fields use throughout this struct (there is no
+   * level 0 and no depth 0, so it cannot collide).
+   *
+   * NEITHER HOST CONSUMES IT, because neither platform has a primitive for a
+   * rank: `UIAccessibilityTraits.header` is a bit, `AccessibilityNodeInfo
+   * .setHeading(true)` is a boolean, and `CollectionItemInfo` carries no
+   * depth. Announcing one would mean putting "heading level 2" in the label,
+   * in English, which is the one thing this channel is shaped to avoid. It
+   * crosses anyway because a role that arrived without its level could not be
+   * given one later without a second wire change; both hosts say so where
+   * they drop it (`RunAccessibility.resolve`,
+   * `SelectableRunHostView.accessibilityElements`).
+   */
+  roleLevel?: Int32;
+  /**
+   * The range's ONE-BASED position in its collection: a list item's place in
+   * its list, a table cell's row (row 1 is the header row of a GFM table,
+   * always, which is what lets a host flag those cells without shipping the
+   * word "header" in English).
+   *
+   * One-based because `0` is this struct's absent sentinel and a zero-based
+   * first row could not be told from an absent one. Both hosts subtract one
+   * on the way into `AccessibilityNodeInfo.CollectionItemInfo`, which is
+   * zero-based; the counting itself is done once in
+   * `resolveRunAttributes`, where the marks that define a list's extent are.
+   */
+  roleRow?: Int32;
+  /**
+   * The size of that collection — a list's item count, a table's row count
+   * including the header. Sent with `roleRow`; it is the "of 5" half of
+   * TalkBack's "item 2 of 5", which the reader phrases in its own language.
+   */
+  roleRowCount?: Int32;
+  /**
+   * The range's one-based column, for the one role laid out in two
+   * dimensions (`tableCell`). Absent for a list item, which both hosts read
+   * as a one-column collection.
+   */
+  roleColumn?: Int32;
+  /** The table's column count. Sent with `roleColumn`. */
+  roleColumnCount?: Int32;
 }>;
 
 /**
@@ -258,8 +352,11 @@ type NativeRunEmbed = Readonly<{
    * swallowing a real character. */
   start: Int32;
   end: Int32;
-  /** JS's identifier for the embed — its index into the `embeds` array as
-   * sent, carried explicitly for the same reason `pressableId` is. */
+  /** JS's identifier for the embed, carried explicitly for the same reason
+   * `pressableId` is — and unlike `pressableId` it is NOT always this array's
+   * own index: JS drops a claim whose declared size cannot be reserved
+   * (non-positive, or infinite) without renumbering the entries around it.
+   * Echo it back on `onEmbedLayout` verbatim; never substitute a position. */
   embedId: Int32;
   /** Declared size in points. Layout-affecting: the same values reach the
    * measurer and the view through this one prop. */
@@ -316,6 +413,33 @@ type SelectionActionEvent = Readonly<{
   selectedText: string;
 }>;
 
+/**
+ * Payload of `onSelectionChange`: where the run's selection stands NOW.
+ *
+ * THE ONE DIFFERENCE FROM `onSelectionAction`, AND IT IS THE POINT: an EMPTY
+ * range is a legal payload here. `onSelectionAction` never emits one — a menu
+ * item fired against no selection would be nonsense — but "the selection went
+ * away" is exactly what a consumer's floating toolbar has to hear in order to
+ * dismiss itself, so `start === end` is emitted and means "nothing is
+ * selected in this run". Every other guarantee is `onSelectionAction`'s
+ * verbatim: UTF-16 code units into the *current* `text`, end-exclusive,
+ * clamped, ordered, and nothing in this port converts them.
+ *
+ * It carries no `selectedText`. This fires continuously while a selection
+ * handle is dragged, and the string would be rebuilt and transcoded to UTF-8
+ * on every one of those frames purely to be thrown away — JS already holds
+ * the projected text and slices it for free. `onSelectionAction` keeps its
+ * copy because it fires once, on a deliberate tap.
+ *
+ * BOTH HOSTS DEDUPE BEFORE EMITTING: an unchanged range is not re-announced,
+ * which matters because a streamed snapshot re-applies the text (and with it
+ * the selection) on every commit.
+ */
+type SelectionChangeEvent = Readonly<{
+  start: Int32;
+  end: Int32;
+}>;
+
 export interface NativeProps extends ViewProps {
   /** The projected run text. The host renders it verbatim — that is what
    * selection mapping depends on (docs/SELECTION.md). */
@@ -340,8 +464,12 @@ export interface NativeProps extends ViewProps {
    */
   decorations?: ReadonlyArray<NativeRunDecoration>;
   /**
-   * Tappable ranges over `text`, non-overlapping (links cannot nest). The
-   * host intercepts single taps that land inside one — and ONLY those taps:
+   * Tappable ranges over `text`, non-overlapping — not because links cannot
+   * nest (the mark stream nests them: `[<https://a.com>](https://b.com)`),
+   * but because `resolveRunPressables` drops any range that starts inside one
+   * it has already kept before this prop is built.
+   *
+   * The host intercepts single taps that land inside one — and ONLY those:
    * a tap anywhere else must fall through to the platform text view's own
    * behaviour, and selection gestures (long-press, handle drags) are never
    * intercepted at all. `RunHost` sends `[]` when no `onInlinePress` listener
@@ -370,8 +498,54 @@ export interface NativeProps extends ViewProps {
    */
   selectable?: WithDefault<boolean, true>;
   /**
-   * Ordered identifiers ('copy-text', 'copy-markdown') for the custom
-   * selection-menu items; the order *is* the menu order.
+   * Whether this host takes part in one-active-selection coordination.
+   * Defaults to true, which is the behaviour that predates the prop.
+   *
+   * WHAT THE COORDINATION IS. Neither platform clears one text view's
+   * selection because a selection began in a different one, so a transcript
+   * of per-run hosts would show two highlights at once with only the newest
+   * carrying handles and a menu. Each host therefore records itself as the
+   * process's one selection owner when a non-empty selection lands in it, and
+   * clears the host that held the slot before.
+   *
+   * SET IT FALSE AND THIS HOST OPTS OUT OF THE COORDINATION IN BOTH
+   * DIRECTIONS — it never clears another host, and it never takes the slot, so
+   * no other host can clear it either. That symmetry is what makes the prop
+   * useful rather than merely lenient: two selections held at once is only
+   * reachable if the second one does not erase the first AND survives the
+   * third. The trade is the one the coordination exists to prevent: several
+   * highlights on screen, only the newest with handles and a menu, and it is
+   * the consumer's job to make that read as deliberate.
+   *
+   * It is per host, not per document, because the registry it governs is
+   * per process: two unrelated `<SelectableMarkdown>` trees in a split view
+   * clear each other by default, and this is the prop that stops them.
+   */
+  exclusiveSelection?: WithDefault<boolean, true>;
+  /**
+   * The custom selection-menu items, in menu order — the order *is* the menu
+   * order.
+   *
+   * ONE ENTRY IS `id` OR `id + U+001F + title`, and both hosts split at the
+   * FIRST U+001F: everything before it is the identifier echoed back in
+   * `onSelectionAction`, everything after it is the item's title, verbatim.
+   * A bare id (no separator) means "use the host's own localised title",
+   * which exists for the two built-in ids only — 'copy-text' and
+   * 'copy-markdown', titled from `NSLocalizedString` on iOS and
+   * `R.string.selectable_markdown_copy_*` on Android. An id the host does not
+   * know and cannot title is dropped rather than rendered as a blank item, so
+   * a consumer-defined action must send a title with it.
+   *
+   * The packing exists because this prop's TYPE is load-bearing (see below):
+   * it stays one ordered `std::vector<std::string>`, so a title cannot
+   * desynchronise from its id and no second prop is needed.
+   * `src/view/selectionActions.ts` owns the encoder, the decoder and the
+   * reasoning; `RunHost` is the only caller that builds this array.
+   *
+   * FORWARD AND BACKWARD COMPATIBILITY BOTH HOLD. A binary older than titles
+   * reads `id + U+001F + title` as one unrecognised identifier and ignores it
+   * — so JS sends a bare id whenever no title was given, which is byte-for-
+   * byte the pre-title wire format for the default menu.
    *
    * THIS STAYS `ReadonlyArray<string>` AND MUST NOT BECOME A STRING UNION.
    * An array of a string union is a dead end in both directions, and both
@@ -396,7 +570,73 @@ export interface NativeProps extends ViewProps {
   /** Fired per embed after layout with the reserved rect; re-fired only when
    * the rect moved. */
   onEmbedLayout?: DirectEventHandler<EmbedLayoutEvent>;
+  /**
+   * Fired whenever this run's selection changes — by gesture, by a
+   * `setSelection`/`clearSelection` command, by another host taking the
+   * one-active-selection slot, or by a text swap that moved it. An empty
+   * range is a real payload; see `SelectionChangeEvent`.
+   */
+  onSelectionChange?: DirectEventHandler<SelectionChangeEvent>;
 }
+
+/**
+ * The imperative half of the contract: what JS can TELL one host to do.
+ *
+ * WHY COMMANDS RATHER THAN A PROP. A selection is view state the user also
+ * owns — they drag it, and the platform moves it — so "the selection is
+ * currently [4, 9)" is not something a render can declare without fighting
+ * whoever moved it last. A command is a one-shot instruction ordered against
+ * the props by the mounting layer, which is the shape this actually is; and
+ * it means no render of `<SelectableMarkdown>` can silently re-assert a
+ * selection the user has since dismissed.
+ *
+ * OFFSETS ARE THE RUN'S, NOT THE DOCUMENT'S. `setSelection` takes UTF-16
+ * offsets into this host's current `text` — the same unit every event on this
+ * component reports — because the host has no idea what a source span is and
+ * this contract exists to keep it that way. `<SelectableMarkdown>` takes a
+ * `SourceSpan`, finds the run that covers it and maps it through that run's
+ * projection before dispatching, which is the same piece table
+ * `mapSelectionToSource` walks in the other direction.
+ *
+ * Both commands are clamped by the host and both are no-ops rather than
+ * errors when the range does not survive clamping — a command can race a text
+ * swap by a frame exactly like an event can.
+ *
+ * THE EXPORT NAME MUST BE `Commands`. React Native's babel plugin removes
+ * this declaration and re-emits it from the generated view config, and it
+ * throws outright on any other name for a `codegenNativeCommands` result —
+ * or on a `Commands` export that is anything else
+ * (@react-native/babel-plugin-codegen/index.js:120-140). `RunHost` reads it
+ * off the same call-expression `require` it reads the component from, so
+ * nothing imports this module statically (see the header).
+ */
+interface NativeCommands {
+  /** Drop this host's selection and dismiss its menu. A no-op when there is
+   * no selection to drop. */
+  clearSelection: (
+    viewRef: React.ElementRef<HostComponent<NativeProps>>,
+  ) => void;
+  /**
+   * Select `[start, end)` of this host's current `text`, UTF-16 offsets,
+   * end-exclusive. Clamped to the text and ordered by the host; an empty
+   * result selects nothing rather than raising, and a host that is not
+   * `selectable` takes nothing.
+   *
+   * It presents no menu and issues no scroll. It DOES take focus — the iOS
+   * first responder, the Android view focus — because neither platform draws
+   * a selection in a text view that lacks it, and a scrolling ancestor may
+   * react to that.
+   */
+  setSelection: (
+    viewRef: React.ElementRef<HostComponent<NativeProps>>,
+    start: Int32,
+    end: Int32,
+  ) => void;
+}
+
+export const Commands: NativeCommands = codegenNativeCommands<NativeCommands>({
+  supportedCommands: ['clearSelection', 'setSelection'],
+});
 
 /**
  * The component name must stay exactly `SelectableRunHost`.
@@ -405,9 +645,14 @@ export interface NativeProps extends ViewProps {
  * (react/renderer/componentregistry/componentNameByReactViewName.cpp:13-70)
  * strips a leading `RCT`, so the C++ side would look up `SelectableRunHost`
  * while codegen's iOS lookup map would be keyed `RCTSelectableRunHost`, and
- * the two would never meet. The string here is also what iOS component
- * discovery resolves to the `SelectableRunHostCls()` C symbol
- * (React/Fabric/Mounting/RCTComponentViewFactory.mm:119), and what Android's
+ * the two would never meet. The string here is also the key iOS Fabric looks
+ * up in the generated `RCTThirdPartyComponentsProvider` dictionary, which
+ * codegen builds from `codegenConfig.ios.componentProvider` in package.json
+ * ("SelectableRunHost" -> "RCTSelectableRunHostComponentView"); a name that
+ * does not match that entry registers nothing and raises nothing, and
+ * `RunHost` throwing at mount is the only symptom. scripts/check-codegen.mjs
+ * pins both halves (section 1, the componentProvider entry; section 6b, the
+ * four registries this name is a key into). Finally it is what Android's
  * `FabricUIManager.measure` routes on.
  */
 export default codegenNativeComponent<NativeProps>('SelectableRunHost');

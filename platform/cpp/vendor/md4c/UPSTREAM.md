@@ -43,9 +43,22 @@ byte-identical to upstream at the pinned SHA.
 4. Re-apply the patches in `patches/` in lexical order
    (`patch -p1 < patches/NNNN-name.patch` from this directory). If a patch no
    longer applies, rebase it onto the new upstream and keep the same number.
-5. Re-run the gates: the C/C++ compile smoke test
-   (`cc -c md4c.c entity.c` and `c++ -std=c++17 -c ../../OffsetParser.cpp -I .`),
-   `npm run typecheck`, `npm test`, and `npm run conformance`.
+5. Re-run the gates: the C/C++ compile smoke test, in the form that leaves
+   **no object files in this directory** —
+
+   ```sh
+   cc -fsyntax-only md4c.c entity.c
+   c++ -std=c++17 -fsyntax-only ../../OffsetParser.cpp -I .
+   ```
+
+   — then `npm run typecheck`, `npm test`, and `npm run conformance`. Use
+   `-fsyntax-only` (or `-o "$TMPDIR/whatever.o"`) rather than a bare `-c`: `cc
+   -c` drops `md4c.o`, `entity.o` and `OffsetParser.o` into this directory, and
+   the root `.gitignore` does not filter a directory that `package.json`
+   `files` allowlists — `npm pack` would ship those objects. The `!**/*.o` and
+   `!**/*.a` negations in `files` are the backstop, and `npm run verify:pack`
+   fails on any compiled object it finds in the tarball, but a stray object is
+   still noise in `git status` and in the next `npm pack` you read.
 6. Skim the upstream diff for new `MD_FLAG_*` values or changed callback
    detail structs. `OffsetParser.{h,cpp}` maps them explicitly and must be
    reviewed whenever the flag set changes.

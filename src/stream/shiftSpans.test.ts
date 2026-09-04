@@ -6,6 +6,7 @@ import {
   linkNativeEngineAsDefault,
 } from '../engine/native/__tests__/support';
 import { presets } from '../engine/options';
+import { StreamSession } from './StreamSession';
 import { shiftSpans } from './shiftSpans';
 
 const FIXTURE = [
@@ -164,4 +165,82 @@ describe('shiftSpans over hand-built nodes', () => {
     // The anchored sibling still moves — the guard is per node, not per tree.
     expect(shifted.children[1].span).toEqual({ start: 500, end: 501 });
   });
+});
+
+/*
+ * Nesting depth. Model output is untrusted and markdown nesting is unbounded,
+ * so the two ways a deep document reaches `shiftSpans` are pinned here: the
+ * hand-built tree (no parser, runs everywhere) proves the walk itself is
+ * iterative, and the streamed 3 kB / 6 kB `'> '` prefix proves the real path
+ * — `StreamSession.update` splicing an engine parse of the tail — survives
+ * the depth that used to throw `RangeError: Maximum call stack size exceeded`
+ * from inside `shiftSpans` (it overflowed somewhere between 2000 and 3000).
+ */
+describe('shiftSpans at depth', () => {
+  function nest(depth: number): Block {
+    let node: Block = {
+      kind: 'paragraph',
+      span: { start: depth, end: depth + 4 },
+      children: [
+        { kind: 'text', span: { start: depth, end: depth + 4 }, value: 'echo' },
+      ],
+    };
+    for (let i = depth - 1; i >= 0; i -= 1) {
+      node = {
+        kind: 'blockquote',
+        span: { start: i, end: depth + 4 },
+        children: [node],
+      };
+    }
+    return node;
+  }
+
+  test('shifts a 20000-deep tree without overflowing the stack', () => {
+    const deep = nest(20_000);
+    const shifted = shiftSpans(deep, 7);
+
+    // Walk down iteratively — a recursive check would be the thing under
+    // test, failing for its own reasons.
+    let source: AnyNode = deep;
+    let clone: AnyNode = shifted;
+    let levels = 0;
+    for (;;) {
+      expect(clone).not.toBe(source);
+      expect(clone.kind).toBe(source.kind);
+      expect(clone.span).toEqual({
+        start: source.span.start + 7,
+        end: source.span.end + 7,
+      });
+      const next: AnyNode[] | undefined = (source as { children?: AnyNode[] })
+        .children;
+      if (next === undefined || next.length === 0) {
+        break;
+      }
+      source = next[0];
+      clone = (clone as { children: AnyNode[] }).children[0];
+      levels += 1;
+    }
+    expect(levels).toBe(20_001);
+  });
+});
+
+describeNative('shiftSpans inside a streamed deep blockquote', () => {
+  test.each([1500, 3000])(
+    "streams a '> ' prefix %i levels deep without overflowing",
+    (levels) => {
+      const source = '> '.repeat(levels) + 'echo\n';
+      const session = new StreamSession();
+      // 64-char chunks: the shape the finding's repro used, and enough
+      // appends that the splice (repair -> parse -> shiftSpans) runs on a
+      // deep tree many times over rather than once at the end.
+      for (let i = 0; i < source.length; i += 64) {
+        session.append(source.slice(i, i + 64));
+      }
+      session.finalize();
+      const snap = session.snapshot();
+      expect(snap.document.source).toBe(source);
+      expect(snap.document.blocks).toHaveLength(1);
+      expect(snap.document.blocks[0].kind).toBe('blockquote');
+    },
+  );
 });

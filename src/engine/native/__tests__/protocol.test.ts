@@ -20,6 +20,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
+import { presets, resolveOptions } from '../../options';
+import { decodeFlatBuffer, NativeProtocolError } from '../decode';
 import * as P from '../protocol';
 import { describeNative, nativeAddonOrNull } from './support';
 
@@ -445,5 +447,200 @@ describeNative('the compiled module speaks this protocol', () => {
     expect(eventKinds('$x$\n', P.EXT_MATH)).toContain(P.NodeType.MathInline);
     expect(eventKinds('_x_\n', 0)).toContain(P.NodeType.Emphasis);
     expect(eventKinds('_x_\n', P.EXT_UNDERLINE)).toContain(P.NodeType.Underline);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What the buffer does NOT carry
+// ---------------------------------------------------------------------------
+
+/**
+ * Two economies of the wire format, asserted on real buffers because neither
+ * is visible from the decoded document: bytes the encoder writes and no
+ * decoder reads cost something on every parse, and nothing fails when they
+ * are wrong.
+ */
+describeNative('the string table holds one entry per value that needs one', () => {
+  interface Table {
+    stringCount: number;
+    /** Table indices reachable from some event's stringA/stringB. */
+    referenced: Set<number>;
+    /** Decoded entries, in table order. */
+    values: string[];
+  }
+
+  function tableOf(source: string, bits = 0): Table {
+    const buffer = nativeAddonOrNull()!.parse(source, bits, P.HTML_PARSED);
+    const h = new Uint32Array(buffer, 0, P.HEADER_SIZE / 4);
+    const fields = new Int32Array(buffer, h[P.HEADER_EVENTS_OFFSET], h[P.HEADER_EVENT_COUNT] * 6);
+    const referenced = new Set<number>();
+    for (let i = 0; i < h[P.HEADER_EVENT_COUNT]; i += 1) {
+      if (fields[i * 6 + 4] >= 0) referenced.add(fields[i * 6 + 4]);
+      if (fields[i * 6 + 5] >= 0) referenced.add(fields[i * 6 + 5]);
+    }
+    const stringCount = h[P.HEADER_STRING_COUNT];
+    const index =
+      stringCount === 0
+        ? new Uint32Array(0)
+        : new Uint32Array(buffer, h[P.HEADER_STRING_INDEX_OFFSET], stringCount + 1);
+    const bytes = new Uint8Array(
+      buffer,
+      h[P.HEADER_STRING_BYTES_OFFSET],
+      h[P.HEADER_STRING_BYTES_LENGTH],
+    );
+    const values: string[] = [];
+    for (let i = 0; i < stringCount; i += 1) {
+      values.push(Buffer.from(bytes.subarray(index[i], index[i + 1])).toString('utf8'));
+    }
+    return { stringCount, referenced, values };
+  }
+
+  /** An unreachable entry is payload and index bytes nothing can ever read. */
+  function expectNoOrphans(table: Table): void {
+    expect(table.values.filter((_, i) => !table.referenced.has(i))).toEqual([]);
+  }
+
+  test('a NUL interns its replacement character and nothing else', () => {
+    // The NUL arm overwrites stringA with U+FFFD, so interning the raw byte
+    // first stranded one entry per NUL — ~14% of the buffer on NUL-heavy
+    // input, plus a decoder cache slot each.
+    const table = tableOf('x\u0000y\u0000z\n');
+    expectNoOrphans(table);
+    expect(table.values).toEqual(['�']);
+  });
+
+  test('an entity interns its decoded value and nothing else', () => {
+    const table = tableOf('a &amp; b\n');
+    expectNoOrphans(table);
+    expect(table.values).toEqual(['&']);
+  });
+
+  test('a thousand line breaks share one entry', () => {
+    // md4c reports every break as the same static "\n", and the table used to
+    // grow one 1-byte entry plus a 4-byte index slot per line — the largest
+    // entry class in ordinary markdown, in a table documented as holding the
+    // rare synthesized value. Collapsing a run also lets the decoder's
+    // index-keyed string cache hit for them.
+    const table = tableOf(`${'a\n'.repeat(1000)}\n`);
+    expectNoOrphans(table);
+    expect(table.values).toEqual(['\n']);
+  });
+
+  test('a fenced block keeps its info string and one newline', () => {
+    const table = tableOf(`\`\`\`js\n${'line\n'.repeat(200)}\`\`\`\n`);
+    expectNoOrphans(table);
+    expect(table.values).toEqual(['js', '\n']);
+  });
+
+  test('a document whose text is all source-anchored interns nothing', () => {
+    expect(tableOf('a *b* `c`\n').stringCount).toBe(0);
+  });
+});
+
+describeNative('detailA carries only the three meanings a decoder reads', () => {
+  function detailOf(source: string, bits: number, node: number): number[] {
+    const buffer = nativeAddonOrNull()!.parse(source, bits, P.HTML_PARSED);
+    const h = new Uint32Array(buffer, 0, P.HEADER_SIZE / 4);
+    const words = new Uint32Array(buffer, h[P.HEADER_EVENTS_OFFSET], h[P.HEADER_EVENT_COUNT] * 6);
+    const out: number[] = [];
+    for (let i = 0; i < h[P.HEADER_EVENT_COUNT]; i += 1) {
+      const packed = words[i * 6];
+      if ((packed & 0xff) === P.EventKind.BlockEnter && ((packed >>> 8) & 0xff) === node) {
+        out.push(words[i * 6 + 3]);
+      }
+    }
+    return out;
+  }
+
+  test('a task item sends no task-mark offset', () => {
+    // It used to send one, and no decoder ever read it: the mark's offset is
+    // already the item's own start — the parser folds it into the range so
+    // that an empty task item still has one — so a second copy could only
+    // ever disagree with the range. The state itself travels in detailFlags.
+    const source = '- [x] done\n';
+    expect(source.indexOf('x')).toBe(3);
+    expect(detailOf(source, P.EXT_TASKLISTS, P.NodeType.ListItem)).toEqual([0]);
+  });
+
+  test('a table sends no column count', () => {
+    // Shape and alignment both come from the cell events; the count was a
+    // second statement of the same fact that nothing consulted.
+    const source = '| a | b |\n| :- | -: |\n| 1 | 2 |\n';
+    expect(detailOf(source, P.EXT_TABLES, P.NodeType.Table)).toEqual([0]);
+  });
+
+  test('the three meanings that are read still arrive', () => {
+    expect(detailOf('### h\n', 0, P.NodeType.Heading)).toEqual([3]);
+    expect(detailOf('7. a\n', 0, P.NodeType.OrderedList)).toEqual([7]);
+    expect(detailOf('~~~\nx\n~~~\n', 0, P.NodeType.CodeBlock)).toEqual(['~'.charCodeAt(0)]);
+    expect(detailOf('    x\n', 0, P.NodeType.CodeBlock)).toEqual([0]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A buffer that says it failed, or stops mid-document
+// ---------------------------------------------------------------------------
+
+/**
+ * The header's flags word and the event list have to be *believed*, not just
+ * carried.
+ *
+ * `kFlagParseOk` clear means md4c gave up mid-parse (an allocation failure is
+ * the realistic trigger) or the encoder could not lay the document out. The
+ * events that made it into the buffer are then a prefix of a real document:
+ * every span in bounds, every node well formed, and the tail simply missing.
+ * The decoder used to read the flag into a field nobody consulted and hand
+ * that prefix back, so a failed parse rendered as a short document — the
+ * exact signal `nativeEngine` refuses to send when the module is absent,
+ * because it points the reader at their own data layer instead of the parser.
+ *
+ * The same is true of a truncated event count with the flag left set, which
+ * is what a buffer corrupted in transit looks like: frames stay open and
+ * their children never reach the root.
+ */
+describeNative('a buffer that reports failure is refused, not decoded', () => {
+  const SOURCE = '# Title\n\nfirst paragraph\n\nsecond paragraph\n';
+  const OPTIONS = resolveOptions(presets.commonmark);
+
+  /** A real buffer for SOURCE, copied so each case can corrupt its own. */
+  function freshBuffer(): ArrayBuffer {
+    return nativeAddonOrNull()!.parse(SOURCE, 0, P.HTML_PARSED).slice(0);
+  }
+
+  test('the undamaged buffer decodes to the whole document', () => {
+    // Guards every case below: if this stopped being three blocks, a test
+    // asserting "throws" could pass for the wrong reason.
+    const doc = decodeFlatBuffer(SOURCE, freshBuffer(), OPTIONS);
+    expect(doc.blocks.map((b) => b.kind)).toEqual(['heading', 'paragraph', 'paragraph']);
+  });
+
+  test('a clear FLAG_PARSE_OK throws instead of decoding the prefix', () => {
+    const buffer = freshBuffer();
+    const h = new Uint32Array(buffer, 0, P.HEADER_SIZE / 4);
+    h[P.HEADER_FLAGS] &= ~P.FLAG_PARSE_OK;
+    // Shortened as well, because that is the shape md4c actually produces:
+    // the events emitted before it gave up, and no more.
+    h[P.HEADER_EVENT_COUNT] -= 6;
+    expect(() => decodeFlatBuffer(SOURCE, buffer, OPTIONS)).toThrow(NativeProtocolError);
+    expect(() => decodeFlatBuffer(SOURCE, buffer, OPTIONS)).toThrow(/reported failure/);
+  });
+
+  test('the failure is reported even when the prefix is empty', () => {
+    const buffer = freshBuffer();
+    const h = new Uint32Array(buffer, 0, P.HEADER_SIZE / 4);
+    h[P.HEADER_FLAGS] &= ~P.FLAG_PARSE_OK;
+    h[P.HEADER_EVENT_COUNT] = 0;
+    expect(() => decodeFlatBuffer(SOURCE, buffer, OPTIONS)).toThrow(/reported failure/);
+  });
+
+  test('a truncated event list throws rather than dropping the tail', () => {
+    const buffer = freshBuffer();
+    const h = new Uint32Array(buffer, 0, P.HEADER_SIZE / 4);
+    // Cut inside the last paragraph, so its Leave never arrives and the
+    // frame is still open when the loop ends. The flag stays set: this is
+    // corruption, not a parse the native side knew had failed.
+    h[P.HEADER_EVENT_COUNT] -= 2;
+    expect(() => decodeFlatBuffer(SOURCE, buffer, OPTIONS)).toThrow(NativeProtocolError);
+    expect(() => decodeFlatBuffer(SOURCE, buffer, OPTIONS)).toThrow(/still open/);
   });
 });

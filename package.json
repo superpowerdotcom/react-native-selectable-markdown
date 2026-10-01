@@ -1,6 +1,6 @@
 {
   "name": "react-native-selectable-markdown",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Streaming-first CommonMark + GFM markdown renderer for React Native with document-grade text selection: every rendered character maps back to an exact UTF-16 range of the source.",
   "license": "MIT",
   "private": false,

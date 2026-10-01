@@ -4,6 +4,8 @@ Versions follow [semver](https://semver.org/); pre-1.0, breaking changes land in
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-10-01
+
 - BREAKING: the package entry exports an explicit list of 191 names. Ten internals left the root and are imported by path instead: `decodeFlatBuffer`, `NativeProtocolError`, `applySmartPunctuation`, `PROTOCOL_VERSION`, `findHostBinding`, `NativeHostBinding` and `__linkNativeEngine` from `dist/engine/native`; `getOrCreateSession` from `dist/agui/useAgUiSession`; `embedContentFor` from `dist/selection/runs`; `isUriLikeLabel` from `dist/stream/repair`.
 - Deprecated: the exported `classifyBlock` function is now `classifyTopLevelBlock`. The old name stays as a deprecated alias until a later minor. The `classifyBlock` prop and the `ClassifyBlock` type are unchanged.
 - Selection: imperative API on `<SelectableMarkdown>`. A `ref` (`SelectableMarkdownHandle`) exposes `getSelection()`, `clearSelection()` and `setSelection(span)`; `onSelectionChange` reports the live selection as `{ span, plain }` or `null`.

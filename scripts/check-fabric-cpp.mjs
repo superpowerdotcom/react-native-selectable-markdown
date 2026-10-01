@@ -569,6 +569,11 @@ function compileArgs(deps, platform, extraDirs = []) {
     // spelling. That is upstream noise, not a signal about our code.
     '-Wno-deprecated-literal-operator',
     '-Wno-documentation',
+    // react/renderer/core/graphicsConversions.h calls std::format without
+    // including <format>. libc++ (the NDK, Apple) pulls it in transitively;
+    // Linux libstdc++ does not, so every TU reaching propsConversions.h fails
+    // there. Force-including it reproduces what the real toolchains see.
+    ...(process.platform === 'linux' ? ['-include', 'format'] : []),
     ...includeFlags(deps, platform, extraDirs),
   ];
 }

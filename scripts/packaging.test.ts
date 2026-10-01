@@ -399,7 +399,9 @@ describe('the package ships an ES module build beside the CommonJS one', () => {
     ]);
     const packed = run('npm', ['pack', '--dry-run', '--json', '--ignore-scripts']);
     expect(packed.status).toBe(0);
-    const shipped = (JSON.parse(packed.stdout) as { files: { path: string }[] }[])[0].files.map(
+    // npm 10 runs `prepare` despite --ignore-scripts, so build logs can precede the JSON.
+    const json = packed.stdout.slice(packed.stdout.search(/^\[\s*$/m));
+    const shipped = (JSON.parse(json) as { files: { path: string }[] }[])[0].files.map(
       (file) => file.path,
     );
     expect(shipped).toEqual(expect.arrayContaining(['native/node/index.mjs', 'scripts/build-node-addon.mjs']));

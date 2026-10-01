@@ -8,7 +8,7 @@
 // latest `v*` tag already names. That pair is one publish away from shipping a
 // breaking change inside a release whose notes never mention it — the audit
 // that prompted this guard left exactly that state behind (an `exports` map
-// that dropped nineteen names from the package root, a renamed export and a
+// that dropped ten names from the package root, a renamed export and a
 // deep path that stopped resolving, all under an unbumped 0.11.0).
 //
 // WHAT IT CHECKS, in one sentence: if CHANGELOG.md's Unreleased section

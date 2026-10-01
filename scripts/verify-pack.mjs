@@ -35,6 +35,11 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // the claim now matches what is actually exercised, and it covers every path
 // a headless consumer is told to use rather than just the first one.
 const NODE_SAFE_ENTRIES = [
+  // The headless `<name>/engine` entry first: a barrel of its own that must
+  // load with no dependency at all (src/index.test.ts pins that it never
+  // reaches the view layer; this keeps the same promise at runtime). Its
+  // sibling `<name>/stream` is NOT here — see PEER_DEPENDENT_ENTRIES.
+  ['dist/engine.js', 'parseDocument'],
   ['dist/engine/Engine.js', 'parseDocument'],
   ['dist/engine/options.js', 'resolveOptions'],
   ['dist/engine/native/index.js', 'createNativeEngine'],
@@ -46,9 +51,47 @@ const NODE_SAFE_ENTRIES = [
   ['dist/selection/copy.js', 'buildCopyPayload'],
 ];
 
+// Entries that load only with the `react` PEER resolvable — which is every
+// consumer's situation, and not this script's: the tarball is unpacked into a
+// scratch directory with nothing above it. `<name>/stream` re-exports
+// `bindRunTextEvents`, whose module imports `react` at load for its hooks, so
+// importing the barrel in a bare directory fails with ERR_MODULE_NOT_FOUND for
+// 'react' however correct the build is. These are loaded AFTER the Node-safe
+// entries above and after `react` has been linked in (see linkPeers), so the
+// zero-dependency property of NODE_SAFE_ENTRIES is still proven for those.
+const PEER_DEPENDENT_ENTRIES = [['dist/stream.js', 'StreamSession']];
+
+// Links the peer the entries above need into the unpacked package, from this
+// repository's own devDependencies. Node resolves a symlinked package by its
+// REAL path, so one link under <pkgDir>/node_modules serves both the direct
+// `require` below and the ESM probe that reaches the package through a
+// consumer symlink. A symlink is not a directory to fs.Dirent, so the
+// build-artifact walk does not descend into it.
+const linkPeers = (pkgDir) => {
+  const modules = path.join(pkgDir, 'node_modules');
+  fs.mkdirSync(modules, { recursive: true });
+  for (const peer of ['react']) {
+    const target = path.dirname(createRequire(import.meta.url).resolve(`${peer}/package.json`));
+    const link = path.join(modules, peer);
+    if (!fs.existsSync(link)) fs.symlinkSync(target, link, 'dir');
+  }
+};
+
 // src/ ships so the declaration maps and source maps in dist/ resolve back to
 // readable sources in a consuming app.
-const REQUIRED_FILES = ['react-native.config.js', 'src/index.ts'];
+//
+// native/node and the addon build script ship because a consumer's test runner
+// builds the Node engine from the installed package (`<name>/node` is the
+// loader, scripts/build-node-addon.mjs the build); a `files` edit that drops
+// either turns every consumer's jest run red with nothing here going red first.
+const REQUIRED_FILES = [
+  'react-native.config.js',
+  'src/index.ts',
+  'src/engine.ts',
+  'src/stream.ts',
+  'native/node/index.mjs',
+  'scripts/build-node-addon.mjs',
+];
 
 // The native sources a consuming app compiles, named individually rather than
 // left to the podspec/config sweep below.
@@ -498,6 +541,27 @@ const checkExportsResolution = (pkgDir, manifest) => {
 
   resolves(`${manifest.name}/package.json`);
 
+  // The named subpaths, each pinned to the file it must land on under Node's
+  // own (`require`) conditions. `engine` and `stream` are the headless
+  // entries a consumer's jest imports; `node` is the addon loader its test
+  // setup requires. Resolution alone is the check here — the two dist entries
+  // are also LOADED, under both conditions, through NODE_SAFE_ENTRIES.
+  const SUBPATH_TARGETS = {
+    engine: 'dist/engine.js',
+    stream: 'dist/stream.js',
+    node: 'native/node/index.mjs',
+  };
+  for (const [subpath, target] of Object.entries(SUBPATH_TARGETS)) {
+    const resolved = resolves(`${manifest.name}/${subpath}`);
+    const expected = path.join(pkgDir, target);
+    if (resolved && fs.realpathSync(resolved) !== fs.realpathSync(expected)) {
+      fail(
+        `exports: "${manifest.name}/${subpath}" resolves to ${path.relative(pkgDir, resolved)}, ` +
+          `expected ${target}.`,
+      );
+    }
+  }
+
   for (const [relative] of NODE_SAFE_ENTRIES) {
     resolves(`${manifest.name}/${relative}`);
     resolves(`${manifest.name}/${relative.replace(/\.js$/, '')}`);
@@ -604,11 +668,21 @@ const checkEsmResolution = (consumer, pkgDir, manifest) => {
 
   const probe = path.join(consumer, 'esm-probe.mjs');
   const specifiers = {
+    // `<name>/node` is deliberately absent: everything resolved here must land
+    // in the ES module BUILD, and the addon loader is a hand-written .mjs under
+    // native/ that is the same file under every condition. Its subpath is
+    // pinned to that file by SUBPATH_TARGETS in checkExportsResolution.
     resolveOnly: [manifest.name, `${manifest.name}/dist`],
-    load: NODE_SAFE_ENTRIES.flatMap(([relative, exported]) => [
-      [`${manifest.name}/${relative}`, exported],
-      [`${manifest.name}/${relative.replace(/\.js$/, '')}`, exported],
-    ]),
+    load: [
+      // The bare subpaths under the `import` condition — the spelling a
+      // bundler resolves to dist/esm/engine.js and dist/esm/stream.js.
+      [`${manifest.name}/engine`, 'parseDocument'],
+      [`${manifest.name}/stream`, 'StreamSession'],
+      ...[...NODE_SAFE_ENTRIES, ...PEER_DEPENDENT_ENTRIES].flatMap(([relative, exported]) => [
+        [`${manifest.name}/${relative}`, exported],
+        [`${manifest.name}/${relative.replace(/\.js$/, '')}`, exported],
+      ]),
+    ],
   };
   fs.writeFileSync(
     probe,
@@ -721,22 +795,30 @@ try {
   for (const relative of REQUIRED_FILES) check(pkgDir, relative, 'file');
   for (const relative of REQUIRED_NATIVE_FILES) check(pkgDir, relative, 'native source');
 
-  for (const [relative, exported] of NODE_SAFE_ENTRIES) {
-    if (!check(pkgDir, relative, 'entry')) continue;
-    let loaded;
-    try {
-      loaded = require(path.join(pkgDir, relative));
-    } catch (error) {
-      // A deep path that throws on require is the failure this exists to
-      // catch: it means the build emitted something Node cannot load, or
-      // that the module grew a React Native import it must not have.
-      fail(`entry: ${relative} threw on require (${error.message})`);
-      continue;
+  const loadEntries = (entries) => {
+    for (const [relative, exported] of entries) {
+      if (!check(pkgDir, relative, 'entry')) continue;
+      let loaded;
+      try {
+        loaded = require(path.join(pkgDir, relative));
+      } catch (error) {
+        // A deep path that throws on require is the failure this exists to
+        // catch: it means the build emitted something Node cannot load, or
+        // that the module grew a React Native import it must not have.
+        fail(`entry: ${relative} threw on require (${error.message})`);
+        continue;
+      }
+      if (typeof loaded[exported] !== 'function') {
+        fail(`entry: ${relative} does not export ${exported}`);
+      }
     }
-    if (typeof loaded[exported] !== 'function') {
-      fail(`entry: ${relative} does not export ${exported}`);
-    }
-  }
+  };
+  // Order matters: the Node-safe entries load before any peer exists, which
+  // is what proves they need none; only then is `react` linked in for the
+  // entries that legitimately import it.
+  loadEntries(NODE_SAFE_ENTRIES);
+  linkPeers(pkgDir);
+  loadEntries(PEER_DEPENDENT_ENTRIES);
 
   checkCodegenSpec(pkgDir, manifest);
   checkRequireGraph(pkgDir, manifest);

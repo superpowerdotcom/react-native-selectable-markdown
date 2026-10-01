@@ -214,14 +214,17 @@ describe('the package entry is an explicit list', () => {
   it('separates the block classifier from the prop that overrides it', () => {
     // Three spellings of one idea used to sit at the root: the `classifyBlock`
     // PROP, its `ClassifyBlock` type, and a `classifyBlock` FUNCTION. The
-    // function is `classifyTopLevelBlock` now, so the bare name belongs to the
-    // prop alone — including as a binding, since re-exporting the function as
-    // `classifyTopLevelBlock` from a module that still called it
-    // `classifyBlock` would leave the collision in place one file down.
+    // function is `classifyTopLevelBlock` now. The old spelling survives at
+    // the root only as a deprecated ALIAS of the new one, so a 0.11 caller
+    // keeps compiling — but no module may call the function `classifyBlock`
+    // any more: re-exporting it from one that still did would leave the
+    // collision in place one file down, and the binding set is what sees
+    // through the alias to catch that.
     expect(entry.names.has('classifyTopLevelBlock')).toBe(true);
     expect(entry.names.has('ClassifyBlock')).toBe(true);
-    expect(entry.names.has('classifyBlock')).toBe(false);
+    expect(entry.names.has('classifyBlock')).toBe(true);
     expect(entry.bindings.has('classifyBlock')).toBe(false);
+    expect(entry.origins.has('./selection/runs#classifyTopLevelBlock')).toBe(true);
   });
 });
 
@@ -259,5 +262,35 @@ describe('the sub-barrels the entry feeds on are explicit too', () => {
     expect(surfaceOf('src/engine/native.ts').names.has('__linkNativeEngine')).toBe(
       true,
     );
+  });
+});
+
+describe('the headless subpath entries are explicit too', () => {
+  // `react-native-selectable-markdown/engine` and `/stream` exist so plain
+  // Node — a consumer's jest, a server-side script — can reach the parser and
+  // the streaming layer without the root, which imports `react-native` at
+  // load. Same rules as the entry: no stars, no renaming. Plus one of their
+  // own: nothing from the view layer or the root, or the subpath would drag
+  // `react-native` back in by another route and stop loading headless.
+  const SUBPATHS = ['src/engine.ts', 'src/stream.ts'];
+
+  it.each(SUBPATHS)('%s re-exports nothing with a star', (path) => {
+    expect(surfaceOf(path).stars).toEqual([]);
+  });
+
+  it.each(SUBPATHS)('%s renames nothing on the way out', (path) => {
+    const surface = surfaceOf(path);
+    expect(
+      [...surface.origins].filter(
+        (origin) => !surface.names.has(origin.slice(origin.indexOf('#') + 1)),
+      ),
+    ).toEqual([]);
+  });
+
+  it.each(SUBPATHS)('%s reaches neither the view layer nor the root', (path) => {
+    const modules = [...surfaceOf(path).origins].map((origin) =>
+      origin.slice(0, origin.indexOf('#')),
+    );
+    expect(modules.filter((m) => m === './index' || m.startsWith('./view'))).toEqual([]);
   });
 });

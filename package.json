@@ -57,7 +57,32 @@
     },
     "./src/*": "./src/*",
     "./package.json": "./package.json",
-    "./react-native.config.js": "./react-native.config.js"
+    "./react-native.config.js": "./react-native.config.js",
+    "./node": "./native/node/index.mjs",
+    "./engine": {
+      "react-native": "./src/engine.ts",
+      "require": {
+        "types": "./dist/engine.d.ts",
+        "default": "./dist/engine.js"
+      },
+      "import": {
+        "types": "./dist/esm/engine.d.ts",
+        "default": "./dist/esm/engine.js"
+      },
+      "default": "./dist/engine.js"
+    },
+    "./stream": {
+      "react-native": "./src/stream.ts",
+      "require": {
+        "types": "./dist/stream.d.ts",
+        "default": "./dist/stream.js"
+      },
+      "import": {
+        "types": "./dist/esm/stream.d.ts",
+        "default": "./dist/esm/stream.js"
+      },
+      "default": "./dist/stream.js"
+    }
   },
   "files": [
     "dist",
@@ -73,7 +98,9 @@
     "react-native.config.js",
     "LICENSE",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "native/node",
+    "scripts/build-node-addon.mjs"
   ],
   "repository": {
     "type": "git",

@@ -419,6 +419,7 @@ describe('the package ships an ES module build beside the CommonJS one', () => {
     module: string;
     'react-native': string;
     exports: Record<string, Record<string, unknown>>;
+    files: string[];
   };
   const esmDir = path.join(repoRoot, 'dist', 'esm');
   // The suites below need `npm run build` to have run. CI has it (npm ci runs
@@ -443,6 +444,40 @@ describe('the package ships an ES module build beside the CommonJS one', () => {
         `${key}: ${key.includes('*') ? './dist/esm/*.js' : `./${manifest.module}`}`,
       );
     }
+  });
+
+  it('declares the headless subpaths with the same three conditions as the root', () => {
+    // `<name>/engine` and `<name>/stream` are what a consumer that cannot load
+    // the root — plain Node, its jest — imports instead: the parser and the
+    // streaming layer without the view layer's `react-native` import. Each is
+    // a real barrel in src/ (src/index.test.ts keeps it star-free and off the
+    // view layer), built into both trees, and the conditions must line up
+    // with the root's: Metro to src/, `require` to dist/, `import` to dist/esm.
+    for (const name of ['engine', 'stream']) {
+      const entry = manifest.exports[`./${name}`] as Record<
+        string,
+        { types?: string; default?: string } | string
+      >;
+      expect(`${name}: ${JSON.stringify(entry)}`).toBe(
+        `${name}: ${JSON.stringify({
+          'react-native': `./src/${name}.ts`,
+          require: { types: `./dist/${name}.d.ts`, default: `./dist/${name}.js` },
+          import: { types: `./dist/esm/${name}.d.ts`, default: `./dist/esm/${name}.js` },
+          default: `./dist/${name}.js`,
+        })}`,
+      );
+      expect(fs.existsSync(path.join(repoRoot, 'src', `${name}.ts`))).toBe(true);
+    }
+  });
+
+  it('ships the Node addon loader and what a consumer needs to build it', () => {
+    // A consumer's test setup requires `<name>/node` and, when the addon is
+    // not built yet, tells the developer to run the build script out of
+    // node_modules. Both must therefore be in the tarball, and `exports` must
+    // let the loader be reached.
+    expect(manifest.exports['./node']).toBe('./native/node/index.mjs');
+    expect(manifest.files).toContain('native/node');
+    expect(manifest.files).toContain('scripts/build-node-addon.mjs');
   });
 
   it('resolves the bare directory path again', () => {

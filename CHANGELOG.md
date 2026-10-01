@@ -4,8 +4,8 @@ Versions follow [semver](https://semver.org/); pre-1.0, breaking changes land in
 
 ## [Unreleased]
 
-- BREAKING: the package entry exports an explicit list of 190 names. Nineteen internals left the root and are imported by path instead (`dist/engine/native`, `dist/view/selectionActions`, `dist/agui/useAgUiSession`, `dist/selection/runs`, `dist/stream/repair`).
-- BREAKING: the exported `classifyBlock` function is now `classifyTopLevelBlock`. The `classifyBlock` prop and the `ClassifyBlock` type are unchanged.
+- BREAKING: the package entry exports an explicit list of 191 names. Ten internals left the root and are imported by path instead: `decodeFlatBuffer`, `NativeProtocolError`, `applySmartPunctuation`, `PROTOCOL_VERSION`, `findHostBinding`, `NativeHostBinding` and `__linkNativeEngine` from `dist/engine/native`; `getOrCreateSession` from `dist/agui/useAgUiSession`; `embedContentFor` from `dist/selection/runs`; `isUriLikeLabel` from `dist/stream/repair`.
+- Deprecated: the exported `classifyBlock` function is now `classifyTopLevelBlock`. The old name stays as a deprecated alias until a later minor. The `classifyBlock` prop and the `ClassifyBlock` type are unchanged.
 - Selection: imperative API on `<SelectableMarkdown>`. A `ref` (`SelectableMarkdownHandle`) exposes `getSelection()`, `clearSelection()` and `setSelection(span)`; `onSelectionChange` reports the live selection as `{ span, plain }` or `null`.
 - Selection: `RunHostHandle` (`clearSelection`, `setSelection`) and the exported `mapSourceToRunRange` for consumers driving `RunHost` directly.
 - Selection: `exclusiveSelection` prop (default `true`) on `<SelectableMarkdown>` and `RunHost`; `false` opts out of the one-active-selection coordination.
@@ -29,6 +29,7 @@ Versions follow [semver](https://semver.org/); pre-1.0, breaking changes land in
 - iOS: the blockquote bar sits on the leading edge for right-to-left paragraphs.
 - Android: selection menu strings ship in `res/values/strings.xml` (`selectable_markdown_copy_text`, `selectable_markdown_copy_markdown`) and can be overridden or translated.
 - Packaging: `exports` map (root, `./dist`, `./dist/*`, `./src/*`, `./package.json`, `./react-native.config.js`), `sideEffects: false`, an ES module build in `dist/esm` with `import`/`require` conditions, and `dist/view/SelectableRunHostNativeComponent.d.ts` beside the shim.
+- Packaging: `./engine` and `./stream` subpath entries for headless consumers (plain Node, a consumer's jest) that cannot load the root because it imports `react-native`; `./node` resolves the Node addon loader, and `native/node` plus `scripts/build-node-addon.mjs` ship in the tarball so a consumer can build the engine for its tests.
 - Release: notes come from this file (`scripts/changelog-section.mjs`); `scripts/check-unreleased-breaking.mjs` refuses a pending breaking change under an already-tagged version; `scripts/check-lock-sync.mjs` checks the lockfile mirrors the manifest.
 - Benches and CI: `bench:pathological` takes per-stage budgets and `--require-engine`; `bench:projection` is a CI gate.
 

@@ -15,7 +15,7 @@
  *
  * (Both figures are reproducible with the TypeScript checker's
  * `getExportsOfModule` on this file: 167 against a `git archive` of the
- * pre-fix commit, 190 against the list below. The nineteen internals the
+ * pre-fix commit, 191 against the list below. The ten internals the
  * changeover dropped are itemised in CHANGELOG.md; the rest of the difference
  * is public API added since.)
  *
@@ -188,7 +188,9 @@ export { trimTrailingPlaceholders } from './stream/placeholders';
 // is the type of the `classifyBlock` PROP that overrides it. The function was
 // called `classifyBlock` too until 0.12, which put three spellings of one idea
 // at the package root and made "call classifyBlock" ambiguous in every
-// sentence that used it.
+// sentence that used it. The old spelling stays as a deprecated ALIAS of the
+// new one — the binding is `classifyTopLevelBlock`, only the exported name is
+// old — so a 0.11 caller keeps compiling and sees the deprecation at the call.
 export type {
   RunSegment,
   BlockClass,
@@ -199,6 +201,12 @@ export type {
 } from './selection/runs';
 export {
   classifyTopLevelBlock,
+  /**
+   * @deprecated Renamed to `classifyTopLevelBlock` in 0.12.0; this alias is
+   * removed in a later minor. The `classifyBlock` PROP and the `ClassifyBlock`
+   * type are unaffected.
+   */
+  classifyTopLevelBlock as classifyBlock,
   segmentRuns,
   DEFAULT_MAX_RUN_CHARS,
 } from './selection/runs';

@@ -65,7 +65,7 @@ jobs:
       # Everything still sitting under `## [Unreleased]` when a tag is cut is in
       # that tarball, so a line there saying BREAKING is a break published under
       # a version whose notes never mention it — which is the state the last
-      # audit left behind (nineteen names dropped from the package root, an
+      # audit left behind (ten names dropped from the package root, an
       # export renamed, a deep path that stopped resolving, all under an
       # unbumped 0.11.0). The tag is passed explicitly because `actions/checkout`
       # fetches the pushed ref and need not have any other tag locally.

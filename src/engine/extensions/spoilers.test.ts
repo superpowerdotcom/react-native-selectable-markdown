@@ -1,4 +1,5 @@
 import type {
+  Block,
   BlockquoteNode,
   ListNode,
   ParsedDocument,
@@ -66,16 +67,24 @@ describeNative('spoilers are OFF by default (the stray-pipe fix)', () => {
 
   test('llmChat preset also keeps spoilers off', () => {
     const doc = parse('||x||', presets.llmChat);
-    expect(spoilerCount(doc)).toBe(0);
+    expect((doc.blocks[0] as ParagraphNode).children).toEqual([
+      { kind: 'text', span: { start: 0, end: 5 }, value: '||x||' },
+    ]);
   });
 
   test('the commonmark preset keeps spoilers off', () => {
     const doc = parse('||x||', presets.commonmark);
-    expect(spoilerCount(doc)).toBe(0);
+    expect((doc.blocks[0] as ParagraphNode).children).toEqual([
+      { kind: 'text', span: { start: 0, end: 5 }, value: '||x||' },
+    ]);
   });
 });
 
 describeNative('spoilers with the everything preset', () => {
+  test.each([1, 2, 3, 4])('respects escape parity with %i backslashes', (count) => {
+    const source = 'a' + '\\'.repeat(count) + '||b||';
+    expect(spoilerCount(parse(source, presets.everything))).toBe(count % 2 === 0 ? 1 : 0);
+  });
   test('"||hidden||" becomes a spoiler node with an exact span', () => {
     const doc = parse('||hidden||', presets.everything);
     const p = doc.blocks[0] as ParagraphNode;
@@ -126,7 +135,14 @@ describeNative('spoilers with the everything preset', () => {
 
   test('a stray pipe in a heading stays literal even when enabled', () => {
     const doc = parse('# a | b || c', presets.everything);
-    expect(spoilerCount(doc)).toBe(0);
+    expect(doc.blocks).toEqual([
+      {
+        kind: 'heading',
+        span: { start: 0, end: 12 },
+        level: 1,
+        children: [{ kind: 'text', span: { start: 2, end: 12 }, value: 'a | b || c' }],
+      },
+    ]);
   });
 
   test('spoilers inside blockquotes and list items', () => {
@@ -154,7 +170,10 @@ describeNative('a stray | never produces a spoiler, even when enabled', () => {
     '||',
   ])('%j stays spoiler-free', (src) => {
     const doc = parse(src, presets.everything);
-    expect(spoilerCount(doc)).toBe(0);
+    const span = { start: 0, end: src.length };
+    expect(doc.blocks).toEqual([
+      { kind: 'paragraph', span, children: [{ kind: 'text', span, value: src }] },
+    ]);
   });
 
   test('an unpaired trailing || after a real pair stays literal', () => {
@@ -202,43 +221,34 @@ describeNative('applySpoilers transform contract', () => {
 
   test('escaped pipes are skipped: the source has no `||` run to match', () => {
     // `\|\|` is two runs of one pipe in the source against one run of two in
-    // the value, so the run lists do not line up and the node is skipped.
-    // That is the "an escaped pipe is never a marker" rule, arrived at by
-    // the same check that lets an unescaped one through.
+    // the value.
     const doc = parse('\\|\\|not a spoiler\\|\\|', presets.everything);
-    expect(spoilerCount(doc)).toBe(0);
+    expect((doc.blocks[0] as ParagraphNode).children).toEqual([
+      { kind: 'text', span: { start: 0, end: 21 }, value: '||not a spoiler||' },
+    ]);
   });
 
   test('an escaped pipe touching a real one is skipped too', () => {
-    // `\||x\||` has the same run *lengths* in source and value — two runs of
-    // two — but the source's runs start one character into an escape. Taking
-    // them would give the spoiler a span that starts inside `\|`, so the
-    // node is refused instead.
+    // Same run lengths in source and value, but the source's runs start inside
+    // an escape.
     const doc = parse('\\||x\\||', presets.everything);
-    expect(spoilerCount(doc)).toBe(0);
+    expect((doc.blocks[0] as ParagraphNode).children).toEqual([
+      { kind: 'text', span: { start: 0, end: 7 }, value: '||x||' },
+    ]);
   });
 
   test('an entity written as pipes never becomes a marker', () => {
     const doc = parse('&#124;&#124;x&#124;&#124;', presets.everything);
-    expect(spoilerCount(doc)).toBe(0);
+    expect((doc.blocks[0] as ParagraphNode).children).toEqual([
+      { kind: 'text', span: { start: 0, end: 25 }, value: '||x||' },
+    ]);
   });
 });
 
 describeNative('a divergence that leaves the pipes alone keeps the spoiler', () => {
   /**
-   * The regression that made spoilers unusable in the only preset that ships
-   * them. The decoder merges adjacent text events into one run, so a single
-   * entity, escape or smart-punctuation rewrite anywhere in a paragraph
-   * produced one text node whose value was shorter than its slice — and the
-   * old "value length must equal span width" guard then skipped the whole
-   * paragraph, not the one character that diverged. `everything` enables
-   * `smartPunctuation` alongside `spoilers`, so an ordinary sentence ending
-   * in `...` was enough to render the secret in the clear.
-   *
-   * Each case below asserts the spans as well as the count, because the
-   * offsets are the reason the guard existed: a spoiler placed by value
-   * offsets in a diverged node would cover the wrong source characters and
-   * copy back the wrong markdown.
+   * Spans are asserted too: a spoiler placed by value offsets in a diverged
+   * node copies the wrong markdown.
    */
   test.each([
     ['smart ellipsis', '||secret|| and so on ...'],
@@ -253,8 +263,6 @@ describeNative('a divergence that leaves the pipes alone keeps the spoiler', () 
     const sp = p.children[0] as SpoilerNode;
     expect(slice(doc, sp)).toBe('||secret||');
     expect(sp.children[0]).toMatchObject({ kind: 'text', value: 'secret' });
-    // The tail keeps covering the raw source it came from, right through the
-    // rewrite: the slice is the markdown, the value is what renders.
     const tail = p.children[1];
     expect(slice(doc, tail)).toBe(source.slice(10));
   });
@@ -277,31 +285,15 @@ describeNative('a divergence that leaves the pipes alone keeps the spoiler', () 
     expect(spoilerCount(doc)).toBe(2);
     const p = doc.blocks[0] as ParagraphNode;
     expect(slice(doc, p.children[0])).toBe('||a||');
-    // The middle run is the whole point: its slice is the five source
-    // characters the author typed, its value is the three the reader sees,
-    // and the second spoiler's span still lands on `||b||`.
     expect(slice(doc, p.children[1])).toBe(' ... ');
     expect(p.children[1]).toMatchObject({ value: ' … ' });
     expect(slice(doc, p.children[2])).toBe('||b||');
   });
 });
 
-// ---------------------------------------------------------------------------
-// Nesting depth
-// ---------------------------------------------------------------------------
-
 /**
- * The transform walks the block tree, and the tree's depth is whatever the
- * model emitted — `'> '.repeat(n)` is an n-deep blockquote and costs two
- * bytes a level. The blockquote/list/listItem arms used to recurse, so 5 kB
- * of `'> '` threw `RangeError: Maximum call stack size exceeded` out of
- * `parseDocument` itself (and out of `StreamSession.append`) for anyone on
- * `presets.everything`, which is the only shipped preset with spoilers on.
- * `presets.llmChat` never called this transform and so never overflowed,
- * which is exactly why the earlier depth work missed it.
- *
- * The first case needs no parser: it builds the tree directly, so the bound
- * is pinned even on a machine that cannot compile the addon.
+ * The first case builds the tree directly, so the bound holds even without the
+ * native addon.
  */
 describe('applySpoilers is depth-bounded', () => {
   function nestedQuotes(depth: number, leaf: ParagraphNode): ParsedDocument {
@@ -321,7 +313,7 @@ describe('applySpoilers is depth-bounded', () => {
     const doc = nestedQuotes(20000, leaf);
     const out = applySpoilers(doc);
     expect(out).not.toBe(doc);
-    // And the rewrite really reached the bottom rather than stopping early.
+    // Reached the bottom rather than stopping early.
     expect(spoilerCount(out)).toBe(1);
   });
 
@@ -339,9 +331,22 @@ describe('applySpoilers is depth-bounded', () => {
 describeNative('deep nesting under the everything preset', () => {
   test('a 3000-level blockquote parses instead of throwing', () => {
     const source = '> '.repeat(3000) + 'hi\n';
-    expect(() => parse(source, presets.everything)).not.toThrow();
-    // llmChat was always fine; the point is that `everything` now is too.
-    expect(() => parse(source, presets.llmChat)).not.toThrow();
+    for (const options of [presets.everything, presets.llmChat]) {
+      const doc = parse(source, options);
+      expect(doc.blocks).toHaveLength(1);
+      let node: Block = doc.blocks[0];
+      let depth = 0;
+      while (node.kind === 'blockquote') {
+        depth += 1;
+        node = node.children[0];
+      }
+      expect(depth).toBe(3000);
+      expect(node).toEqual({
+        kind: 'paragraph',
+        span: { start: 6000, end: 6002 },
+        children: [{ kind: 'text', span: { start: 6000, end: 6002 }, value: 'hi' }],
+      });
+    }
   });
 
   test('a 5000-level blockquote streams and finalizes under everything', () => {

@@ -3,49 +3,11 @@
 // bundlers can actually load: writes dist/esm/package.json and gives every
 // relative import specifier the file extension ES modules require.
 //
-// WHY THE EMIT IS NOT ENOUGH ON ITS OWN
-// ------------------------------------
-// Two things are wrong with `module: es2020` output the moment it lands in a
-// package whose root package.json has no `"type"`:
+// tsc rewrites no specifiers and Node's ESM resolver does no extension search, so
+// an extensionless relative specifier left after the rewrite fails the build.
 //
-//   1. Node reads dist/esm/*.js as CommonJS, because the nearest package.json
-//      says nothing and the default is CommonJS. Every `import` statement in
-//      those files is then a SyntaxError. dist/esm/package.json declaring
-//      `"type": "module"` is the whole fix, and it is scoped to that directory
-//      — dist/ itself stays CommonJS, which is what `main` and the `require`
-//      condition promise.
-//   2. tsc does not rewrite import specifiers (it never has, in any module
-//      mode): `import { x } from './options'` is emitted verbatim, and Node's
-//      ESM resolver does no extension search, so that import fails with
-//      ERR_MODULE_NOT_FOUND. The rewrite below resolves each specifier against
-//      the emitted tree and appends `.js` (or `/index.js` for a directory),
-//      which is also what TypeScript's own `node16` resolution expects to find
-//      inside the .d.ts files.
-//
-// Both are checked rather than assumed: after the rewrite this script scans
-// every emitted file for an import or export statement whose relative
-// specifier still has no extension, and fails the build if it finds one. A
-// half-rewritten ESM tree would otherwise ship and break only in the consumer
-// who imported the one module that was missed.
-//
-// `sideEffects: false` is repeated in dist/esm/package.json on purpose.
-// webpack and Rollup read that hint from the package.json NEAREST the module,
-// not from the package root, so leaving it out of this file would throw away
-// the tree-shaking the ESM build exists to enable.
-//
-// WHAT THIS OUTPUT IS AND IS NOT FOR. The `import` condition points at it, so
-// it is what webpack, Rollup, Vite and Node's own ESM loader take. Metro is
-// deliberately NOT one of them: `exports` sends the `react-native` condition to
-// src/, and on the deep paths the `require` condition is listed ahead of
-// `import`, so a bundler that asserts both (Metro does) stays on the CommonJS
-// tree. That matters because two modules here reach the platform through a
-// call-expression `require` — `require('react-native')` in
-// src/engine/native/install.ts and `require('./SelectableRunHostNativeComponent')`
-// in src/view/RunHost.tsx — and `require` does not exist in an ES module
-// scope. Both calls sit inside a `try`/`catch` whose fallback is the same one
-// a web bundle already takes (no native module, no native host), so the ESM
-// copy degrades exactly as the CommonJS copy does on web; what it must not
-// become is the copy a React Native app loads.
+// Metro never takes this tree: `require` is listed ahead of `import`, so the
+// `require` calls in install.ts and RunHost.tsx stay on the CommonJS build.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -53,7 +15,6 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-/** Reads a tsconfig that may carry line comments (this repo's do). */
 const readTsconfig = (file) =>
   JSON.parse(fs.readFileSync(path.join(repoRoot, file), 'utf8').replace(/^\s*\/\/.*$/gm, ''));
 
@@ -82,16 +43,7 @@ const walk = (dir) => {
 };
 walk(outDir);
 
-/**
- * The specifier as ES modules need it spelled, or null when it names nothing
- * in the emitted tree.
- *
- * Resolution is done against the FILES ON DISK rather than by pattern, so a
- * specifier that already carries its extension is left alone and a directory
- * import becomes `/index.js` — the two shapes tsc's output actually contains.
- * A .d.ts gets the same `.js` spelling, which is what TypeScript's node16
- * resolution looks for (it maps `./x.js` to `./x.d.ts` itself).
- */
+/** A .d.ts gets `.js` too: node16 resolution maps `./x.js` to `./x.d.ts` itself. */
 const resolved = (fromFile, specifier) => {
   if (!specifier.startsWith('./') && !specifier.startsWith('../')) return null;
   if (specifier.endsWith('.js') || specifier.endsWith('.json')) return null;
@@ -101,10 +53,7 @@ const resolved = (fromFile, specifier) => {
   return null;
 };
 
-// `from './x'`, `import './x'` and `import('./x')` — the three forms tsc emits
-// a module specifier in. Anchored on the keyword so an ordinary string in the
-// code cannot be rewritten by accident, and every match is still checked
-// against the filesystem before it is touched.
+// Anchored on the keyword so an ordinary string literal is never rewritten.
 const SPECIFIER = /(\bfrom\s+|\bimport\s*\(\s*|\bimport\s+)(['"])(\.[^'"]*)\2/g;
 
 let rewritten = 0;
@@ -119,10 +68,7 @@ for (const file of files) {
   if (after !== before) fs.writeFileSync(file, after);
 }
 
-// The post-condition, checked rather than trusted: nothing may be left with a
-// relative specifier an ESM resolver cannot follow. `import('…')` is excluded
-// from this scan because a dynamic specifier can be built at runtime; the
-// statement forms cannot.
+// `import('…')` is not scanned: a dynamic specifier can be built at runtime.
 const STATEMENT =
   /^\s*(?:import|export)\b[^\n]*?(?:\bfrom\s+)?(['"])(\.[^'"]*)\1\s*;?\s*$/;
 const offenders = [];
@@ -146,9 +92,7 @@ if (offenders.length > 0) {
   process.exit(1);
 }
 
-// `"type": "module"` scopes this directory to ES modules; dist/ stays
-// CommonJS. `sideEffects` is repeated because bundlers read it from the
-// nearest package.json — see the header.
+// `sideEffects` is repeated because bundlers read it from the nearest package.json.
 const marker = {
   type: 'module',
   sideEffects: false,

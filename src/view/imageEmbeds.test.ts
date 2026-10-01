@@ -1,17 +1,4 @@
-/**
- * The built-in image embed: `SelectableMarkdown`'s `images: 'embed'` default.
- *
- * The claim itself is a pure function of `(node, context)` and the theme's
- * box, so it is tested directly, and then through the two consumers that have
- * to agree about it — `segmentRuns` (does the block still flow?) and
- * `projectRun` (does the image project one placeholder instead of its alt
- * text?).
- *
- * `react-native` is stubbed the way `renderers.test.ts` stubs it, because the
- * claim's `render` now goes through `renderNode` — the image renderer is
- * PLACED as an element like every other renderer instead of being called — and
- * that pulls the renderer module in. Nothing here mounts anything.
- */
+// The claim's `render` goes through `renderNode`, which pulls in `react-native`.
 
 jest.mock('react-native', () => ({
   Image: 'Image',
@@ -38,11 +25,33 @@ import { makeDoc, plainParagraph, spanOf } from '../selection/__tests__/fixtures
 import { withImageEmbeds } from './imageEmbeds';
 import type { EmbedRenderer } from './SelectableMarkdown';
 import type { RenderContext } from './renderers';
+import { parseDocument } from '../engine/Engine';
+import { presets } from '../engine/options';
+import { describeNative, requireNativeEngine } from '../engine/native/__tests__/support';
 
 const BOX = { width: 280, height: 200 };
-const NESTED: EmbedClaimContext = { topLevel: false };
+const NESTED: EmbedClaimContext = { topLevel: false, soleChildOfTopLevelParagraph: true };
 
 const SOURCE = 'Before.\n\n![alt](img.png)\n\nAfter.';
+
+describeNative('image placement boundaries', () => {
+  it.each([
+    ['![alt](https://e.test/a.png)', false],
+    ['text ![alt](https://e.test/a.png)', true],
+    ['# ![alt](https://e.test/a.png)', true],
+    ['**![alt](https://e.test/a.png)**', true],
+    ['- ![alt](https://e.test/a.png)', true],
+    ['> ![alt](https://e.test/a.png)', true],
+    ['| Image |\n| --- |\n| ![alt](https://e.test/a.png) |', true],
+  ])('keeps segmentation and projection consistent for %j', (source, standalone) => {
+    const doc = parseDocument(source, presets.llmChat, requireNativeEngine());
+    const embed = withImageEmbeds(undefined, BOX);
+    const [run] = segmentRuns(doc, { embed });
+    expect(run.standalone).toBe(standalone);
+    const projected = projectRun(run, doc, { embed });
+    expect(projected.embeds ?? []).toHaveLength(standalone ? 0 : 1);
+  });
+});
 
 function imageNode(alt = 'alt'): ImageNode {
   return {
@@ -75,9 +84,7 @@ describe('withImageEmbeds', () => {
   });
 
   it('declares no copy text for an image with no alt', () => {
-    // `text` absent means the placeholder is DELETED from a copy-text
-    // payload rather than copied as U+FFFC — the same nothing an alt-less
-    // image projected when it flowed.
+    // No `text` drops the placeholder from copy text instead of copying U+FFFC.
     const claim = withImageEmbeds(undefined, BOX)(imageNode(''), NESTED);
 
     expect(claim).toMatchObject({ width: 280, height: 200 });
@@ -93,6 +100,7 @@ describe('withImageEmbeds', () => {
     };
 
     expect(lookup(text, NESTED)).toBeUndefined();
+    expect(lookup(imageNode(), NESTED)).toMatchObject({ width: 280, height: 200 });
   });
 
   it('lets the consumer claim win outright', () => {
@@ -116,7 +124,7 @@ describe('withImageEmbeds', () => {
     lookup(imageNode(), { topLevel: true });
     lookup(imageNode(), NESTED);
 
-    expect(seen).toEqual([{ topLevel: true }, { topLevel: false }]);
+    expect(seen).toEqual([{ topLevel: true }, NESTED]);
   });
 
   it.each([
@@ -125,18 +133,12 @@ describe('withImageEmbeds', () => {
     ['NaN', { width: Number.NaN, height: 200 }],
     ['infinite', { width: 280, height: Number.POSITIVE_INFINITY }],
   ])('declines a %s box, leaving the image to VIEW_KINDS', (_label, box) => {
-    // A box no host would reserve for must not be claimed: the claim would
-    // be refused downstream and the image would flow as its alt text, which
-    // is the one outcome worse than a standalone block.
     expect(withImageEmbeds(undefined, box)(imageNode(), NESTED)).toBeUndefined();
+    expect(withImageEmbeds(undefined, BOX)(imageNode(), NESTED)).toMatchObject(BOX);
   });
 
   it('renders through the context image renderer, overrides included', () => {
-    // The renderer is PLACED, not called: `render` returns the element
-    // `renderNode` builds, which names the context's `image` renderer and
-    // gives it its own component instance. Calling it here instead — which
-    // this test used to assert — ran a consumer's override inside
-    // `EmbedOverlay`'s body, so any hook in it joined the overlay's hook list.
+    // Placed as an element, not called, so an override's hooks get their own instance.
     const drawn: ImageNode[] = [];
     const image = imageNode();
     const renderImage = (node: ImageNode): null => {
@@ -157,7 +159,6 @@ describe('withImageEmbeds', () => {
     expect(element.props.node).toBe(image);
     expect(element.props.render).toBe(renderImage);
 
-    // And the element, once rendered, is what calls the override.
     (element.type as (props: unknown) => unknown)(element.props);
     expect(drawn).toEqual([image]);
   });
@@ -168,8 +169,6 @@ describe('the images: "embed" default, through the pipeline', () => {
     const image = imageNode();
     const doc = imageDoc(image);
 
-    // Without the claim, the image is a VIEW_KIND and its paragraph is its
-    // own selection scope — the sweep across the answer breaks in two.
     expect(segmentRuns(doc).map((run) => run.standalone)).toEqual([
       false,
       true,
@@ -200,16 +199,10 @@ describe('the images: "embed" default, through the pipeline', () => {
       node: image,
       content: { width: 280, height: 200, text: 'alt' },
     });
-    // The alt text is gone from the projection: a placeholder stands for the
-    // node, and the piece under it carries the image's whole span, so a sweep
-    // across it copies `![alt](img.png)`.
     expect(projected.text).not.toContain('alt');
   });
 
   it('leaves the image standalone when the claim is declined', () => {
-    // `images: 'standalone'` is the prop, but a theme box that cannot be
-    // reserved reaches the same place: the paragraph goes back to its own
-    // scope and the picture is drawn by the renderer, not deleted.
     const doc = imageDoc(imageNode());
     const runs = segmentRuns(doc, {
       embed: withImageEmbeds(undefined, { width: 0, height: 0 }),
@@ -219,9 +212,7 @@ describe('the images: "embed" default, through the pipeline', () => {
   });
 
   it('never embeds an image the stream is still repairing', () => {
-    // `embedContentFor` refuses incomplete nodes whatever a lookup says, so
-    // the paragraph stays standalone until the image settles — an overlay on
-    // a span that is still moving is the artifact embeds exist to avoid.
+    // `embedContentFor` refuses incomplete nodes whatever the claim says.
     const image = { ...imageNode(), incomplete: true as const };
     const runs = segmentRuns(imageDoc(image), {
       embed: withImageEmbeds(undefined, BOX),

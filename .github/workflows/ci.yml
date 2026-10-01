@@ -5,11 +5,20 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -34,19 +43,7 @@ jobs:
       # gate. While a second, pure-TypeScript parser existed, a runner with no
       # C++ toolchain could still prove the library and merely skip the native
       # measurements, so `--if-available` cost only numbers. Now a runner that
-      # skips this build runs *zero* markdown-parsing checks: every suite that
-      # parses markdown reaches the engine through the helpers in
-      # src/engine/native/__tests__/support.ts, and `describeNative` there is
-      # `describe.skip` without the addon. That is half the suite —
-      #
-      #   grep -rlE 'describeNative|linkNativeEngineAsDefault|requireNativeEngine' \
-      #     src conformance --include='*.test.ts' --include='*.test.tsx' | wc -l
-      #
-      # returned 22 of the 45 suites under src/ and conformance/ as this was
-      # written — the conformance run has nothing to score, and the job goes
-      # green having tested no parse. A missing compiler on ubuntu-latest is
-      # not a tolerable runner property, it is a broken job, so it fails here
-      # where the cause is named rather than passing silently downstream.
+      # skips this build runs no parsing suite: `describeNative` skips without the addon.
       #
       # This must come BEFORE `npm test`: the src/engine/native/ suites load
       # build/selectable-markdown.node, and jest picks them up automatically.
@@ -68,63 +65,18 @@ jobs:
       # Gates: unit suites, the every-character-prefix streaming oracle,
       # copy-fidelity properties, and the tail-repair corpus.
       - run: npm test
-      - run: npm run build
-      # Gate: adversarial input stays cheap in every stage a consumer runs, not
-      # only in the parse. md4c is linear on all four of these shapes, so a
-      # parse-only measurement gates the one stage that was never going to
-      # fail; the bench times tail repair, run segmentation and run projection
-      # beside it, and a throw (a stack overflow on deeply nested input, say)
-      # counts as a failure however fast it was.
-      #
-      # The budgets are PER STAGE because the stages differ by four orders of
-      # magnitude: measured medians on a developer machine are parse 23 ms,
-      # repair 31 ms, project 18 ms and segment 3.5 ms on the worst case of
-      # each, so one 1000 ms number — which is what this step used to pass —
-      # left `segment` free to get a hundred times slower and still pass. Each
-      # is 25-60x its measured median: not a performance target, a cliff
-      # detector, with enough headroom for a shared runner. The numbers
-      # themselves belong to docs/BENCHMARKS.md, measured on a machine whose
-      # clock is worth reading.
-      #
-      # `--require-engine` is what stops the step passing vacuously. Without
-      # it the bench exits 0 after printing that the addon did not resolve —
-      # a protocol-version drift between the built addon and dist/ is the
-      # likeliest way that happens here, and it would turn this gate green
-      # having measured nothing.
+      # Per-stage budgets are cliff detectors at 25-60x the measured medians, not targets.
       - run: >-
           npm run bench:pathological --
           --require-engine
           --budget-parse 750 --budget-repair 750 --budget-segment 200 --budget-project 750
-      # Gate: adversarial STREAMING, which the document shapes above cannot
-      # see. `transcript-giant-list.json` is one 420-item bullet list, and a
-      # list never anchors — `StreamSession.isAnchorSafe` refuses it, a blank
-      # line does not end it — so every one of its 2484 appends re-reads the
-      # whole accumulated text and pays the splice on top. That is where a
-      # repair or splice pass that stops being linear shows up first, and it
-      # shows up in the number a user feels: `ms/chunk`. Before this step the
-      # bench had no budget, no non-zero exit and no workflow, so nothing
-      # anywhere failed on the adversarial streaming shape.
-      #
-      # Budgets are cliff detectors, not targets: measured on a developer
-      # machine the p99 append is 0.8 ms and finalize's single clean parse of
-      # the 22 kB result is 0.8 ms, so 20 ms and 50 ms leave 25-60x for a
-      # shared runner — the same headroom rule as the step above. `--repeat 1`
-      # because the p99 is taken over 2484 appends within one replay; the
-      # extra replays only steady the incremental-vs-full ratio, which is a
-      # published number rather than a gated one. `--require-engine` for the
-      # same reason it is on the step above.
+      # This transcript never anchors, so every append re-reads the whole text.
       - run: >-
           npm run bench:streaming --
           --transcript conformance/fixtures/transcript-giant-list.json
           --require-engine --repeat 1
           --budget-chunk 20 --budget-finalize 50
-      # Gate: incremental projection still tracks the deltas rather than the
-      # document. This one is a COUNT, not a clock — source characters handed
-      # to `projectRun` over a whole replay — so it is deterministic and can be
-      # gated tightly: `cached` amplification must not grow more than 1.25x
-      # when the document doubles (it measures 0.99-1.00; the pipeline it
-      # replaced measures 1.98-2.09). It caught nothing before because nothing
-      # ran it: the bench printed the word "gate" and exited 0 regardless.
+      # A deterministic count, not a clock: `cached` growth over 1.25x per doubling fails.
       - run: npm run bench:projection -- --require-engine
       # Gate: the packed tarball is what a consumer actually installs, and
       # dist/ is never committed — this proves it still carries a working
@@ -179,6 +131,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -197,48 +151,9 @@ jobs:
           else
             sudo apt-get update && sudo apt-get install -y libboost-dev
           fi
-      # Gate: every .cpp of the VIEW LAYER is compiled against the genuine
-      # React Native 0.75.4 renderer headers — on BOTH platform header sets on
-      # the macOS leg, on the Android set here on ubuntu — including the
-      # Android include-order seam that decides whether runs measure at all.
       - run: npm run check:fabric-cpp
-      # Gate: the checker can still fail. Seven deliberate breakages must each
-      # be rejected, and rejected for the stated reason — against the iOS
-      # headers on macOS, the Android headers on ubuntu. Five of them
-      # (`MUTATIONS` in the script) are compiled into the synthetic Fabric
-      # translation unit the default run compiles; the other two
-      # (`SOURCE_MUTATIONS`) are applied to COPIES OF THE REAL
-      # platform/fabric sources, and they pin the clone-guard tripwire: that
-      # the static_assert fires when React Native moves both clean-clone
-      # mechanisms, and that the deliberately absent `override` is load-bearing
-      # rather than an oversight.
       - run: npm run check:fabric-cpp:selftest
-      # Gate: and every .cpp of the ENGINE, which the run above deliberately
-      # skips (it reaches no react/renderer header, and dragging the parser
-      # into the Fabric pass would only prove the harness works). Without this
-      # step platform/cpp compiled in no automated job at all — including
-      # SelectableMarkdownJsi.cpp, the installer that publishes
-      # `__selectableMarkdown` and therefore the only path the app has to the
-      # parser. It ships into libselectable-markdown.so through
-      # android/CMakeLists.txt and into the pod through the podspec's
-      # source_files, and nothing here runs Gradle or CocoaPods.
-      #
-      # `--syntax-only` at the podspec's own C++ standard is the whole check:
-      # the engine has no React Native dependency beyond <jsi/jsi.h>, so a
-      # clean parse and semantic analysis is what a consumer's compiler is
-      # going to disagree with, and it takes seconds against the deps the run
-      # above already fetched. The platform is picked to match the runner
-      # because an explicit file list narrows check-fabric-cpp to one pass, and
-      # the iOS one needs an Apple SDK.
-      #
-      # The file list is built with `find`, not with `platform/cpp/*.cpp`. That
-      # glob is non-recursive and expanded by the runner's shell, so an engine
-      # source added in a subdirectory of platform/cpp would fall silently
-      # outside this gate — the default run reports such a file as skipped and
-      # nothing goes red. vendor/ is pruned because it is md4c's own C, built
-      # by scripts/build-node-addon.mjs at -std=c11 and not ours to hold to the
-      # podspec's C++ standard. An empty list fails the step rather than
-      # passing over nothing.
+      # The only job that compiles platform/cpp; `find` because a shell glob does not descend.
       - name: Compile the markdown engine at the podspec's C++ standard
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then platform=ios; else platform=android; fi
@@ -262,6 +177,8 @@ jobs:
       RNSM_REQUIRE_SWIFT: '1'
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 20

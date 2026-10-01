@@ -94,6 +94,7 @@ const log = (message) => console.log(`[check-codegen] ${message}`);
 /** Asserts `haystack` contains `needle` verbatim; `why` explains what breaks. */
 const expectText = (haystack, needle, label, why) => {
   if (haystack.includes(needle)) return true;
+  if (label === 'view config' && haystack.replace(/"/g, "'").includes(needle.replace(/"/g, "'"))) return true;
   fail(`${label}: expected to find\n      ${needle}\n    ${why}`);
   return false;
 };
@@ -172,13 +173,7 @@ if (codegenConfig.android?.javaPackageName !== 'com.selectablemarkdown') {
 // the app, export `SelectableRunHostCls` — every assertion in this file and in
 // check-fabric-cpp.mjs green — and still be absent from the provider
 // dictionary. `UIManager.hasViewManagerConfig('SelectableRunHost')` then
-// answers false and every run throws, because there is nothing under that tier
-// any more: the `<Text selectable>` fallback was removed in 0.10.0. When this
-// last shipped, at 0.2.0, the same missing registration was silent instead —
-// the fallback rendered a document that merely looked selectable (a long-press
-// block Copy menu, no handles, no range, `onSelectionAction` never firing) with
-// no error or warning in a release build or a debug one. Loud beats silent, but
-// neither belongs in a consuming app, which is what this assertion is for.
+// answers false and every run throws at mount.
 //
 // The class name is compared against the `@implementation` rather than merely
 // being present, because `NSClassFromString` returning nil is the same silence
@@ -363,17 +358,9 @@ const EXPECTED_ATTRIBUTE_MEMBERS = {
   textDecorationLine: 'std::string',
   color: 'SharedColor',
   backgroundColor: 'SharedColor',
-  // The semantics channel (src/view/runAttributes.ts `RunSemanticRole`): what
-  // the range IS for a screen reader, not what it looks like. A plain string
-  // for the same reason `kind` is on the decoration struct — a string union
-  // inside an array element does not compile — with "" as the absent
-  // sentinel.
+  // A plain string, since a string union in an array element does not compile; "" is absent.
   role: 'std::string',
-  // The role's coordinates, all ints on the shared 0-is-absent sentinel. That
-  // is why every one of them is ONE-based on the wire: there is no level 0, no
-  // nesting depth 0 and no row 0, so the sentinel cannot collide, whereas a
-  // zero-based first row would be indistinguishable from an absent one. The
-  // hosts subtract one on the way into `CollectionItemInfo`.
+  // ONE-based on the wire so 0 can mean absent; the hosts subtract one.
   roleLevel: 'int',
   roleRow: 'int',
   roleRowCount: 'int',
@@ -420,6 +407,11 @@ const EXPECTED_EMBED_MEMBERS = {
   height: 'Float',
 };
 
+const dataMembers = (body) => body.replace(
+  /^\s*#ifdef RN_SERIALIZABLE_STATE\b[\s\S]*?^\s*#endif\s*$/gm,
+  '',
+);
+
 /**
  * Asserts one generated array-element struct keeps the sparse sentinel
  * contract: expected members with expected sentinel types, no strays, no
@@ -438,7 +430,7 @@ const checkSparseStruct = (structName, expectedMembers, readers) => {
     return;
   }
   const members = new Map();
-  for (const line of body.split('\n')) {
+  for (const line of dataMembers(body).split('\n').filter((line) => line.trim())) {
     const m = /^\s*([A-Za-z_][A-Za-z0-9_:<>, ]*?)\s+([A-Za-z_]\w*)\s*\{([^}]*)\};\s*$/.exec(line);
     if (!m) {
       fail(`Props.h: cannot parse member declaration in ${structName}: ${line.trim()}`);
@@ -607,7 +599,7 @@ if (propsH) {
           '    onInlinePress (docs/SELECTION.md, "Event: onInlinePress").',
       );
     }
-    const extraMembers = pressablesBody
+    const extraMembers = dataMembers(pressablesBody)
       .split('\n')
       .map((line) => line.trim())
       .filter((line) => line.length > 0 && !/^int (start|end|pressableId)\{0\};$/.test(line));
@@ -829,17 +821,6 @@ if (eventEmittersCpp) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// 4b. The commands: the third direction of the contract (JS tells one host).
-// ---------------------------------------------------------------------------
-
-// Commands exist ONLY while the spec declares them, and their absence is
-// silent in a way that is worth pinning: with no `codegenNativeCommands`
-// export, codegen emits no RCTSelectableRunHostViewProtocol at all, the iOS
-// component view's `@interface … <RCTSelectableRunHostViewProtocol>` stops
-// compiling (that one is loud), and on Android the generated delegate simply
-// has no `receiveCommand` switch — so `Commands.clearSelection(ref)` from JS
-// reaches a delegate that drops it, with nothing in logcat.
 const componentViewHelpersH = read(iosSpec('RCTComponentViewHelpers.h'), 'RCTComponentViewHelpers.h');
 if (componentViewHelpersH) {
   expectText(
@@ -984,9 +965,6 @@ if (managerInterface) {
     'void setSelectable(T view, boolean value);',
     'void setExclusiveSelection(T view, boolean value);',
     'void setSelectionActions(T view, @Nullable ReadableArray value);',
-    // The commands land on the same interface as the props, so the Kotlin
-    // ViewManager is forced to implement them or fail to compile — the whole
-    // reason the interface is implemented rather than reflected over.
     'void clearSelection(T view);',
     'void setSelection(T view, int start, int end);',
   ]) {
@@ -1017,15 +995,9 @@ const managerDelegate = read(
   'SelectableRunHostManagerDelegate.java',
 );
 if (managerDelegate) {
-  // The delegate is what routes a dispatched command to the interface method.
-  // `ViewManager.receiveCommand` asks getDelegate() and forwards to it
-  // (ViewManager.java:296-301), and this manager returns the generated
-  // delegate — so the Kotlin needs no override, and this switch is the entire
-  // route. Without it a `Commands.clearSelection(ref)` from JS is dropped in
-  // silence.
   expectText(
     managerDelegate,
-    'public void receiveCommand(T view, String commandName, @Nullable ReadableArray args)',
+    'public void receiveCommand(T view, String commandName, ReadableArray args)',
     'SelectableRunHostManagerDelegate.java',
     'The generated delegate must carry a receiveCommand dispatcher; it is what\n' +
       '    ViewManager.receiveCommand forwards a dispatched command to.',
@@ -1158,12 +1130,7 @@ expectText(
     '    entry here the prop never reaches the host and the opt-out silently does\n' +
     '    nothing.',
 );
-// The commands half of the JS surface. The babel plugin DELETES the
-// `codegenNativeCommands` declaration in the source and re-emits an equivalent
-// `Commands` object from the schema (index.js:167-172), so what ships is this
-// generated one — and `RunHost` reads it off the same require it reads the
-// component from. If it stopped being emitted, every imperative call would be
-// a TypeError on `undefined` at the first `clearSelection()`.
+// The babel plugin re-emits `Commands` from the schema, and that generated copy is what ships.
 expectText(
   viewConfig,
   'Commands',

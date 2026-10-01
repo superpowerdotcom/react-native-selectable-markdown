@@ -1,29 +1,6 @@
 /**
- * Incremental projection, held over the corpus and over a real stream.
- *
- * WHY THIS FILE EXISTS. A settled prose run GROWS: `segmentRuns` merges every
- * adjacent settled flowing block into one run, so an ordinary answer is one run
- * that gains a block on every settle. Reprojecting it each time is O(document)
- * per settle and O(document²) over a message — measured at 668,995 characters
- * projected for a 14 kB document and 2,528,198 for a 28 kB one. `projectRun`
- * therefore takes a `previous` projection and extends it, and
- * `createRunProjectionCache` is what holds one per run.
- *
- * That optimisation is only safe if an extended projection is INDISTINGUISHABLE
- * from a fresh one, and "indistinguishable" is a strong claim: the projector
- * merges a chunk into the preceding piece when the two are linear in the
- * source, records marks as constructs close and sorts them at the end, numbers
- * embeds by position, and refuses to grow an embed's piece. All four are state
- * carried across a block boundary. Hand-built fixtures check the constructs
- * somebody thought of (src/selection/__tests__/mapSelection.test.ts, "projectRun
- * (incremental)"); this checks every construct in the CommonMark suite and every
- * shipped fixture, parsed by the engine the app actually runs.
- *
- * The second half measures rather than compares: it replays fixtures through a
- * real `StreamSession` and gates the amplification — projected characters over
- * document characters — at a constant, which is the invariant docs/
- * PERFORMANCE.md and docs/BENCHMARKS.md quote. bench/projection.mjs reports the
- * same number with the transcripts, in the open.
+ * The projector carries merge, mark, and embed-numbering state across block
+ * boundaries, so an extended projection is checked against a fresh one.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -74,7 +51,6 @@ const corpus = loadCorpus();
 
 linkNativeEngineAsDefault();
 
-/** `run` restricted to its first `count` blocks. */
 function prefixRun(run: RunSegment, count: number): RunSegment {
   const blocks = run.blocks.slice(0, count);
   return {
@@ -87,12 +63,6 @@ function prefixRun(run: RunSegment, count: number): RunSegment {
   };
 }
 
-/**
- * Grows `run` one block at a time through a cache, asserting after every step
- * that the result deep-equals the projection from scratch. Returns the number
- * of steps taken, so a caller can prove the corpus actually exercised runs with
- * more than one block in them.
- */
 function growAndCompare(
   run: RunSegment,
   doc: ParsedDocument,
@@ -127,14 +97,14 @@ describeNative.each([
         }
       }
     }
-    // The property is vacuous on one-block runs, so make the corpus prove it
-    // supplied plenty of multi-block ones.
+    // Vacuous on one-block runs, so the corpus must supply many multi-block
+    // ones.
     expect(steps).toBeGreaterThan(500);
   });
 
   it('grows identically when an embed lookup is claiming nodes', () => {
-    // Links and code blocks: one inline, one block, so the seam between two
-    // projected blocks is crossed with an embed on either side of it.
+    // One inline and one block embed, so block seams are crossed with an embed
+    // on either side.
     const embed: EmbedLookup = (node) =>
       node.kind === 'link' || node.kind === 'codeBlock'
         ? { width: 100, height: 40, text: '[card]' }
@@ -159,13 +129,8 @@ describeNative.each([
 });
 
 /**
- * The measuring instrument: a pure `EmbedLookup` that claims nothing and sums
- * the source extent of the top-level nodes it is offered. The projector offers
- * a run's own blocks with `topLevel: true` and every descendant with false, so
- * that sum is exactly "source characters projected" — the number the audit
- * measured. Claiming nothing leaves the projection byte-identical to one with
- * no lookup at all (asserted by the corpus case above, which projects both
- * ways).
+ * Claims nothing; summing the spans of `topLevel` nodes counts source
+ * characters projected.
  */
 function meter(): {
   embed: EmbedLookup;
@@ -194,19 +159,16 @@ function meter(): {
 }
 
 interface Replay {
-  /** Source characters handed to the projector across the whole stream. */
+  /** Source characters projected, summed over every commit. */
   projected: number;
-  /** The finished document's length. */
   source: number;
-  /** The largest single projection — the number an old late settle blew up. */
+  /** Largest single projection, in source characters. */
   worst: number;
 }
 
 /**
- * Streams `source` in `chunk`-character deltas through a real `StreamSession`
- * and runs the view pipeline on every commit: `segmentRuns`, one cache per
- * `runKey` (which is what `SelectableMarkdown` files its `RunView`s under), and
- * `cache.project` per prose run.
+ * Mirrors the view pipeline: one cache per `runKey`, as `SelectableMarkdown`
+ * keys its `RunView`s.
  */
 function replay(source: string, chunk: number, options: EngineOptions): Replay {
   const gauge = meter();
@@ -220,14 +182,13 @@ function replay(source: string, chunk: number, options: EngineOptions): Replay {
     const runs = segmentRuns(doc, {
       settledUntil: snapshot.settledUntil,
       embed: gauge.embed,
+      liveTail: true,
     });
     runs.forEach((run, index) => {
       if (run.standalone) {
         return;
       }
-      const unsettledTail =
-        snapshot.phase === 'streaming' && run.span.end > snapshot.settledUntil;
-      const key = runKey(run, index, runs.length, unsettledTail);
+      const key = runKey(run, index, runs.length, true);
       let cache = caches.get(key);
       if (cache === undefined) {
         cache = createRunProjectionCache();
@@ -249,7 +210,6 @@ function replay(source: string, chunk: number, options: EngineOptions): Replay {
   return { projected: gauge.chars(), source: source.length, worst };
 }
 
-/** The longest shipped fixture, repeated to make a document of a given size. */
 function transcript(minimumLength: number): string {
   const parts = fs
     .readdirSync(FIXTURE_DIR)
@@ -275,9 +235,8 @@ describeNative('projected-character amplification', () => {
     const smallAmp = small.projected / small.source;
     const largeAmp = large.projected / large.source;
 
-    // Before the cache this ratio grew with the document (47.7× at 14 kB,
-    // 90.1× at 28 kB). It is now set by how long a block spends as the live
-    // tail, which is a property of the delta size, not of the document.
+    // Amplification is set by how long a block stays the live tail, so by delta
+    // size, not document size.
     expect(largeAmp).toBeLessThan(smallAmp * 1.35);
     expect(largeAmp).toBeLessThan(40);
   });
@@ -286,8 +245,6 @@ describeNative('projected-character amplification', () => {
     const doc = transcript(14000);
     const { worst, source } = replay(doc, CHUNK, presets.llmChat);
 
-    // The number the old design could not bound at all: with a whole message
-    // in one growing run, the last settle reprojected the whole message.
     expect(worst).toBeLessThan(source / 4);
   });
 });

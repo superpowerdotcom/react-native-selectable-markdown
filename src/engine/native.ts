@@ -7,28 +7,19 @@
  * re-export means the directory can be reorganized without moving anyone's
  * import.
  *
- * The list is written out rather than `export *` for the same reason
- * `src/index.ts`'s is: a facade whose contents are whatever `native/index.ts`
- * happens to export republishes every new helper by accident. What this facade
- * carries and the package root does not is the harness half — the decoder
- * entry points, the wire protocol version, the host-binding lookup and
- * `__linkNativeEngine` — which the conformance runner, the benches and an app
- * embedding its own md4c build need, and which the root deliberately does not
- * advertise.
+ * Listed rather than `export *`, so a new helper in `native/index.ts` is not
+ * published by accident.
  */
 
 export {
-  // The engine seam.
   createNativeEngine,
   nativeEngine,
-  // Installation and its diagnostics.
   installNativeEngine,
   isNativeEngineAvailable,
   isNativeEngineInstalled,
   isNativeEnginePermanentlyRefused,
   findHostBinding,
   __linkNativeEngine,
-  // The wire decoder, for a harness that holds a buffer rather than an engine.
   decodeFlatBuffer,
   NativeProtocolError,
   applySmartPunctuation,

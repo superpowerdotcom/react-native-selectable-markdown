@@ -31,10 +31,7 @@
 // and it turns "reviewed" into "compiled" for the largest reviewed-only surface
 // in the package.
 //
-// Those four are HISTORY, not the current self-test. The Swift has been
-// rewritten since and none of those four call sites survives, so `--selftest`
-// reverts three mutations of the same class against today's source rather than
-// the original four — see section 6, which says which and why.
+// Those four call sites are gone; `--selftest` mutates today's source instead (section 6).
 //
 // What it is not
 // --------------
@@ -333,22 +330,7 @@ function typecheck(sources, scratch, reactModule, bridgingHeader, targets) {
 // 6. Self-test: three selector-import mutations the checker must reject.
 // ---------------------------------------------------------------------------
 
-// A checker that cannot fail is not a checker. These three mutations are the
-// negative controls, and they are all the SAME CLASS of defect as the four in
-// the header: an Objective-C selector imported into Swift under the wrong
-// name. That class is what this gate exists to catch, because it is invisible
-// to human review — nothing about the logic is wrong, only the spelling
-// omit-needless-words chose.
-//
-// They are NOT the historical four. Those sites are gone: `didSetProps`,
-// `makeTextContainer(with:)` and `setIntrinsicContentSize(_:for:)` no longer
-// appear anywhere in platform/ios, so a mutation that reverted them would have
-// nothing to edit and would pass by mutating nothing — the worst failure mode
-// a self-test has. Each mutation below edits a line that exists in today's
-// SelectableRunHostView.swift, which is why `apply` is a literal string
-// replacement and why selftest() fails a mutation that changed nothing
-// ("did not change") before it ever type-checks: a mutation whose target has
-// moved would otherwise report a green self-test over an unmutated file.
+// Each mutation edits a line of today's SelectableRunHostView.swift; one that changes nothing fails.
 const MUTATIONS = [
   {
     name: 'Objective-C selector piece kept where Swift omits it (makeTextStack)',

@@ -1,15 +1,4 @@
-/**
- * The projection cache, and the streaming property it exists for.
- *
- * WHY THE STREAM IS EMULATED BY HAND HERE. The property under test is about
- * BLOCK IDENTITY across snapshots — settled blocks are the same objects, the
- * tail is a new one every tick — and that is a contract `StreamSession` keeps
- * regardless of which parser is behind it. Building the frames directly states
- * that contract in the test file instead of depending on a compiler being
- * present, and keeps a failure pointing at the cache rather than at md4c. The
- * counterpart over a real `StreamSession` and a real parse is
- * conformance/selection/incremental-projection.test.ts.
- */
+// Frames are hand-built to pin block identity; conformance/selection/incremental-projection.test.ts runs a real StreamSession.
 import type { ParagraphNode, ParsedDocument } from '../document/nodes';
 import { projectRun } from '../selection/mapSelection';
 import { segmentRuns } from '../selection/runs';
@@ -18,7 +7,6 @@ import { createRunProjectionCache } from './projectionCache';
 import type { RunProjectionCache } from './projectionCache';
 import { runKey } from './runIdentity';
 
-/** A paragraph whose text is exactly the given source slice. */
 function paragraph(source: string, start: number, end: number): ParagraphNode {
   const span = { start, end };
   return {
@@ -28,7 +16,6 @@ function paragraph(source: string, start: number, end: number): ParagraphNode {
   };
 }
 
-/** `count` paragraphs of `width` characters, blank-line separated. */
 function proseDocument(count: number, width: number): ParsedDocument {
   let source = '';
   const bounds: { start: number; end: number }[] = [];
@@ -51,12 +38,6 @@ interface Frame {
   settledUntil: number;
 }
 
-/**
- * The frames a stream of `doc` would commit: `ticks` per paragraph, each one
- * extending the tail paragraph, and every settled paragraph handed back as the
- * SAME OBJECT it will be for the rest of the stream — which is exactly what
- * `StreamSession` does with its frozen prefix.
- */
 function frames(doc: ParsedDocument, ticks: number): Frame[] {
   const out: Frame[] = [];
   for (let index = 0; index < doc.blocks.length; index += 1) {
@@ -66,8 +47,7 @@ function frames(doc: ParsedDocument, ticks: number): Frame[] {
     const length = block.span.end - block.span.start;
     for (let tick = 1; tick <= ticks; tick += 1) {
       const grown = Math.max(1, Math.round((length * tick) / ticks));
-      // The final tick hands over the settled object itself; every earlier one
-      // is a fresh node, as a reparsed tail always is.
+      // Only the final tick hands over the settled object; earlier ticks are fresh, like a reparsed tail.
       const tail =
         grown === length
           ? block
@@ -81,16 +61,7 @@ function frames(doc: ParsedDocument, ticks: number): Frame[] {
   return out;
 }
 
-/**
- * A pure `EmbedLookup` that claims nothing and records what it was offered.
- *
- * IT IS THE MEASURING INSTRUMENT, not a feature under test. The projector
- * offers every node it projects to the lookup, and offers a run's own blocks
- * with `topLevel: true` — so the summed span of the top-level offers is exactly
- * "how many source characters were projected", the number the audit measured
- * and the one this file gates. Claiming nothing keeps the projection identical
- * to a projection with no lookup at all.
- */
+/** Claims nothing; the top-level offers sum to the source characters projected. */
 function meter(): {
   embed: EmbedLookup;
   on: () => void;
@@ -116,12 +87,6 @@ function meter(): {
   };
 }
 
-/**
- * Replays a document as a stream through the real view pipeline —
- * `segmentRuns`, one cache per run key (`runKey` is what `SelectableMarkdown`
- * files its `RunView`s under), `cache.project` per run — and reports the
- * characters projected against the characters in the document.
- */
 function replay(
   doc: ParsedDocument,
   ticks: number,
@@ -183,10 +148,9 @@ describe('createRunProjectionCache', () => {
   it('hands back the identical object when the run has not changed', () => {
     const cache = createRunProjectionCache();
     const first = cache.project(run, doc);
+    expect(first).toEqual(projectRun(run, doc));
 
-    // A fresh RunSegment over the same blocks — what `segmentRuns` returns on
-    // a tick that changed nothing. Downstream memos key on the projection's
-    // identity, so this is what makes such a tick free.
+    // A fresh RunSegment over the same blocks, as `segmentRuns` returns on an unchanged tick.
     expect(cache.project({ ...run }, doc)).toBe(first);
   });
 
@@ -211,8 +175,7 @@ describe('createRunProjectionCache', () => {
 
     expect(claimed).toEqual(projectRun(grown, doc, { embed: claim }));
     expect(claimed.embeds).toHaveLength(4);
-    // …and back again, which is the direction that would splice placeholder
-    // text onto full text if the key were only checked one way.
+    // Dropping the lookup must reproject too, or placeholder text splices onto full text.
     expect(cache.project(grown, doc)).toEqual(projectRun(grown, doc));
   });
 
@@ -220,7 +183,6 @@ describe('createRunProjectionCache', () => {
     const cache = createRunProjectionCache();
     cache.project(prefixRun(4), doc);
 
-    // The tail run: different blocks entirely, same cache would be wrong.
     const other: RunSegment = {
       ...run,
       blocks: doc.blocks.slice(4),
@@ -230,21 +192,7 @@ describe('createRunProjectionCache', () => {
   });
 });
 
-/**
- * THE AMPLIFICATION GATE.
- *
- * Before the cache, a settled prose run was reprojected in full on every
- * settle, so a message of n characters cost O(n²) projection over its stream:
- * measured at 47.7× the document for 14 kB and 90.1× for 28 kB — doubling the
- * document quadrupled the work, and one late settle reprojected a 25 kB run.
- *
- * What replaces it is a constant: every block is projected once when it
- * settles, plus once per tick while it is the live tail. So the ratio of
- * projected characters to document characters must not grow with the document
- * — that is the invariant, and it is the one docs/PERFORMANCE.md and
- * docs/BENCHMARKS.md quote. The bench that reports the same number over real
- * transcripts is bench/projection.mjs.
- */
+// docs/PERFORMANCE.md and docs/BENCHMARKS.md quote the ratio this gates.
 describe('projected-character amplification', () => {
   const TICKS = 4;
 
@@ -255,15 +203,14 @@ describe('projected-character amplification', () => {
     const smallAmp = small.projected / small.source;
     const largeAmp = large.projected / large.source;
 
-    // Linear, with the constant set by how many ticks each paragraph spends as
-    // the live tail: ~TICKS + 1, not ~document/2.
+    // Each paragraph is reprojected once per tick while it is the tail: ~TICKS + 1.
     expect(smallAmp).toBeLessThan(TICKS + 3);
     expect(largeAmp).toBeLessThan(smallAmp * 1.2);
+    expect(smallAmp).toBeGreaterThanOrEqual(1);
+    expect(largeAmp).toBeGreaterThanOrEqual(1);
   });
 
   it('never reprojects more than the tail plus one settling block', () => {
-    // The single number the old design could not bound: with a whole message
-    // in one growing run, the LAST settle reprojected the whole message.
     const doc = proseDocument(30, 150);
     const gauge = meter();
     const caches = new Map<string, RunProjectionCache>();
@@ -294,26 +241,20 @@ describe('projected-character amplification', () => {
       });
     }
 
-    // Two blocks' worth of source is the ceiling: the block that just settled,
-    // and the tail block being redrawn. Nothing scales with the prefix.
+    // Ceiling: the block that just settled plus the tail being redrawn.
     expect(worst).toBeLessThan(400);
+    expect(worst).toBe(150);
     expect(doc.source.length).toBeGreaterThan(4000);
   });
 });
 
-/**
- * A very long document is several runs, so no single native host holds — and
- * re-measures — the whole thing. See `DEFAULT_MAX_RUN_CHARS`; the cap is a
- * selection boundary, so it sits far above ordinary message lengths.
- */
 describe('run-size budget as the view sees it', () => {
   it('splits a document past the cap into several prose runs', () => {
     const doc = proseDocument(200, 150);
     const runs = segmentRuns(doc);
 
-    expect(runs.length).toBeGreaterThan(1);
+    expect(runs.length).toBe(4);
     expect(runs.every((run) => !run.standalone)).toBe(true);
-    // Every run keeps a distinct, stable React key.
     const keys = runs.map((run, index) =>
       runKey(run, index, runs.length, false),
     );
@@ -321,13 +262,35 @@ describe('run-size budget as the view sees it', () => {
   });
 });
 
-/** Nothing above may claim an embed; the meter has to be inert. */
 it('meters without changing what is projected', () => {
   const doc = proseDocument(4, 80);
   const run = segmentRuns(doc)[0];
   const gauge = meter();
 
-  expect(projectRun(run, doc, { embed: gauge.embed })).toEqual(
-    projectRun(run, doc),
-  );
+  const metered = projectRun(run, doc, { embed: gauge.embed });
+  expect(metered).toEqual(projectRun(run, doc));
+  expect(metered.text).toBe(doc.source);
+  expect(metered.embeds).toBeUndefined();
+});
+
+test('a changed second block invalidates a cached prefix', () => {
+  const doc = proseDocument(3, 10);
+  const run = segmentRuns(doc)[0];
+  const cache = createRunProjectionCache();
+  cache.project(run, doc);
+  const source = doc.source.slice(0, 12) + 'changed!!!' + doc.source.slice(22);
+  const changed = { source, blocks: [doc.blocks[0], paragraph(source, 12, 22), doc.blocks[2]] };
+  const next = segmentRuns(changed)[0];
+  expect(cache.project(next, changed)).toEqual(projectRun(next, changed));
+});
+
+test('truncated source refuses reuse even when a caller retains block identities', () => {
+  const doc = proseDocument(2, 10);
+  const run = segmentRuns(doc)[0];
+  const cache = createRunProjectionCache();
+  const previous = cache.project(run, doc);
+  const truncated = { ...doc, source: doc.source.slice(0, 4) };
+  const projected = cache.project(run, truncated);
+  expect(projected).not.toBe(previous);
+  expect(projected).toEqual(projectRun(run, truncated));
 });

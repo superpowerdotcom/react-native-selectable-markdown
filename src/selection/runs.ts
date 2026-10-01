@@ -43,10 +43,8 @@ export type ClassifyBlock = (node: AnyNode) => BlockClass | undefined;
 export interface EmbedContent {
   /** Reserved size in points, declared up front — the reservation is
    * layout-affecting and measured off the UI thread, so there is no
-   * measure-the-card-first feedback loop. Must be positive AND finite:
-   * an infinity is a number that passes every `> 0` test and then saturates
-   * whatever text system it reaches, so `embedContentFor` refuses it exactly
-   * as it refuses a NaN or a zero. */
+   * measure-the-card-first feedback loop. Must be positive and finite, or the
+   * claim is ignored. */
   width: number;
   height: number;
   /** What `plain` shows for this embed in a copy-text payload. Absent means
@@ -67,12 +65,28 @@ export interface EmbedContent {
  */
 export interface EmbedClaimContext {
   topLevel: boolean;
+  /** Descendant of a list, table, or blockquote with reduced line width. */
+  withinContainer?: boolean;
+  /** The only inline in a paragraph directly under the document. */
+  soleChildOfTopLevelParagraph?: boolean;
 }
 
 /** The two context values, frozen module constants: the lookup runs for
  * every node of every projection, and the flag has exactly two states. */
 const TOP_LEVEL_CLAIM: EmbedClaimContext = Object.freeze({ topLevel: true });
 const NESTED_CLAIM: EmbedClaimContext = Object.freeze({ topLevel: false });
+const SOLE_PARAGRAPH_CHILD_CLAIM: EmbedClaimContext = Object.freeze({
+  topLevel: false,
+  soleChildOfTopLevelParagraph: true,
+});
+const CONTAINER_CLAIM: EmbedClaimContext = Object.freeze({
+  topLevel: false,
+  withinContainer: true,
+});
+
+export function constrainsEmbedWidth(block: Block): boolean {
+  return block.kind === 'list' || block.kind === 'table' || block.kind === 'blockquote';
+}
 
 /**
  * Consumer-supplied embed claim. Return content to claim the node as an
@@ -107,30 +121,22 @@ export type EmbedLookup = (
  * The one gate for "may this node be embedded at all", returning the claimed
  * content when it may. Shared by segmentation and projection so the two
  * cannot disagree about a claim. Rejects synthetic and incomplete nodes (see
- * `EmbedLookup`) and every size that is not POSITIVE AND FINITE.
- *
- * THE FINITENESS HALF IS NOT PEDANTRY. `!(x > 0)` catches a NaN, which is why
- * the test was written that way, but `Infinity > 0` is true — so an infinite
- * width used to be claimed as a real embed and travel down: iOS builds a
- * `CGRectMake(0, descender, width, height)` attachment out of it and Android
- * runs it through `PixelUtil.toPixelFromDIP(...).toInt()`, which saturates to
- * `Int.MAX_VALUE` for a `ReplacementSpan`. `Number.isFinite` covers NaN and
- * both infinities in one test, so the explicit `<= 0` beside it is safe.
- *
- * This is the gate, not the only defence: the view layer re-checks with
- * `isReservableEmbedSize` (src/view/runEmbeds.ts) before anything crosses the
- * bridge, and both hosts check again. A consumer using the exported `RunHost`
- * directly never reaches this function at all.
+ * `EmbedLookup`) and every size that is not positive and finite. `!(x > 0)`
+ * alone would admit Infinity, which saturates native layout on both hosts.
  */
 export function embedContentFor(
   node: AnyNode,
   embed?: EmbedLookup,
   topLevel = false,
+  withinContainer = false,
+  soleChildOfTopLevelParagraph = false,
 ): EmbedContent | undefined {
   if (embed === undefined || node.synthetic === true || node.incomplete === true) {
     return undefined;
   }
-  const content = embed(node, topLevel ? TOP_LEVEL_CLAIM : NESTED_CLAIM);
+  const context = topLevel ? TOP_LEVEL_CLAIM : withinContainer ? CONTAINER_CLAIM
+    : soleChildOfTopLevelParagraph ? SOLE_PARAGRAPH_CHILD_CLAIM : NESTED_CLAIM;
+  const content = embed(node, context);
   if (
     content === undefined ||
     !Number.isFinite(content.width) ||
@@ -143,15 +149,13 @@ export function embedContentFor(
   return content;
 }
 
-function embeddable(node: AnyNode, embed?: EmbedLookup, topLevel = false): boolean {
-  return embedContentFor(node, embed, topLevel) !== undefined;
+function embeddable(node: AnyNode, embed?: EmbedLookup, topLevel = false, withinContainer = false, soleChildOfTopLevelParagraph = false): boolean {
+  return embedContentFor(node, embed, topLevel, withinContainer, soleChildOfTopLevelParagraph) !== undefined;
 }
 
 /**
- * Block kinds that merge into a shared prose run — the eight below, which is
- * every kind the parsers put at the top level of a document. Everything else
- * (a kind nobody has classified, a `listItem` or a `tableRow` somehow hoisted
- * to the top) is standalone.
+ * Block kinds that merge into a shared prose run. Everything else is
+ * standalone.
  *
  * An allowlist rather than a denylist, deliberately: a kind nobody has
  * classified gets its own selection scope, which is the safe failure. Merging
@@ -215,20 +219,9 @@ const VIEW_KINDS: ReadonlySet<AnyNode['kind']> = new Set<AnyNode['kind']>([
   //
   // An image projects nothing but its `alt` (mapSelection, the `image` case).
   // Flowing one does not degrade the picture, it DELETES it and leaves the alt
-  // text in its place — so an image that is nothing but projected text has to
-  // keep its own renderer, and the block holding it has to leave the run.
-  //
-  // THIS IS NOW THE FALLBACK, NOT THE USUAL PATH. The view claims image nodes
-  // as EMBEDS by default (`images: 'embed'`, `src/view/imageEmbeds.ts`), and
-  // an embed claim is consulted above — so an ordinary image flows, the
-  // projection stands it down to one placeholder, and the picture is drawn
-  // over the space the host reserves instead of being deleted. What still
-  // reaches this line is what no claim covered: `images: 'standalone'`, a
-  // theme whose image box is not a reservable size, a synthetic or
-  // still-streaming image (`embedContentFor` refuses both), and a consumer
-  // driving `segmentRuns` with no `embed` lookup at all. For those the old
-  // rule is still the right one — the alternative is a paragraph that renders
-  // its alt text where a picture should be.
+  // text in its place — so an unclaimed image keeps its own renderer and its
+  // block leaves the run. Images claimed as embeds (the view's default,
+  // `src/view/imageEmbeds.ts`) are pruned before this set is consulted.
   'image',
   // A spoiler is here for the *gesture* half of the rule above, not the view
   // half: `SpoilerSpan` is the only inline in the library that owns a tap
@@ -243,37 +236,17 @@ const VIEW_KINDS: ReadonlySet<AnyNode['kind']> = new Set<AnyNode['kind']>([
   'spoiler',
 ]);
 
-/**
- * Whether `node`'s subtree holds anything that cannot live inside a run's
- * text tree.
- *
- * ON `visit`, NOT ON A DESCENT OF ITS OWN. The two answers this search gives
- * are exactly the two signals a visitor may return: `false` to prune a
- * subtree there is no point looking under, `'stop'` the moment the answer is
- * yes. Before `visit` could say the second, this walk was written out by hand
- * off `childrenOf` purely to get the short circuit.
- *
- * `visit` runs DEPTH-FIRST OFF AN EXPLICIT STACK, which is what this needs:
- * nesting depth is untrusted input — `'> '.repeat(2500)` is five kilobytes of
- * model output — and a recursive walk used to overflow the JS stack right
- * here, before any of it reached the screen. The visit order is the same one
- * this function always used — pre-order, children left to right, stopping at
- * the first standalone construct — so a `classifyBlock` callback sees exactly
- * the nodes, in the order, it always did.
- */
 function containsStandalone(
   node: AnyNode,
   classify?: ClassifyBlock,
   embed?: EmbedLookup,
+  withinContainer = false,
+  soleChildOfTopLevelParagraph = false,
 ): boolean {
   let found = false;
   visit(node, (current) => {
-    // An embed claim beats everything, including a `classifyBlock` claim on
-    // the same node: the projection stands the whole subtree down to one
-    // placeholder, so nothing inside it can render a view — there is no reason
-    // to descend, and descending would let a nested image force standalone a
-    // block whose image the consumer just said flows.
-    if (embeddable(current, embed /* nested: this walk is always inside a block */)) {
+    // An embed claim outranks `classifyBlock` and prunes: the subtree projects as one placeholder.
+    if (embeddable(current, embed, false, withinContainer, current === node && soleChildOfTopLevelParagraph)) {
       return false;
     }
     const claimed = classify?.(current);
@@ -294,16 +267,8 @@ function containsStandalone(
 }
 
 /**
- * Whether `node` emits projected characters OF ITS OWN, ignoring anything its
- * children emit. This is `mapSelection`'s `blockTasks` and `inlineTasks` read
- * as a table: which cases push an `emit` or a `literal` task, and with what.
- *
- * IT HAS TO KEEP MIRRORING THEM. A kind that starts projecting text and is
- * not added here is harmless — the run it sits in is non-empty either way, it
- * just may be demoted when it is alone. A kind that STOPS projecting text and
- * stays here is the real hazard: it goes back to drawing nothing. The
- * corpus-scale guard is the "every flowing run projects non-empty text" case
- * in conformance/selection/projection-oracle.test.ts.
+ * Must mirror the `emit` and `literal` tasks in mapSelection's `blockTasks`
+ * and `inlineTasks`; conformance/selection/projection-oracle.test.ts guards it.
  */
 function emitsOwnText(node: AnyNode): boolean {
   switch (node.kind) {
@@ -316,52 +281,29 @@ function emitsOwnText(node: AnyNode): boolean {
     case 'htmlSpan':
       return node.literal.length > 0;
     case 'image':
-      // An image projects its `alt` and nothing else, so an image with no alt
-      // text projects nothing — hence a length test rather than a bare true.
       return node.alt.length > 0;
     case 'list':
-      // Every item is prefixed with its marker glyph — bullet, ordinal or
-      // task box — so a list holding an item is never blank, however empty
-      // that item's own content is.
+      // Every item is prefixed with a marker glyph, however empty its content.
       return node.items.length > 0;
     case 'autolink':
-      // The URL the author typed, falling back to `href`. Both empty is not a
-      // shape any parser here produces.
+      // The typed URL or `href`; no parser produces both empty.
       return true;
     case 'hardBreak':
     case 'softBreak':
       // '\n' and ' ' respectively; see the `softBreak` case in mapSelection.
       return true;
     default:
-      // Containers emit only what their children emit (paragraph, heading,
-      // blockquote, list items, table rows and cells, every inline wrapper),
-      // and `thematicBreak` emits a zero-length mark and no text at all.
+      // `thematicBreak` emits a zero-length mark and no text.
       return false;
   }
 }
 
-/**
- * Whether this block would project any text — the question `flushProse` asks
- * before letting a group of blocks merge into one flowing run.
- *
- * The separators the projector emits BETWEEN siblings do not count: a run
- * whose only characters are the '\n\n' between two thematic breaks is
- * exactly as blank as an empty one, and wants the same recovery.
- *
- * Short-circuits at the first character found, which in prose is two nodes
- * in — the block, then its first text node — so the common case costs
- * nothing. Only a genuinely blank subtree is walked to the end, and those are
- * small by definition.
- */
 function projectsText(block: Block, embed?: EmbedLookup): boolean {
   let text = false;
+  const soleChild = block.kind === 'paragraph' && block.children.length === 1 ? block.children[0] : null;
   visit(block, (node) => {
-    // `topLevel` is offered exactly as the projector offers it — true only
-    // for the block itself, since `projectRun` starts each top-level block
-    // with `topLevel: true` and every descendant with false — so this asks
-    // about the same claim the projection will honour. A claimed node stands
-    // down to one U+FFFC placeholder, and a placeholder is text.
-    if (embeddable(node, embed, node === block) || emitsOwnText(node)) {
+    // The claim context `projectRun` will offer, so a claim here is a U+FFFC placeholder there.
+    if (embeddable(node, embed, node === block, constrainsEmbedWidth(block), node === soleChild) || emitsOwnText(node)) {
       text = true;
       return 'stop';
     }
@@ -370,89 +312,46 @@ function projectsText(block: Block, embed?: EmbedLookup): boolean {
   return text;
 }
 
-/**
- * One remembered classification: the answer, plus the two callbacks it was
- * computed with. Both are part of the key — the `classifyBlock` and `embed`
- * callbacks' contract is that they are pure and referentially stable, so a
- * change of identity is the only signal that the answer may have moved.
- */
-interface CachedClass {
-  classify: ClassifyBlock | undefined;
-  embed: EmbedLookup | undefined;
-  result: BlockClass;
-}
-
-/**
- * Classification results, keyed on BLOCK IDENTITY.
- *
- * WHY THIS IS THE ONE MEMO ON THE SEGMENTATION PATH. Classifying a prose block
- * walks its entire subtree (`containsStandalone`), and `segmentRuns` runs over
- * every top-level block of the document on every streamed snapshot — the memo
- * in the view keys on the snapshot's document object, which is new per delta.
- * So the walk was O(document nodes) per token: measured at 592 node visits and
- * ~65 µs per delta on a 19 kB document, quadratic over a stream, and comparable
- * to the whole parse+decode+append path it sits behind.
- *
- * Block identity is exactly the right key because `StreamSession` splices the
- * frozen prefix back in verbatim (see "Blocks keep referential identity" in
- * docs/STREAMING.md): every block but the tail one is the SAME OBJECT as on the
- * previous tick, and a block's subtree is immutable once parsed. So a hit is
- * sound, and the only misses are the blocks that genuinely changed.
- *
- * A `WeakMap` so a finished message's blocks are collected with the snapshot
- * that held them; nothing here needs eviction of its own.
- *
- * ONE ENTRY PER BLOCK, KEYED ON BOTH CALLBACKS, so two callers that segment
- * the SAME block objects with different callbacks each overwrite the other's
- * answer and both pay a full subtree walk every time. Nothing in the library
- * does that — `buildCopyPayload` segments a freshly reparsed slice, whose
- * blocks are new objects, and takes the same callbacks through `CopyContext`
- * anyway — but a second consumer of `segmentRuns` over the live document
- * should pass the same `classifyBlock`/`embed` the view has, or silently give
- * up the memo for both of them.
- */
-const classCache = new WeakMap<Block, CachedClass>();
+const DEFAULT_CLASS_KEY = {};
+const classCache = new WeakMap<Block, WeakMap<object, WeakMap<object, BlockClass>>>();
 
 /**
  * Classifies one top-level block. An embed claim wins first (an embedded
  * block flows — that is the point of embedding); then a consumer claim wins
- * outright; otherwise a kind outside `PROSE_KINDS` is standalone, and a prose
- * kind is standalone when it carries a standalone construct ANYWHERE in its
- * subtree — one of the `VIEW_KINDS` (an image in a paragraph, a spoiler in a
- * table cell) or a node the consumer claimed. Such a block cannot merge
+ * outright; otherwise a kind outside `PROSE_KINDS` is standalone, and so is
+ * a prose block whose subtree holds a `VIEW_KINDS` node or a node claimed
+ * standalone. Such a block cannot merge
  * either: a run is one text tree, and the nested construct has to keep its
- * own renderer and gestures. Note the blast radius — it is the whole
- * containing block that leaves the run, not just the construct: one
- * unclaimed spoiler or image makes its entire list or table standalone.
- * Which is why the view claims images as embeds by default: an embedded
- * construct keeps its element AND its block's place in the run, so the blast
- * radius only applies to what nothing claimed.
+ * own renderer and gestures. The whole block leaves the run, not just the
+ * construct.
  *
- * MEMOIZED ON BLOCK IDENTITY (see `classCache`), which is what makes repeated
- * segmentation of a streaming document cost O(new blocks) rather than
- * O(document nodes). The memo is only as sound as the callbacks' purity, which
- * is already their documented contract; a callback whose identity changes
- * invalidates every entry it wrote.
+ * Memoized on block identity and both callbacks' identities, so the
+ * callbacks must be pure.
  */
 export function classifyTopLevelBlock(
   block: Block,
   classify?: ClassifyBlock,
   embed?: EmbedLookup,
 ): BlockClass {
-  const cached = classCache.get(block);
-  if (
-    cached !== undefined &&
-    cached.classify === classify &&
-    cached.embed === embed
-  ) {
-    return cached.result;
+  const classifyKey = classify ?? DEFAULT_CLASS_KEY;
+  const embedKey = embed ?? DEFAULT_CLASS_KEY;
+  let byClassify = classCache.get(block);
+  if (byClassify === undefined) {
+    byClassify = new WeakMap();
+    classCache.set(block, byClassify);
   }
+  let byEmbed = byClassify.get(classifyKey);
+  if (byEmbed === undefined) {
+    byEmbed = new WeakMap();
+    byClassify.set(classifyKey, byEmbed);
+  }
+  const cached = byEmbed.get(embedKey);
+  if (cached !== undefined) return cached;
   const result = computeBlockClass(block, classify, embed);
-  classCache.set(block, { classify, embed, result });
+  byEmbed.set(embedKey, result);
   return result;
 }
 
-/** `classifyTopLevelBlock` with the memo taken off — the rules themselves. */
 function computeBlockClass(
   block: Block,
   classify?: ClassifyBlock,
@@ -470,60 +369,33 @@ function computeBlockClass(
   if (!PROSE_KINDS.has(block.kind)) {
     return 'standalone';
   }
-  return childrenOf(block).some((child) => containsStandalone(child, classify, embed))
+  const soleChild = block.kind === 'paragraph' && block.children.length === 1;
+  return childrenOf(block).some((child) => containsStandalone(child, classify, embed, constrainsEmbedWidth(block), soleChild))
     ? 'standalone'
     : 'flowing';
 }
 
 /**
  * How many SOURCE characters one flowing run may span before the next flowing
- * block starts a new one.
- *
- * WHY A CAP EXISTS AT ALL. A run is one native text host, and a host's cost is
- * paid per settle, not per delta: each time a block settles it joins the
- * settled run, and the host is handed longer text, which re-measures and
- * re-lays-out everything it already held (`RNSMRunHostShadowNode::measureContent`
- * resets its cached measurement on any new props). With no cap, a message is
- * one run, so a message of n characters costs O(n) native layout per settle and
- * O(n²) over the stream — the shape that turned a 28 kB document into 2.5 M
- * projected characters and one 25 kB re-measure on a late settle.
- *
- * WHY IT IS THIS LARGE. A cap is a selection boundary: a gesture cannot sweep
- * from one host into the next, which is the very thing merging `codeBlock`,
- * `table`, `thematicBreak` and `htmlBlock` into `PROSE_KINDS` bought back. So
- * the cap must sit far above the documents people actually sweep across. Eight
- * thousand characters is ~1300 words — several times the longest chat answer in
- * the shipped corpus — so an ordinary message is still exactly one run and
- * nothing about its selection changes; only documents already past the point
- * where a single host is the wrong shape get split.
- *
- * Pass `maxRunChars: Infinity` to opt out entirely (one run per flowing
- * sequence, whatever its length), or a smaller number to trade sweep distance
- * for smaller per-settle layouts.
+ * block starts a new one. Each run is one native host that re-lays-out its
+ * whole text on every settle, and a run boundary is one a selection cannot
+ * cross. `maxRunChars: Infinity` opts out.
  */
 export const DEFAULT_MAX_RUN_CHARS = 8000;
 
-/**
- * The cap in force: the caller's when it is a positive number (`Infinity`
- * included — that is the documented opt-out), the default otherwise. `> 0`
- * rather than `>= 0` so 0, a negative and a `NaN` all fall back rather than
- * producing one run per block.
- */
 function runBudget(given: number | undefined): number {
   return typeof given === 'number' && given > 0 ? given : DEFAULT_MAX_RUN_CHARS;
 }
 
 /**
  * Segments the document into runs: maximal sequences of adjacent flowing
- * blocks — any of the eight `PROSE_KINDS`, so a code block and a table merge
- * into the prose around them like a paragraph does — into one selectable
+ * blocks merged into one selectable
  * unit; every standalone block is its own `standalone` run. See
  * `classifyTopLevelBlock` for what makes a block one or the other, and
  * `opts.classifyBlock` for claiming app-specific blocks. One exception to the
- * classification: a flowing sequence whose blocks ALL project no text — a
- * lone thematic break, an unfinished '```' fence, an empty blockquote —
- * demotes to standalone runs, see the note in `flushProse`, so every
- * non-standalone run this returns projects non-empty text.
+ * classification: a flowing sequence whose blocks all project no text (a lone
+ * thematic break, an unfinished '```' fence) demotes to standalone runs, so
+ * every non-standalone run this returns projects non-empty text.
  *
  * When `settledUntil` is given, a run never mixes settled and unsettled
  * blocks: prose merging breaks at the settled boundary, so blocks past
@@ -532,15 +404,9 @@ function runBudget(given: number | undefined): number {
  * per-platform policy (e.g. iOS may keep the tail selectable).
  *
  * Merging also breaks at `opts.maxRunChars` (see `DEFAULT_MAX_RUN_CHARS`), so
- * a very long document becomes several native hosts instead of one growing
- * one. The packing is GREEDY FROM THE START OF THE DOCUMENT and depends only on
- * blocks already placed, which is what keeps every boundary — and therefore
- * every `run:${span.start}` key and every cached projection — stable as the
- * document grows: a block that settles can only ever be added to the run it
- * would have joined anyway, or start the next one.
- *
- * `opts.liveTail` keeps the tail run in existence while the stream is still
- * running; see the option's own note.
+ * a very long document becomes several native hosts. The packing is greedy
+ * from the start of the document, so every boundary and `run:${span.start}`
+ * key stays stable as the document grows.
  */
 export function segmentRuns(
   doc: ParsedDocument,
@@ -550,31 +416,11 @@ export function segmentRuns(
     embed?: EmbedLookup;
     maxRunChars?: number;
     /**
-     * The document is still streaming, so its LAST block is where the next
-     * characters will arrive: keep it in a run of its own even when
-     * `settledUntil` covers the whole document.
-     *
-     * WHAT IT IS FOR. A stream settles at completed blank lines, so a chunk
-     * that ends on one leaves `settledUntil === doc.source.length` for as long
-     * as the next chunk takes to arrive — every block settled, nothing
-     * unsettled, and the settled/tail break has nothing to break at. The
-     * document therefore collapses to ONE run for a frame or two and splits
-     * again when the next block starts. The view keys the tail run by its role
-     * (`runKey`), so that collapse unmounts the tail's native host — on iOS
-     * `prepareForRecycle` clears the attributed text, zeroes `selectedRange`
-     * and resigns first responder — and a selection the reader had made in the
-     * live tail dies, several times per message, at moments that look to them
-     * like nothing happened at all.
-     *
-     * WHAT IT DOES. Only the boundary moves: the last block leaves the settled
-     * run and becomes the tail run again, both halves still `selectable` (they
-     * really are settled — this is not a claim about repair), and the split
-     * lands exactly where the previous frame's settled boundary already was,
-     * so no host is handed different text and none is destroyed. When the next
-     * block does arrive the tail grows into it, which is the ordinary settle
-     * path. It does nothing when the tail is genuinely unsettled (the break is
-     * already there), when the last run is standalone, or when the last run
-     * holds a single block.
+     * The document is still streaming: keep its last block in a run of its
+     * own even when `settledUntil` covers the whole document, so the tail
+     * run's host is not unmounted (and its selection lost) between chunks.
+     * No-op when the tail is unsettled or standalone, or the last run holds
+     * a single block.
      */
     liveTail?: boolean;
   },
@@ -593,30 +439,8 @@ export function segmentRuns(
     if (pending.length === 0) {
       return;
     }
-    // A BLOCK THAT PROJECTS NO TEXT FLOWS ONLY IN COMPANY, because an empty
-    // run cannot draw anything at all: both native hosts measure empty text
-    // to a 0×0 box and skip decoration drawing when the length is zero, and
-    // `resolveRunAttributes` returns nothing to draw with. Separators are
-    // emitted only BETWEEN blocks, so a group whose blocks all project
-    // nothing projects the empty string (or, for several of them, only the
-    // blank lines between).
-    //
-    // This is not just the pathological `---`-only document. A thematic
-    // break projects a zero-length mark and no characters; an empty fenced
-    // block projects no mark at all; and the streaming prefixes '```',
-    // '```py\n' and '> ' all project the empty string, so a message that
-    // opens with a code fence or a quote would render a 0×0 host until its
-    // first character of content arrived.
-    //
-    // Falling back to standalone hands each such block to its built-in
-    // renderer (the pre-0.5.0 path), which draws the rule, the code box or
-    // the quote bar the decoration would have. Nothing is lost
-    // selection-wise: these blocks contribute no selectable text by
-    // definition, and any of them with a text-projecting neighbour still
-    // merges and keeps the sweep intact. An EMBEDDED block is exempt —
-    // it projects a placeholder character, so its run is not empty, and
-    // demoting it would hand it to `renderBlocks`, which ignores the embed
-    // claim; `projectsText` is where that exemption lives.
+    // An all-blank group would be an empty run, which both hosts draw as a
+    // 0×0 box; each block falls back to its built-in renderer instead.
     if (pending.every((block) => !projectsText(block, embed))) {
       for (const block of pending) {
         runs.push({
@@ -644,13 +468,11 @@ export function segmentRuns(
   for (const block of doc.blocks) {
     const settled = block.span.end <= settledUntil;
     if (classifyTopLevelBlock(block, classify, embed) === 'flowing') {
-      // Two reasons to end the run before this block, and the budget test is
-      // deliberately written against SOURCE extent rather than projected
-      // characters: it has to be answerable without projecting anything, and
-      // it has to give the same answer for the same prefix every tick. Both
-      // ends of the measurement are settled offsets, so they do not move.
+      // Measured in source extent over settled offsets only (an unsettled
+      // block's start), so the split is the same for the same prefix every tick.
       const overBudget =
-        pending.length > 0 && block.span.end - pending[0].span.start > maxRunChars;
+        pending.length > 0 &&
+        (settled ? block.span.end : block.span.start) - pending[0].span.start > maxRunChars;
       if (pending.length > 0 && (pendingSettled !== settled || overBudget)) {
         flushProse();
       }
@@ -666,12 +488,7 @@ export function segmentRuns(
       });
     }
   }
-  // The live-tail split (see `opts.liveTail`), applied where the whole
-  // document has settled into one trailing prose group: peel the last block
-  // back off it so the tail run — and the host holding it — still exists.
-  // `pendingSettled` is the test for "nothing is unsettled": an unsettled tail
-  // has already broken the group at the boundary, and this would then be
-  // splitting the tail itself.
+  // See `opts.liveTail`; an unsettled tail has already split the group.
   if (liveTail && pendingSettled && pending.length > 1) {
     const last = pending[pending.length - 1];
     pending = pending.slice(0, -1);

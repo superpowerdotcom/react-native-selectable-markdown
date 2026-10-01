@@ -79,18 +79,8 @@
  *    document md4c choked on. So installSelectableMarkdown probes the
  *    capability once and refuses the install when it is missing, which turns
  *    a per-document mystery into one startup warning naming Hermes. Hermes
- *    passes the probe.
- *
- *    WHAT WAS ACTUALLY CHECKED, and against which versions. The JSCRuntime
- *    source was read on 0.73 through 0.81; package.json's peer floor is now
- *    `react-native >= 0.82`, and nothing in this repository has re-read it
- *    there (CI compiles against the 0.75.4 devDependency's headers). That
- *    gap costs correctness nothing, because the refusal is a *probe* and not
- *    a version test: a runtime that grows a working createArrayBuffer simply
- *    passes and gets the binding. What the gap does mean is that "JSC is
- *    refused" is a statement about versions this package no longer supports,
- *    so treat it as the reason the probe exists rather than as a claim about
- *    0.82+.
+ *    passes the probe. JSCRuntime was read on 0.73-0.81 only; on 0.82+ the
+ *    probe, not a version test, decides.
  */
 
 #ifndef SELECTABLE_MARKDOWN_JSI_H

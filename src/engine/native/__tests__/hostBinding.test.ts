@@ -22,6 +22,7 @@
 
 import { parseDocument } from '../../Engine';
 import { presets } from '../../options';
+import { PROTOCOL_VERSION } from '../protocol';
 import type { NativeHostBinding } from '../index';
 import { nativeAddonOrNull } from './support';
 
@@ -89,12 +90,8 @@ describe('host binding discovery', () => {
   }
 
   /**
-   * A platform module that answers with a fixed outcome and never installs
-   * anything — the shape of a device that cannot host the binding at all.
-   *
-   * `outcome` is typed `unknown` on purpose: the three strings are what a
-   * current binary returns, and a bare `false` is what an older one returns,
-   * and `installNativeEngine` has to read both.
+   * `outcome` is `unknown`: current binaries return a string, older ones a
+   * bare `false`.
    */
   function mockRefusingPlatform(outcome: unknown): void {
     jest.doMock('react-native', () => ({
@@ -110,7 +107,7 @@ describe('host binding discovery', () => {
   }
 
   test('availability asks the platform to install, and reports the result', () => {
-    const binding = realBinding(1);
+    const binding = realBinding(PROTOCOL_VERSION);
     if (!binding) return; // no compiled addon on this machine
     mockPlatform(binding);
     withFreshModules((native) => {
@@ -123,7 +120,7 @@ describe('host binding discovery', () => {
   });
 
   test('a second call does not re-cross the bridge', () => {
-    const binding = realBinding(1);
+    const binding = realBinding(PROTOCOL_VERSION);
     if (!binding) return;
     mockPlatform(binding);
     withFreshModules((native) => {
@@ -155,15 +152,8 @@ describe('host binding discovery', () => {
   });
 
   /**
-   * The warning is the feature here, so it is captured and asserted rather
-   * than left to print.
-   *
-   * Both cases below drive `installNativeEngine` down its protocol-mismatch
-   * path, which warns. Unspied, Jest renders that with a code frame and a
-   * stack, so a passing run looked like a failing one — and the message
-   * itself, the actionable half this file's docblock is about, went
-   * unchecked. The spy is installed for the whole block: a stray warning from
-   * anywhere else in it fails `toHaveBeenCalledTimes`.
+   * Spied for the whole block, so a stray warning anywhere in it fails
+   * `toHaveBeenCalledTimes`.
    */
   describe('protocol version skew', () => {
     let warn: jest.SpyInstance;
@@ -185,8 +175,6 @@ describe('host binding discovery', () => {
         expect(native.findHostBinding()).toBeNull();
         expect(native.isNativeEngineAvailable()).toBe(false);
 
-        // Both numbers and the fix, because "not available" alone would send
-        // the reader looking at their own code.
         expect(warn).toHaveBeenCalledTimes(1);
         expect(warn.mock.calls[0][0]).toMatch(
           new RegExp(
@@ -194,9 +182,7 @@ describe('host binding discovery', () => {
           ),
         );
 
-        // The once-per-JS-context guard (`warnedAboutProtocol` in
-        // install.ts). An app that polls availability from a render path must
-        // get a diagnostic, not a flood.
+        // `warnedAboutProtocol` in install.ts: one warning per JS context.
         expect(native.isNativeEngineAvailable()).toBe(false);
         expect(native.isNativeEngineAvailable()).toBe(false);
         expect(warn).toHaveBeenCalledTimes(1);
@@ -215,22 +201,14 @@ describe('host binding discovery', () => {
           parseDocument('# hi\n', presets.commonmark, native.nativeEngine);
         expect(parse).toThrow(/native engine not usable/);
         expect(parse).not.toThrow(native.NativeProtocolError);
-        // Two failed parses, still one warning.
         expect(warn).toHaveBeenCalledTimes(1);
       });
     });
   });
 
   /**
-   * The failure path used to cost as much as the success path, every time.
-   *
-   * `isNativeEngineAvailable()` is documented as safe to poll, and
-   * `install()` is a BLOCKING SYNCHRONOUS method that logs from the native
-   * side on every refusal (RCTLogWarn / Log.w). Because a `false` was never
-   * memoized, a component that asked once per render crossed the bridge once
-   * per render and turned a one-line diagnostic into a flood. The platform
-   * modules now say which refusals are permanent, and that is what these
-   * cases pin.
+   * `install()` blocks synchronously and logs natively on each refusal, so a
+   * permanent refusal must cross the bridge once.
    */
   describe('a permanent refusal is asked for once', () => {
     test("'refused' stops the polling, and availability stays false", () => {
@@ -239,13 +217,11 @@ describe('host binding discovery', () => {
         expect(native.isNativeEngineAvailable()).toBe(false);
         expect(installCalls).toBe(1);
 
-        // The whole point: five more asks, still one bridge crossing.
         for (let i = 0; i < 5; i += 1) {
           expect(native.isNativeEngineAvailable()).toBe(false);
         }
         expect(installCalls).toBe(1);
 
-        // And the reason is legible to an app that wants to stop waiting.
         expect(native.isNativeEnginePermanentlyRefused()).toBe(true);
         expect(native.isNativeEngineInstalled()).toBe(false);
       });
@@ -257,17 +233,16 @@ describe('host binding discovery', () => {
         expect(native.isNativeEngineAvailable()).toBe(false);
         expect(native.isNativeEngineAvailable()).toBe(false);
         expect(native.isNativeEngineAvailable()).toBe(false);
-        // Three asks, three crossings — deliberately, since this is the state
-        // that resolves itself once the runtime is up.
+        // Deliberately retried: this state resolves itself once the runtime is
+        // up.
         expect(installCalls).toBe(3);
         expect(native.isNativeEnginePermanentlyRefused()).toBe(false);
       });
     });
 
     test('a native binary older than this bundle still answers a bare boolean', () => {
-      // Forward compatibility in the direction that actually happens: JS
-      // reloads without a rebuild. A `false` carries no permanence claim, so
-      // it must read as transient — retried forever, exactly as before.
+      // An older binary's `false` makes no permanence claim, so it stays
+      // transient.
       mockRefusingPlatform(false);
       withFreshModules((native) => {
         expect(native.isNativeEngineAvailable()).toBe(false);
@@ -278,8 +253,7 @@ describe('host binding discovery', () => {
     });
 
     test('an unrecognised outcome is read as transient, never as permanent', () => {
-      // A future binary inventing a fourth string must not be able to make
-      // this bundle give up on a binding that is really there.
+      // An unknown fourth string must not make this bundle give up.
       mockRefusingPlatform('something-new');
       withFreshModules((native) => {
         expect(native.isNativeEngineAvailable()).toBe(false);
@@ -290,10 +264,8 @@ describe('host binding discovery', () => {
     });
 
     test('a refusal is not remembered once the binding is actually there', () => {
-      // The refusal memo is only consulted when nothing landed on the global.
-      // A binary that reports 'refused' but installs anyway (or a host that
-      // installed during startup) must still be used.
-      const binding = realBinding(1);
+      // The refusal memo is consulted only when nothing landed on the global.
+      const binding = realBinding(PROTOCOL_VERSION);
       if (!binding) return;
       jest.doMock('react-native', () => ({
         NativeModules: {
@@ -323,7 +295,19 @@ describe('host binding discovery', () => {
       native.__linkNativeEngine(addon.parse);
       expect(native.isNativeEngineAvailable()).toBe(true);
       const doc = parseDocument('*x*\n', presets.commonmark, native.nativeEngine);
-      expect(doc.blocks).toHaveLength(1);
+      expect(doc.blocks).toEqual([
+        {
+          kind: 'paragraph',
+          span: { start: 0, end: 3 },
+          children: [
+            {
+              kind: 'emphasis',
+              span: { start: 0, end: 3 },
+              children: [{ kind: 'text', span: { start: 1, end: 2 }, value: 'x' }],
+            },
+          ],
+        },
+      ]);
     });
   });
 });

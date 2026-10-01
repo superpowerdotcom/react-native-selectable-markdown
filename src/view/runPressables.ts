@@ -46,35 +46,13 @@ export interface RunPressable {
 }
 
 /**
- * The tappable ranges of a projected run, in mark order, NON-OVERLAPPING —
- * the property both hosts' hit tests rely on, since each of them resolves a
- * tap with "the first range that contains this offset" (SelectableRunHostView
- * .swift, SelectableRunHostView.kt) and would silently ignore any second one.
- *
- * The non-overlap is enforced here rather than assumed. "Links cannot nest in
- * CommonMark" is true of the *rendered* result and false of the mark stream:
- * `[<https://a.com>](https://b.com)` parses as a link whose text is an
- * autolink, and the projection emits a link mark for each — two marks over
- * one identical range, with different hrefs. Passing both to the host left the
- * documented guarantee false and the winner decided by array order.
- *
- * So a mark that starts inside a range already kept is dropped. Marks arrive
- * sorted by start ascending, then by end descending (`Projector.finish`), so
- * "already kept" is a single running end offset, and the range that survives
- * is the first one in mark order — exactly the one both hit tests were
- * already choosing.
- *
- * That is the INNER autolink only when the two ranges are identical, where
- * the tie keeps push order and marks are pushed innermost-first. Add any text
- * outside the autolink and the wider outer link sorts ahead of it and wins:
- * `[<https://a.com> tail](https://b.com)` yields one pressable spanning the
- * whole display range, pointing at b.com, and the autolink is not separately
- * tappable. Both cases are pinned in runPressables.test.ts.
+ * The tappable ranges of a projected run, in mark order, non-overlapping: both
+ * hosts' hit tests take the first containing range. A mark starting inside a
+ * kept range is dropped, so on an identical range the inner autolink of
+ * `[<https://a.com>](https://b.com)` wins, and with any outer text the outer link does.
  */
 export function resolveRunPressables(projected: ProjectedRun): RunPressable[] {
   const out: RunPressable[] = [];
-  // The end of the furthest range kept so far; a mark starting before it
-  // would overlap one of them.
   let coveredUntil = -1;
   for (const mark of projected.marks) {
     if (mark.kind !== 'link' && mark.kind !== 'blockedLink') continue;

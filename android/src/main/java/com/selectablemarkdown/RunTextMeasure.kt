@@ -18,29 +18,12 @@ import kotlin.math.ceil
  * The one place a run's text layout is configured, and the one place it is
  * measured.
  *
- * WHY THIS OBJECT EXISTS. Two separate things have to agree about how a run
- * lays out: the `TextView` that draws it on the UI thread, and
- * `SelectableRunHostViewManager.measure`, which the C++ shadow node
- * (platform/fabric/RNSMRunHostShadowNode.cpp) calls across JNI from the layout
- * thread. If they disagree the symptom is not a build error, it is text
- * clipped at the bottom of a run: it looks like a rendering bug, it gets worse
- * with every extra line, and no test in this repository can see it
- * (docs/FABRIC-PLAN.md §4.3 specifies the instrumented test that could, and
- * says plainly that it cannot run here). So agreement is not maintained by
- * keeping two call sites in sync — there is one paint configuration and one
- * `StaticLayout` construction, and both sides go through this file.
- * `RunAttributedText.build` is the matching guarantee for the styled string
- * itself. `RunLayoutCache` memoizes both and does not bend any of this: it
- * sits in FRONT of the one builder and this one measure, never beside them,
- * so a cache hit returns what the miss path would have built from the same
- * inputs.
+ * WHY THIS OBJECT EXISTS. The drawing `TextView` and the JNI `measure` must lay a run out
+ * identically, or text clips at the bottom of a run where no test here can see it, so both go
+ * through one paint configuration and one `StaticLayout` construction.
  *
- * UNITS. Everything here is in **pixels**, and the caller converts — which is
- * why converting is not this object's job:
+ * UNITS. Everything here is in **pixels**, and the caller converts:
  *
- *  - The drawing side wants pixels, because that is what a `TextView`, its
- *    `TextPaint` and a `StaticLayout` all speak. It takes what `measure` and
- *    `configurePaint` produce, untouched.
  *  - Fabric's Yoga tree is in points. `FabricUIManager.measure` converts the
  *    constraints to pixels on the way in — `getYogaSize` is
  *    `PixelUtil.toPixelFromDIP(maxSize)`
@@ -115,34 +98,15 @@ internal object RunTextMeasure {
     private const val BREAK_STRATEGY = Layout.BREAK_STRATEGY_HIGH_QUALITY
     private const val HYPHENATION_FREQUENCY = Layout.HYPHENATION_FREQUENCY_NONE
 
-    /**
-     * Paragraph direction, pinned on both sides for the same reason the break
-     * strategy is: the two ends resolve it from different places by default.
-     * A `StaticLayout.Builder` left alone uses FIRSTSTRONG_LTR; a `TextView`
-     * left alone inherits TEXT_DIRECTION_FIRST_STRONG, which resolves to
-     * FIRSTSTRONG_**RTL** when the view's layout direction is RTL — so in an
-     * RTL app a paragraph with no strong directional character in it (a line
-     * of digits, a code fence of punctuation) was measured as LTR and drawn
-     * as RTL, and ALIGN_NORMAL resolves against exactly that bit.
-     *
-     * The pair below is one decision written twice, because the two APIs take
-     * different types: `TextDirectionHeuristics.FIRSTSTRONG_LTR` is what
-     * `TextView.getTextDirectionHeuristic` returns for
-     * `View.TEXT_DIRECTION_FIRST_STRONG_LTR`. It is also what the deprecated
-     * pre-M `StaticLayout` constructor uses internally, so that branch needs
-     * nothing added to agree, and it is the heuristic React Native resolves
-     * its own text layouts through (TextLayoutManager.java's `isScriptRTL`).
-     */
+    /** Pinned on both sides: an RTL `TextView` resolves FIRSTSTRONG_RTL, while `StaticLayout.Builder` uses FIRSTSTRONG_LTR. */
     private val TEXT_DIRECTION = TextDirectionHeuristics.FIRSTSTRONG_LTR
     private const val VIEW_TEXT_DIRECTION = View.TEXT_DIRECTION_FIRST_STRONG_LTR
 
     /**
      * Scratch paint for the measure path, one per thread rather than one per
-     * call. Per thread because `measure` runs on whatever thread Fabric calls
-     * it from — the layout thread for a background commit, the UI thread for a
-     * synchronous one — while the view side configures its own paint on the UI
-     * thread, and TextPaint is not thread-safe; never handed across threads or
-     * out of this function. `configurePaint`
+     * call. Per thread because `measure` runs on the layout or the UI thread
+     * and TextPaint is not thread-safe; never handed across threads or out of
+     * this function. `configurePaint`
      * re-runs on every measure because textSize derives from the window
      * metrics, which move under a font-scale or density change; nothing else
      * on the paint is ever written — span measurement inside StaticLayout and
@@ -175,6 +139,7 @@ internal object RunTextMeasure {
      */
     fun configurePaint(paint: TextPaint, baseSizeSp: Float = TEXT_SIZE_SP) {
         paint.textSize = PixelUtil.toPixelFromSP(baseSizeSp)
+        paint.isElegantTextHeight = true
         // Set explicitly on every configuration, measure side and view side
         // alike, for two reasons at once: the measure side's scratch paint is
         // thread-local and would otherwise freeze the locale it was created
@@ -197,44 +162,24 @@ internal object RunTextMeasure {
      * writing the paint directly is equivalent to `setTextSize` here and not a
      * shortcut around it.
      *
-     * Every knob below is one `measure` also sets on its `StaticLayout`; they
-     * are set here and nowhere else so that "what the view is configured with"
-     * and "what was measured" cannot drift apart in a diff. `includeFontPadding`
-     * is `TextView`'s default and is stated anyway, because the measure side has
-     * to name it explicitly and a default that is only true on one side is not
-     * agreement.
+     * Every knob below is one `measure` also sets on its `StaticLayout`, so it is set here and
+     * nowhere else; `includeFontPadding` is stated anyway because the measure side must name it.
      *
      * The line-spacing pair is set to the identity for a second reason beyond
      * agreement: leading is owned entirely by `RunLineHeightSpan`, driven by
      * the `lineHeight` attribute on the wire, and a non-zero `lineSpacingExtra`
      * here would add to it invisibly on the drawn side only.
      *
-     * Fallback line spacing is pinned rather than inherited, and it is the one
-     * knob here whose default depends on the HOST APP: `TextView` turns it on
-     * for itself only when the app's targetSdk is 28+, while
-     * `StaticLayout.Builder` defaults it off at every level. Left alone, the
-     * pair disagrees about any line that fell back to another font for a
-     * script the chosen face lacks — emoji, CJK — where the fallback face's
-     * taller metrics grow the drawn line but not the measured one, which is
-     * the clipped-text failure this object exists to prevent. React Native
-     * turns it on for the same reason (TextLayoutManager.java:416-418, under
-     * the same API-28 guard).
+     * Fallback line spacing is pinned: `TextView` enables it only for targetSdk 28+ apps, `StaticLayout.Builder` never.
      */
     fun configureTextView(view: TextView) {
         configurePaint(view.paint)
         view.includeFontPadding = true
         view.setLineSpacing(0f, 1f)
         view.textDirection = VIEW_TEXT_DIRECTION
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            // Pre-M Android has one line-breaking algorithm and no way to
-            // select another, so there is nothing to synchronise there and the
-            // measure side leaves it alone for the same reason.
-            view.breakStrategy = BREAK_STRATEGY
-            view.hyphenationFrequency = HYPHENATION_FREQUENCY
-        }
+        view.breakStrategy = BREAK_STRATEGY
+        view.hyphenationFrequency = HYPHENATION_FREQUENCY
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            // Below API 28 neither side has the knob, so both use the font's
-            // own metrics and agree by construction.
             view.isFallbackLineSpacing = true
         }
     }
@@ -282,17 +227,6 @@ internal object RunTextMeasure {
             return YogaMeasureOutput.make(0f, 0f)
         }
 
-        // The cache consult. The key captures every input the styled string
-        // and the paint read — text, all three specs (attributes, decorations
-        // and the embed reservations, which bake their own sizes into spans),
-        // the window display metrics and the default locale — so a hit is
-        // exactly what the code below would have produced; RunLayoutCache's
-        // header carries the argument, including why the metrics must be in
-        // the key and why the entry caps are not the memory bound. Streaming
-        // recommits — Fabric re-measures every run whose props changed on
-        // every commit — arrive here with identical inputs and identical
-        // constraints for every run the delta did not touch, and the second
-        // lookup turns that whole case into a map get.
         val key = RunLayoutCache.key(text, spec, decorations, embeds)
         RunLayoutCache.measurement(key, width, widthMode, height, heightMode)?.let { return it }
 
@@ -316,45 +250,20 @@ internal object RunTextMeasure {
         }
         val wrapWidth = layoutWidth.toInt().coerceAtLeast(1)
 
-        val layout = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val builder = StaticLayout.Builder
-                .obtain(styled, 0, styled.length, paint, wrapWidth)
-                .setAlignment(Layout.Alignment.ALIGN_NORMAL)
-                .setLineSpacing(0f, 1f)
-                .setIncludePad(true)
-                .setBreakStrategy(BREAK_STRATEGY)
-                .setHyphenationFrequency(HYPHENATION_FREQUENCY)
-                .setTextDirection(TEXT_DIRECTION)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                // The view side pins the same bit in `configureTextView`,
-                // where the comment says what the two would otherwise
-                // disagree about.
-                builder.setUseLineSpacingFromFallbacks(true)
-            }
-            builder.build()
-        } else {
-            // Pre-M: no builder, and no break strategy or fallback line
-            // spacing to choose on either side. The remaining parameters are
-            // positional — width, alignment, spacing multiplier, spacing add,
-            // includePad — and match the builder call above knob for knob;
-            // the text direction matches too, since this constructor uses
-            // FIRSTSTRONG_LTR internally (see TEXT_DIRECTION).
-            @Suppress("DEPRECATION")
-            StaticLayout(styled, paint, wrapWidth, Layout.Alignment.ALIGN_NORMAL, 1f, 0f, true)
+        val builder = StaticLayout.Builder
+            .obtain(styled, 0, styled.length, paint, wrapWidth)
+            .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+            .setLineSpacing(0f, 1f)
+            .setIncludePad(true)
+            .setBreakStrategy(BREAK_STRATEGY)
+            .setHyphenationFrequency(HYPHENATION_FREQUENCY)
+            .setTextDirection(TEXT_DIRECTION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            builder.setUseLineSpacingFromFallbacks(true)
         }
+        val layout = builder.build()
 
-        // The room a box at the very EDGE of the run needs, which the text
-        // layout above neither asks for nor knows about: a table that closes
-        // an answer has nothing under its bottom border, a code block that
-        // opens one has nothing above its top border. Everywhere else the
-        // padding is painted into the blank line the '\n\n' block separator
-        // leaves and costs nothing. `RunDecorations.edgePaddingPx` is the one
-        // derivation — `SelectableRunHostView` reads the same function for
-        // the child TextView's padding, which is what puts the text inside
-        // the room measured here rather than at the top of it. In PIXELS on
-        // both sides, and rounded once inside that function: `setPadding`
-        // takes whole pixels, so a float added here would reserve a fraction
-        // of a pixel the view could not spend.
+        // `SelectableRunHostView` pads its TextView by this same `edgePaddingPx`, so the text sits in the room measured here.
         val edge = RunDecorations.edgePaddingPx(decorations, text.length)
         val contentHeight = layout.height.toFloat() + edge.top.toFloat() + edge.bottom.toFloat()
 

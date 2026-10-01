@@ -1,6 +1,7 @@
 package com.selectablemarkdown
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.os.Build
 import android.view.ActionMode
 import android.view.GestureDetector
@@ -8,6 +9,8 @@ import android.view.KeyEvent
 import android.view.Menu
 import android.view.MenuItem
 import android.view.MotionEvent
+import android.view.View
+import android.view.accessibility.AccessibilityManager
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.TextView
@@ -28,10 +31,7 @@ import com.facebook.react.uimanager.UIManagerHelper
  * JS contract (see docs/SELECTION.md):
  *   props:  `text` (projected run text), `attributes` (styled ranges over
  *           that text), `pressables` (tappable ranges over that text),
- *           `selectable`, `exclusiveSelection` (whether this host takes part
- *           in the one-active-selection coordination), `selectionActions`
- *           (the ordered menu, one string per item: an action identifier, or
- *           `identifier + U+001F + title`)
+ *           `selectable`, `exclusiveSelection`, `selectionActions`
  *   events: `onSelectionAction({ start, end, action, selectedText })` —
  *           UTF-16 code-unit offsets into the CURRENT `text`,
  *           end-exclusive, clamped, start <= end; `action` names the menu
@@ -39,29 +39,14 @@ import com.facebook.react.uimanager.UIManagerHelper
  *           `onInlinePress({ start, end, pressableId })` — a single tap
  *           landed inside one of `pressables`; same offset guarantees, and
  *           `pressableId` is JS's identifier for the range, echoed verbatim.
- *           `onSelectionChange({ start, end })` — where the selection stands
- *           now, deduped; same offset guarantees except that an EMPTY range
- *           is a real payload and means "nothing is selected here".
- *   commands: `clearSelection()`, `setSelection(start, end)` — JS telling one
- *           mounted host what to select, in the same offsets the events
- *           report. Routed through the codegen'd ViewManager delegate.
+ *           `onSelectionChange({ start, end })` — deduped; same offset
+ *           guarantees, except that an EMPTY range means nothing is selected.
+ *   commands: `clearSelection()`, `setSelection(start, end)`, in the same offsets.
  *
  * The system Copy item (android.R.id.copy) is never intercepted, replaced,
  * or reordered: stock plain-text copy keeps working with no JS involvement.
  * The custom items only EMIT the event — JS builds the payload and writes
  * the clipboard.
- *
- * THE MENU'S STRINGS COME FROM JS WHEN JS SENDS THEM, and from this module's
- * resources otherwise. An entry with no U+001F is a bare identifier, titled
- * from `R.string.selectable_markdown_copy_text` /
- * `..._copy_markdown` — which a host app overrides by declaring the same
- * names, and translates with a `values-<locale>` folder. An entry that
- * carries a title uses it verbatim, which is what lets one JS i18n call
- * localise both platforms and what lets a consumer define items this file
- * has never heard of. An identifier this view cannot title (unknown, and no
- * title sent) is dropped rather than added as a blank menu item — the same
- * forward-compatibility rule as before, now with the escape hatch that a
- * title makes any identifier renderable.
  *
  * `attributes` is what makes this host render markdown rather than a wall of
  * system text. Each entry is a range of `text` plus the parts of a text style
@@ -82,24 +67,16 @@ import com.facebook.react.uimanager.UIManagerHelper
  * settled flowing block into one run keyed on its start offset, so when the
  * next block settles it lands in the same run: same key, same mounted view,
  * still `selectable=true`, longer text. Measured across the eight shipped
- * fixtures, an Android-selectable run's text changes four to ten times per
- * streamed message — 47 changes across the eight, streamed in 5-character
- * chunks under `presets.llmChat` — and each one costs the user their
- * selection and the open action mode.
+ * fixtures, an Android-selectable run's text changes several times per
+ * streamed message, and each one costs the user their selection and the
+ * open action mode.
  *
  * Nothing here can copy the wrong markdown — the offsets are always read from
  * the current text — so this is a UX defect, not a correctness one. It is
  * pre-existing and unfixed; docs/SELECTION.md ("Android: no preservation, and
- * a known gap") carries the per-fixture measurement and the candidate fixes,
- * every one of which is larger than this file.
+ * a known gap") carries the measurement and the candidate fixes.
  *
- * NOTHING HERE IS CONDITIONAL ON AN ARCHITECTURE, because there is only one
- * left: the peer range starts at react-native 0.82. Fabric hands the Java
- * ViewManager the raw props, so `RunAttributedText.parse` reads them
- * unchanged, and events go out through `UIManagerHelper`'s dispatcher rather
- * than a path of their own. What Fabric brings that the old architecture did
- * not is recycling — see `prepareToRecycle`, which is a correctness
- * requirement here and not hygiene.
+ * Fabric recycles views, so `prepareToRecycle` is a correctness requirement, not hygiene.
  */
 class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
 
@@ -108,8 +85,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
      * offers to a TextView subclass, mirroring the iOS host:
      * `onSelectionChanged` feeds the one-active-selection coordination (see
      * `activeHost`), the only selection-change signal a TextView exposes, and
-     * the three dispatch overrides below are the plumbing
-     * `ExploreByTouchHelper` documents as the caller's job.
+     * the dispatch overrides below feed `ExploreByTouchHelper`.
      *
      * Everything else stays the stock widget — the decorator design's whole
      * point — and every override degrades to `super` whenever it has nothing
@@ -119,41 +95,23 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
 
         override fun onSelectionChanged(selStart: Int, selEnd: Int) {
             super.onSelectionChanged(selStart, selEnd)
-            // THE CONSTRUCTOR GUARD. TextView's own init reaches this override
-            // before the host's fields exist — `textView` itself is still
-            // null, so anything that reads it would NPE. It used to be
-            // implicit in `selEnd > selStart` (the selection is always empty
-            // that early); it has to be explicit now that an empty selection
-            // is something this view reports rather than ignores.
+            // TextView's own constructor reaches this before the host's fields exist.
             if (!readyForEvents) return
-            // Self first, coordination second, and the order is load-bearing:
-            // a hand-off must reach JS as "this run holds [4,9)" followed by
-            // "the other run holds nothing", which JS can drop as stale.
-            // Coordinating first would deliver a null and then the real
-            // selection — one visible toolbar flicker per hand-off. The iOS
-            // delegate is ordered the same way for the same reason.
+            // Report before coordinating, so a hand-off reaches JS as the new range, then the old run's empty one.
             emitSelectionChange()
-            // A host that opted out of exclusivity still REPORTS; it only
-            // skips the coordination.
             if (selEnd > selStart && exclusiveSelection) {
                 becomeActiveSelectionHost()
             }
         }
 
-        // The three feeds ExploreByTouchHelper cannot install for itself.
-        // Hover drives explore-by-touch (a finger dragged over the text with
-        // TalkBack on), keys drive arrow navigation between virtual views,
-        // and focus keeps the helper's idea of the focused node in step. All
-        // three are null-safe against construction order: this subclass is
-        // built while the host's own fields are still being initialised, and
-        // `accessibilityHelper` is the last of them.
+        // The feeds ExploreByTouchHelper cannot install for itself.
         override fun dispatchHoverEvent(event: MotionEvent): Boolean {
             if (accessibilityHelper?.dispatchHoverEvent(event) == true) return true
             return super.dispatchHoverEvent(event)
         }
 
         override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-            if (accessibilityHelper?.dispatchKeyEvent(event) == true) return true
+            if (accessibilityHelper?.dispatchLinkKeyEvent(event) == true) return true
             return super.dispatchKeyEvent(event)
         }
 
@@ -163,20 +121,13 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
             previouslyFocusedRect: android.graphics.Rect?,
         ) {
             super.onFocusChanged(focused, direction, previouslyFocusedRect)
-            accessibilityHelper?.onFocusChanged(focused, direction, previouslyFocusedRect)
+            accessibilityHelper?.onHostFocusChanged(focused, direction, previouslyFocusedRect)
         }
     }
 
     private val textView: TextView = RunTextView(context)
 
-    /**
-     * The screen-reader channel over `pressables` and the run's block roles —
-     * heading, list item, table cell; see `RunAccessibility.kt`. Nullable and
-     * assigned in `init`
-     * rather than initialised here, because `RunTextView` reads it from three
-     * dispatch overrides that the platform can in principle reach before this
-     * object finishes constructing.
-     */
+    /** Nullable: `RunTextView`'s dispatch overrides can run before `init` assigns it. */
     private var accessibilityHelper: RunAccessibilityHelper? = null
 
     /** The three props the rendered text is built from, plus a dirty flag.
@@ -193,40 +144,20 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
     private var pendingEmbeds: RunEmbeds.Spec = RunEmbeds.Spec.EMPTY
     private var textDirty = false
 
-    /** The accessibility ranges' own dirty flag, and it cannot be folded into
-     * `textDirty`: they are derived from `text`, `attributes` AND
-     * `pressables`, and a pressables-only update deliberately never sets
-     * `textDirty` (see `setPressables`). Same purpose as `textDirty` though —
-     * under Fabric the whole prop map arrives on every commit, and this is
-     * what keeps a batch that changed none of the three from rebuilding the
-     * list. */
+    /** Separate from `textDirty`: a pressables-only update changes the accessibility ranges, never the text. */
     private var accessibilityDirty = false
+    private val accessibilityManager = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
+    private val accessibilityStateListener = AccessibilityManager.AccessibilityStateChangeListener { enabled ->
+        accessibilityDirty = true
+        if (enabled) commitProps() else accessibilityHelper?.setNodes(emptyList())
+    }
 
-    /** False until `init` finishes. `RunTextView`'s own constructor reaches
-     * `onSelectionChanged` before this object's fields are assigned — before
-     * `textView` itself exists — so the emitter there has to know when it is
-     * safe to touch them. The JVM default of a Boolean field is false, which
-     * is what makes reading it from inside that constructor correct rather
-     * than merely lucky. */
+    /** Read inside `RunTextView`'s constructor, where only the JVM default false makes that safe. */
     private var readyForEvents = false
 
-    /** Whether this host takes part in the one-active-selection coordination;
-     * see `becomeActiveSelectionHost` and the `exclusiveSelection` prop. */
     private var exclusiveSelection = true
 
-    /** The last range handed to `onSelectionChange`, so an unchanged selection
-     * is never re-announced.
-     *
-     * IT MATTERS BECAUSE `onSelectionChanged` IS NOISY: the platform calls it
-     * on every step of a handle drag and on every `Selection` write, and
-     * `commitProps` performs one of those on every commit that changes the
-     * text. An empty selection is normalised to (0, 0) before it lands here,
-     * so the two ways Android spells "nothing selected" — (-1, -1) and a
-     * collapsed cursor — dedupe against each other instead of alternating.
-     *
-     * Starting at (0, 0) means a host that has never held a selection emits
-     * nothing at all: an empty report is meaningful only as the END of a
-     * selection this host previously announced. */
+    /** Empty selections are normalised to (0, 0), so both of Android's spellings dedupe and a never-selected host reports nothing. */
     private var lastReportedStart = 0
     private var lastReportedEnd = 0
 
@@ -242,23 +173,10 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
     private val decorationPath = android.graphics.Path()
     private val decorationRadii = FloatArray(8)
 
-    /** Configured menu actions, in prop order: the identifier to report and
-     * the title to draw, both resolved when the prop arrived. Defaults to
-     * the built-in menu, matching the JS default. */
     private var selectionActions: List<ResolvedAction> = defaultSelectionActions()
 
-    /** The menu item ids added by the last `onPrepareActionMode`.
-     *
-     * Tracked rather than assumed because the menu is no longer a fixed two
-     * items: the prop can shrink, grow or be reordered between prepares, and
-     * removing exactly what was added is what leaves nothing behind. */
     private val addedMenuItemIds = ArrayList<Int>(2)
 
-    /** Item id -> action identifier for the items currently on the menu.
-     *
-     * This map IS the "never intercept a system item" rule: only ids this
-     * class put on the menu are in it, so `onActionItemClicked` declines
-     * android.R.id.copy and every OEM addition by finding nothing. */
     private val menuItemActions = HashMap<Int, String>()
 
     /** Tappable ranges over the text, parsed from the `pressables` prop.
@@ -275,14 +193,6 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
      * ClickableSpan + LinkMovementMethod, which take over the TextView's
      * movement/touch handling and are a known source of selection breakage on
      * exactly the widget this class exists to keep stock.
-     *
-     * IT IS NOT THE ONLY WAY IN ANY MORE, and it could not be: a screen
-     * reader activates a node with ACTION_CLICK through the accessibility
-     * API, never by injecting a touch stream, so while this detector was the
-     * only path a link inside a run was unreachable with TalkBack on — and
-     * unannounced. `accessibilityHelper` adds that path (RunAccessibility.kt)
-     * without giving up anything above: it installs no movement method, and
-     * both routes end in the same `emitInlinePress`.
      */
     private val inlineTapDetector = GestureDetector(
         context,
@@ -313,10 +223,6 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
             // Remove-first, then re-add per the current prop: repeated
             // prepare calls (OEM skins invoke it more than once) and prop
             // updates both converge on the same menu with no duplicates.
-            // What gets removed is exactly what was added last time, not a
-            // fixed pair — the list is consumer-sized now. System items
-            // (android.R.id.copy and friends) stay exactly where the
-            // platform put them.
             for (index in addedMenuItemIds.indices) {
                 menu.removeItem(addedMenuItemIds[index])
             }
@@ -324,11 +230,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
             menuItemActions.clear()
             var order = Menu.CATEGORY_SECONDARY
             for (action in selectionActions) {
-                // Sequential from the base, so the default two-item menu
-                // still gets the same two ids it always had. Every entry in
-                // `selectionActions` is renderable — an identifier this
-                // binary cannot title was already dropped by
-                // `parseSelectionAction` — so there is nothing to skip here.
+                // Sequential from the base, so the default two-item menu keeps its ids.
                 val itemId = ITEM_ID_BASE + addedMenuItemIds.size
                 menu.add(Menu.NONE, itemId, order, action.title)
                 addedMenuItemIds.add(itemId)
@@ -339,9 +241,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         }
 
         override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
-            // Never intercept system items (android.R.id.copy etc.); plain
-            // copy must keep its stock behavior. Only the ids this callback
-            // added are in the map, so anything else declines by missing.
+            // Only ids this callback added are in the map, so system and OEM items decline by missing.
             val action = menuItemActions[item.itemId] ?: return false
             emitSelectionAction(action)
             mode.finish()
@@ -374,27 +274,15 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
             // builds; markdown runs need none of its smart-selection output.
             textView.textClassifier = android.view.textclassifier.TextClassifier.NO_OP
         }
-        // The screen-reader channel, installed once and for the life of the
-        // view: it offers no node provider at all while the run has no links
-        // and no block roles
-        // (RunAccessibilityHelper.getAccessibilityNodeProvider), so there is
-        // nothing to attach and detach as props change.
-        //
-        // ExploreByTouchHelper's constructor forces `focusable` on and lifts
-        // importantForAccessibility from AUTO to YES; both are restored here,
-        // exactly as React Native's own ReactAccessibilityDelegate restores
-        // them (ReactAccessibilityDelegate.java:403-407), so a run keeps the
-        // focus behaviour and the announcement coalescing the stock widget
-        // had. `setTextIsSelectable` above owns `focusable` on this widget,
-        // and `setSelectable` keeps owning it afterwards.
-        val focusableBefore = textView.isFocusable
+        // ExploreByTouchHelper's constructor forces `focusable` and importantForAccessibility YES;
+        // both are restored, as React Native's ReactAccessibilityDelegate does.
+        val focusableBefore = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) textView.focusable
+            else if (textView.isFocusable) View.FOCUSABLE else View.NOT_FOCUSABLE
         val importanceBefore = textView.importantForAccessibility
         val helper = RunAccessibilityHelper(textView) { pressable -> emitInlinePress(pressable) }
-        textView.isFocusable = focusableBefore
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) textView.setFocusable(focusableBefore)
+        else textView.isFocusable = focusableBefore == View.FOCUSABLE
         textView.importantForAccessibility = importanceBefore
-        // ViewCompat, not View#setAccessibilityDelegate: the helper is an
-        // AccessibilityDelegateCompat, which the framework setter does not
-        // take.
         ViewCompat.setAccessibilityDelegate(textView, helper)
         accessibilityHelper = helper
         addView(
@@ -406,9 +294,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         // stacking the design needs, since the platform draws the selection
         // highlight inside the TextView, above whatever this layer painted.
         setWillNotDraw(false)
-        // LAST LINE OF `init`, deliberately: everything `onSelectionChanged`
-        // touches — `textView`, the dedupe fields, `exclusiveSelection` — is
-        // assigned by now, so the guard in that override can stop refusing.
+        // Last in `init`: everything `onSelectionChanged` touches is assigned by now.
         readyForEvents = true
     }
 
@@ -428,10 +314,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
      * dismisses the ActionMode even when the new value is character-identical
      * to the old one.
      *
-     * An unguarded setter used to be harmless, because the old architecture
-     * sent only the props JS had diffed as changed, so this ran when
-     * `attributes` actually changed. Fabric does not diff, and Fabric is the
-     * only architecture this package supports. `FabricMountingManager::getProps`
+     * Fabric does not diff props. `FabricMountingManager::getProps`
      * returns `newShadowView.props->rawProps` whole
      * (ReactAndroid/src/main/jni/react/fabric/FabricMountingManager.cpp:222-226),
      * `SurfaceMountingManager` wraps that entire map, and
@@ -449,10 +332,9 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
      */
     fun setAttributes(spec: RunAttributedText.Spec) {
         if (spec.attributes == pendingAttributes.attributes) return
+        val layoutChanged = spec.layoutAttributes != pendingAttributes.layoutAttributes
         pendingAttributes = spec
-        textDirty = true
-        // Headings, list items and table cells are read back out of these
-        // ranges (RunAccessibility.kt).
+        textDirty = textDirty || layoutChanged
         accessibilityDirty = true
     }
 
@@ -487,13 +369,8 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
 
     /** Applied once per prop batch, from the view manager. */
     fun commitProps() {
-        // Ahead of the early return below, because the accessibility ranges
-        // have their own dirty flag: `pressables` changing on its own is the
-        // case that must not be missed, and it deliberately leaves `text`
-        // alone. Offsets only — the node bounds are read from the layout at
-        // the moment a screen reader asks for them, so this does not care
-        // that the text below has not been installed yet.
-        if (accessibilityDirty) {
+        // Before the early return: a pressables-only batch leaves `textDirty` false.
+        if (accessibilityDirty && accessibilityManager.isEnabled) {
             accessibilityDirty = false
             accessibilityHelper?.setNodes(
                 RunAccessibility.resolve(pendingText, pendingAttributes, pressables)
@@ -527,24 +404,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         // the previous run's base size. The measure paths derive the same
         // value from the same two props (RunTextMeasure.baseTextSizeSp).
         RunTextMeasure.updateTextViewBaseSize(textView, pendingText, pendingAttributes)
-        // And the room a box at the very edge of this run needs, as the child
-        // TextView's vertical padding.
-        //
-        // WHY PADDING RATHER THAN A LAYOUT OFFSET. `totalPaddingTop` is
-        // already what every text-to-view coordinate conversion in this file
-        // goes through — the box and rule geometry in `onDraw`, the embed
-        // rects, the pressable hit test, the screen reader's node bounds — so
-        // pushing the text down this way moves all of them together and none
-        // of them has to learn why. The measure path reserved exactly these
-        // two values — the same `RunDecorations.edgePaddingPx` call, added to
-        // the height in `RunTextMeasure.measure`, so the rounding to whole
-        // pixels `setPadding` needs happens once and both sides spend the
-        // identical integers. The taller view Fabric framed is therefore the
-        // room this padding fills; without it the padding would grow the
-        // TextView past the host and clip the last line instead.
-        //
-        // Zero for the ordinary run — no box at either edge — in which case
-        // this is the `setPadding(0, 0, 0, 0)` the widget already had.
+        // Padding, so every `totalPaddingTop` conversion here moves with it; `RunTextMeasure.measure` reserved the same pixels.
         val edge = RunDecorations.edgePaddingPx(pendingDecorations, pendingText.length)
         textView.setPadding(0, edge.top, 0, edge.bottom)
         textView.text = RunLayoutCache.styledText(
@@ -554,12 +414,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         // own display list is stale the moment the text moves — and a child
         // invalidation alone does not rebuild the parent's.
         invalidate()
-        // The swap above dropped whatever was selected, and JS has to be told
-        // — a toolbar over a selection that no longer exists is exactly the
-        // artifact this event was added to remove. Called rather than left to
-        // `onSelectionChanged`, because whether `TextView#setText` re-notifies
-        // for the NEW text is a version-dependent detail of the widget; the
-        // dedupe makes a duplicate call free.
+        // Called directly: whether `setText` re-notifies `onSelectionChanged` varies by version, and the dedupe makes a duplicate free.
         emitSelectionChange()
         // Embed rects are read off the TextView's Layout, which does not
         // exist until the layout pass the setText above requested. onLayout
@@ -576,33 +431,8 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
     }
 
     /**
-     * The `exclusiveSelection` prop: whether this host takes part in the
-     * one-active-selection coordination (`becomeActiveSelectionHost`).
-     * Defaults to true, which is what every host did before the prop existed.
-     *
-     * FALSE OPTS OUT IN BOTH DIRECTIONS. This host neither clears the previous
-     * owner nor takes the slot, so it cannot erase another host's selection
-     * and — because it is never the recorded owner — no other host can erase
-     * its. An opt-out that only stopped the clearing would be useless: the
-     * first selection would still die the moment a second one began.
-     *
-     * WHAT `false` BUYS, AND WHAT IT DOES NOT. It buys several simultaneous
-     * `Selection` spans that survive each other, each reported by its own
-     * host through `onSelectionChange` — which is what makes "select in A,
-     * select in B, merge the two payloads" reachable at all. It does NOT buy
-     * several visible highlights, and it buys at most one action mode. A
-     * `TextView` draws a selection highlight only while `isFocused() ||
-     * isPressed()` (TextView#getUpdatedHighlightPath — the same fact
-     * `setSelection` is built around), and only one view has focus, so the
-     * earlier selections are live and invisible: the user sees the highlight
-     * move to whichever run they touched last. Anything built on this has to
-     * give its own feedback for the spans it is accumulating; the platform
-     * will not.
-     *
-     * The baton is handed back here rather than at the next selection change,
-     * because a host that opted out while holding it would otherwise be
-     * cleared once more by the next selection elsewhere, after it had already
-     * stopped participating.
+     * False opts out both ways: this host never clears another's selection and is never recorded, so none clears its.
+     * Its selection stays live but unhighlighted once another view takes focus.
      */
     fun setExclusiveSelection(value: Boolean) {
         if (value == exclusiveSelection) return
@@ -612,42 +442,9 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         }
     }
 
-    // ---- Commands -----------------------------------------------------------
-
     /**
-     * The `setSelection` command: select `[start, end)` of the current text,
-     * UTF-16 offsets, end-exclusive — the same unit and the same clamping
-     * discipline as every event this view emits, because JS computed these
-     * offsets against text that may have moved on by a frame.
-     *
-     * FOCUS IS TAKEN, AND IT HAS TO BE. `TextView` draws a selection highlight
-     * only while `isFocused() || isPressed()` (TextView#getUpdatedHighlightPath),
-     * so setting the `Selection` spans alone would be an invisible selection:
-     * present in `selectionStart`/`End`, reported to JS as real, and absent
-     * from the screen. The consequence is worth stating rather than hiding —
-     * a scrolling ancestor may respond to a focus change by scrolling this run
-     * into view. This command does not scroll; the platform's focus handling
-     * may.
-     *
-     * No action mode is started. A programmatic selection shows the range and
-     * its handles; the menu belongs to the user's gesture, and iOS behaves the
-     * same way.
-     *
-     * A run that is not selectable takes nothing — the platform's selection UI
-     * is off there (the streaming tail under the Android tail policy, or an
-     * explicit `selectable={false}`), so a selection would be state nobody can
-     * see or dismiss.
-     *
-     * A RANGE THAT CLAMPS TO EMPTY IS A NO-OP AND LEAVES ANY EXISTING
-     * SELECTION ALONE. It used to clear, which made the command destructive
-     * in the one case it is least sure of itself: the offsets were computed
-     * against text that may have moved on by a frame, so an empty clamp means
-     * "I raced a swap", not "the app asked for nothing" — and a user mid-sweep
-     * in this run would have lost their selection to a command aimed at text
-     * that is no longer here. Clearing is what `clearSelection` is for.
-     * Nothing changes, so nothing is emitted: `onSelectionChange` keeps
-     * describing the selection this run actually has. iOS follows the same
-     * rule, for the same reason (`SelectableRunHostView.setSelection`).
+     * Takes focus, since a `TextView` draws its highlight only while focused, so a scrolling ancestor may follow.
+     * A range that clamps to empty is a no-op: it means a raced text swap, so the existing selection stays.
      */
     fun setSelection(start: Int, end: Int) {
         if (!textView.isTextSelectable) return
@@ -670,24 +467,10 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
     fun setPressables(value: List<Pressable>) {
         if (value == pressables) return
         pressables = value
-        // The screen reader's link nodes are these same ranges, so they are
-        // rebuilt with them — in `commitProps`, once for the whole batch,
-        // like everything else derived from props.
         accessibilityDirty = true
     }
 
-    /**
-     * The `selectionActions` prop: one string per menu item, either an
-     * action identifier or `identifier + U+001F + title`, in menu order.
-     *
-     * Resolved to titles HERE rather than in `onPrepareActionMode`, for the
-     * same reason `pressables` is parsed on arrival: prepare runs inside a
-     * UIKit-equivalent callback that OEM skins invoke repeatedly while a
-     * selection is live, and it must not do string work or resource lookups
-     * per invocation. The comparison after resolving is also what keeps a
-     * prop batch that re-sends an identical list from invalidating an open
-     * action mode.
-     */
+    /** Resolved on arrival because OEM skins call `onPrepareActionMode` repeatedly while a selection is live. */
     fun setSelectionActions(actions: List<String>) {
         val resolved = ArrayList<ResolvedAction>(actions.size)
         for (index in actions.indices) {
@@ -704,18 +487,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         activeActionMode?.invalidate()
     }
 
-    /**
-     * One `selectionActions` entry, split the way
-     * `src/view/selectionActions.ts` packs it.
-     *
-     * The split is at the FIRST U+001F and everything after it is the title
-     * verbatim, so a title that contains one survives; an identifier could
-     * not, which is why the encoder refuses to send one. Returns null — the
-     * item is dropped, never added blank — for an empty identifier, and for
-     * an identifier that has no title from JS and none of this library's
-     * own. That last case is the forward-compatibility rule: a newer JS
-     * bundle naming an action this binary predates is ignored.
-     */
+    /** Splits at the first U+001F, so a title may contain one; an entry titled by neither JS nor this library is dropped. */
     private fun parseSelectionAction(encoded: String): ResolvedAction? {
         val separator = encoded.indexOf(ACTION_TITLE_SEPARATOR)
         val id = if (separator < 0) encoded else encoded.substring(0, separator)
@@ -730,29 +502,13 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         return ResolvedAction(id, title)
     }
 
-    /**
-     * This library's own title for an identifier it implements, or null for
-     * one it does not know.
-     *
-     * A RESOURCE AND NOT A LITERAL, so the two built-in items can be
-     * translated and reworded without a fork: a host app declares the same
-     * string names in its own `res/values/strings.xml` to override them (an
-     * application resource wins over a library's) and adds
-     * `res/values-<locale>/` to translate them. It is the Android
-     * counterpart of the iOS host's `NSLocalizedString` lookup against
-     * `Bundle.main`. Sending a `title` from JS overrides both at once and is
-     * the only path that reaches a consumer-defined identifier.
-     */
+    /** A resource, not a literal, so a host app can override or translate the built-in titles. */
     private fun defaultTitleFor(id: String): String? = when (id) {
         ACTION_COPY_TEXT -> context.getString(R.string.selectable_markdown_copy_text)
         ACTION_COPY_MARKDOWN -> context.getString(R.string.selectable_markdown_copy_markdown)
         else -> null
     }
 
-    /** The menu before any prop arrives, and after a prop reset: literally
-     * what the JS default (`DEFAULT_SELECTION_ACTIONS`) encodes to — the two
-     * bare identifiers, run through the same parse as any other entry, so
-     * there is one place where a built-in item gets its title. */
     private fun defaultSelectionActions(): List<ResolvedAction> = listOfNotNull(
         parseSelectionAction(ACTION_COPY_TEXT),
         parseSelectionAction(ACTION_COPY_MARKDOWN),
@@ -764,28 +520,9 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
     /**
      * One active selection across the document: Android never clears one
      * TextView's selection because another began one, so a transcript of
-     * per-run hosts would otherwise keep several live `Selection` spans at
-     * once. Not several highlights — a `TextView` draws one only while it is
-     * focused or pressed, and only one view has focus — so the older span
-     * goes invisible the instant the newer one begins, while remaining a real
-     * range its host has already reported to JS. That undrawn, undismissable
-     * state is what this removes. Called from
-     * `RunTextView.onSelectionChanged` the moment a non-empty selection lands
-     * here.
+     * per-run hosts would keep several live selections, all but one invisible.
      *
-     * THE PREDECESSOR IS THE ONLY HOST THAT CAN BE HOLDING ONE, which is what
-     * makes this O(1). The invariant is maintained by this method itself:
-     * every non-empty selection passes through here and clears the one before
-     * it, so at most one host in the process has a selection, and
-     * `activeHost` is it. This used to sweep a weak registry of every live
-     * host on every callback — an allocation and a walk over every mounted
-     * run, per frame, for the whole of a selection-handle drag.
-     *
-     * Recursion-safe: clearing the predecessor fires its
-     * `onSelectionChanged` with an empty selection, which returns at the
-     * guard there. The reference is weak, so an unmounted predecessor is
-     * simply gone by the time it would have been cleared, and nothing here
-     * keeps a view (or its ReactContext) alive.
+     * Every non-empty selection passes here, so the predecessor is the only host that can hold one.
      */
     private fun becomeActiveSelectionHost() {
         val previous = activeHost?.get()
@@ -794,22 +531,11 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         previous?.clearSelection()
     }
 
-    /**
-     * Drop this host's selection and close any menu over it. A no-op when
-     * nothing is selected.
-     *
-     * ONE METHOD FOR TWO CALLERS, deliberately: the `clearSelection` command
-     * from JS and the coordination clearing the previous selection owner mean
-     * exactly the same thing, and two definitions of "this run has no
-     * selection" would be two chances to leave an orphaned action mode
-     * behind. Order matters the same way it does in `prepareToRecycle`: the
-     * selection goes first, because finishing the mode is what the platform
-     * does in response.
-     *
-     * The report is left to the `onSelectionChanged` the removal triggers.
-     */
+    /** Selection before the mode, since finishing is the platform's response; a backward selection has start > end. */
     fun clearSelection() {
-        if (textView.selectionEnd <= textView.selectionStart) return
+        val start = textView.selectionStart
+        val end = textView.selectionEnd
+        if (start < 0 || end < 0 || start == end) return
         val spannable = textView.text as? android.text.Spannable ?: return
         android.text.Selection.removeSelection(spannable)
         activeActionMode?.finish()
@@ -817,21 +543,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
 
     // ---- Event emission ----------------------------------------------------
 
-    /**
-     * Report where the selection stands, deduped against the last report.
-     *
-     * The clamp is `emitSelectionAction`'s, minus its "never empty" rule: an
-     * empty range is the whole reason this event exists, so it is emitted —
-     * once — when it follows a non-empty one. Android spells "nothing
-     * selected" two ways, (-1, -1) and a collapsed offset, and both normalise
-     * to (0, 0) here so they dedupe against each other rather than
-     * alternating.
-     *
-     * Unlike iOS this needs no forced re-announcement after a text swap: on
-     * this platform `setText` DROPS the selection rather than clamping it
-     * through, so the swap always produces a genuine range change for the
-     * dedupe to notice.
-     */
+    /** Unlike iOS, no forced re-announcement after a text swap: `setText` drops the selection here. */
     private fun emitSelectionChange() {
         val length = textView.text?.length ?: 0
         val rawStart = textView.selectionStart
@@ -850,10 +562,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         lastReportedStart = start
         lastReportedEnd = end
 
-        // One dispatch for both architectures, exactly as emitSelectionAction
-        // below explains. Recorded above before the dispatcher is resolved, so
-        // a report that cannot be delivered (a detached view) does not leave
-        // the dedupe claiming the previous range is still current.
+        // Recorded before dispatch, so an undeliverable report still moves the dedupe off the previous range.
         val reactContext = context as ReactContext
         val dispatcher = UIManagerHelper.getEventDispatcherForReactTag(reactContext, id) ?: return
         dispatcher.dispatchEvent(
@@ -922,10 +631,8 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         if (x < layout.getLineLeft(line) || x > layout.getLineRight(line)) return null
         val offset = layout.getOffsetForHorizontal(line, x)
         // Half-open containment, matching how LinkMovementMethod queries
-        // spans at an insertion offset: ranges never overlap — JS's
-        // resolveRunPressables drops any range starting inside one it already
-        // kept, link marks themselves do nest — so the first hit is the only
-        // hit.
+        // spans at an insertion offset: JS's resolveRunPressables keeps the
+        // ranges disjoint, so the first hit is the only hit.
         return pressables.firstOrNull { offset >= it.start && offset < it.end }
     }
 
@@ -974,18 +681,9 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
      *
      * GEOMETRY IS ANCHORED ON THE LINE, NOT THE BASELINE. The reservation is
      * ascent-shaped in `RunEmbedSpan`, but the final line extents belong to
-     * the embed-height `RunLineHeightSpan` that `RunEmbeds.applyLineHeights`
-     * sets over the same character, and its surplus branch re-centres the
-     * extra room around the baseline — so `getLineBaseline - height` can
-     * point above the line's top. The top of the placeholder's line IS the
-     * top of the reserved band, whatever the baseline did.
-     *
-     * REPORTING THE DECLARED SIZE IS ONLY HONEST BECAUSE THE RESERVATION IS
-     * IN THE SAME UNIT. The rect below echoes `widthDp`/`heightDp` back
-     * unconverted, and the box the span holds open is those same numbers
-     * through `toPixelFromDIP` — including the line height, which is why that
-     * one is decoded in DIP rather than in the SP every other line height on
-     * the wire uses.
+     * the `RunLineHeightSpan` from `RunEmbeds.applyLineHeights`, whose surplus
+     * branch can move the baseline, so `getLineBaseline - height` can point
+     * above the line's top.
      *
      * The horizontal edge takes the smaller of the two `getPrimaryHorizontal`
      * answers: in an RTL paragraph the placeholder's leading edge is its
@@ -1007,8 +705,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         val textTop = (textView.top + textView.totalPaddingTop - textView.scrollY).toFloat()
 
         for (embed in embeds) {
-            // The same guards `RunEmbeds.forEachReserved` applied when the
-            // string was built (both halves of the reservation go through it):
+            // The guards `RunEmbeds.forEachReserved` applied at build time:
             // an entry that reserved nothing must report nothing.
             if (embed.start >= length || embed.end > length) continue
             if (text[embed.start] != RunEmbeds.PLACEHOLDER) continue
@@ -1118,23 +815,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         val textTop = textView.top.toFloat() + textView.totalPaddingTop
         val firstLine = layout.getLineForOffset(start)
         val lastLine = layout.getLineForOffset(end - 1)
-        // Padding is normally painted into the blank line the projection's
-        // '\n\n' block separator leaves around the block, so it costs no
-        // height. At the EDGE of a run there is no such line, and the room
-        // comes from `RunDecorations.edgePaddingPx` instead: the measure path
-        // added it to this host's height and `commitProps` set it as the
-        // child TextView's padding, so `textTop` for a box starting at offset
-        // 0 is already `paddingTop` or more, and this view's `height` for one
-        // ending at the last character is already `paddingBottom` or more
-        // past the last line's bottom.
-        //
-        // THE CLAMPS THEREFORE NO LONGER BITE FOR A WELL-FORMED DECORATION,
-        // and they stay because that is not the only kind that can arrive: an
-        // entry from a newer JS bundle can name a padding larger than the
-        // room JS asked to reserve, and chrome painted over a neighbouring
-        // view is worse than chrome drawn a pixel short. They were a bug when
-        // they were the ONLY thing between a trailing table and a border on
-        // its own last baseline.
+        // Clamped: a newer bundle may name more padding than `edgePaddingPx` reserved, and painting over a neighbour is worse.
         val top = (textTop + layout.getLineTop(firstLine) -
             PixelUtil.toPixelFromDIP(decoration.paddingTop)).coerceAtLeast(0f)
         val bottom = (textTop + layout.getLineBottom(lastLine) +
@@ -1260,11 +941,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         pendingText = ""
         pendingAttributes = RunAttributedText.Spec.EMPTY
         pendingDecorations = RunDecorations.Spec.EMPTY
-        // The run-edge room the previous run's box asked for, which is
-        // geometry and not a prop: a recycled host that kept it would offset
-        // the next run's text by a padding that run never reserved, and the
-        // measured height it was framed at would not include. `commitProps`
-        // recomputes it from the decorations the next run brings.
+        // Geometry, not a prop: `commitProps` recomputes it for the next run.
         textView.setPadding(0, 0, 0, 0)
         // Embeds and their report ledger go together: a recycled host that
         // kept either could report the PREVIOUS run's rects against the next
@@ -1274,10 +951,6 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         lastEmbedRects.clear()
         textDirty = false
         selectionActions = defaultSelectionActions()
-        // The menu the finished action mode above was showing is gone, so
-        // these only ever describe items that no longer exist. Cleared
-        // anyway: a recycled host must not carry a mapping from the previous
-        // run's menu ids to the previous run's action identifiers.
         addedMenuItemIds.clear()
         menuItemActions.clear()
         // A fresh host has no tappable ranges; a recycled one keeping the
@@ -1285,35 +958,21 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         // into links — the pressable cousin of the stale-selection failure
         // this method exists to prevent.
         pressables = emptyList()
-        // And the screen reader's view of them, for the same reason: a
-        // virtual link node left over from the previous run would offer a
-        // TalkBack user an activation on text that is gone.
         accessibilityDirty = false
         accessibilityHelper?.setNodes(emptyList())
-        // Hand back the one-active-selection baton. The `textView.text = ""`
-        // above already dropped this host's selection, so leaving it on
-        // record as the document's selection owner would only cost the next
-        // selecting host a no-op call — but the invariant is worth keeping
-        // true rather than merely harmless.
         if (activeHost?.get() === this) {
             activeHost = null
         }
-        // Selection-report history, like `lastEmbedRects` above: it describes
-        // the previous run's offsets. A recycled host that kept it could
-        // suppress the first real report of the NEXT run's selection as a
-        // duplicate — the same stale-state failure class, one channel over.
+        // A kept dedupe could swallow the next run's first selection report.
         lastReportedStart = 0
         lastReportedEnd = 0
-        // And the exclusivity policy goes back to the default a freshly
-        // constructed host has, for the same reason `selectable` does: it is
-        // the safe value (coordinate), and the prop is re-sent by the batch
-        // that follows on every run where it matters.
         exclusiveSelection = true
     }
 
     // ---- Lifecycle & platform-bug containment -------------------------------
 
     override fun onDetachedFromWindow() {
+        accessibilityManager.removeAccessibilityStateChangeListener(accessibilityStateListener)
         // Close any live menu and uninstall the callback so a lingering
         // ActionMode cannot hold this view (and its ReactContext) after
         // unmount.
@@ -1325,12 +984,14 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
+        accessibilityManager.addAccessibilityStateChangeListener(accessibilityStateListener)
+        accessibilityDirty = true
+        commitProps()
         // Detach is not unmount. A ScrollView or FlatList with
         // `removeClippedSubviews` detaches and re-attaches the very same view
         // as it scrolls, and without this the callback uninstalled above was
         // gone for good: the run stayed selectable but permanently lost
-        // every item `selectionActions` asked for — "Copy Text" and "Copy
-        // Markdown" by default — with no error to notice.
+        // every item `selectionActions` asked for, with no error to notice.
         textView.customSelectionActionModeCallback = selectionCallback
     }
 
@@ -1373,12 +1034,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
      */
     internal data class Pressable(val start: Int, val end: Int, val id: Int)
 
-    /**
-     * One resolved menu item: the identifier reported in
-     * `onSelectionAction`, and the string drawn on the item. A data class
-     * because `setSelectionActions` compares whole lists by value to decide
-     * whether an open action mode has to be invalidated.
-     */
+    /** A data class: `setSelectionActions` compares lists by value to skip invalidating an open menu. */
     internal data class ResolvedAction(val id: String, val title: String)
 
     companion object {
@@ -1386,19 +1042,8 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         const val ACTION_COPY_MARKDOWN = "copy-markdown"
 
         /**
-         * The one host in the process that currently holds a selection, or
-         * null — the whole of the one-active-selection coordination (see
-         * `becomeActiveSelectionHost`).
-         *
-         * Weak, so an unmounted host is collected rather than pinned here
-         * with the ReactContext behind it; touched from the main thread only
-         * (selection changes and clears are both UI-thread events), so no
-         * synchronization is needed. Process-wide, which is the documented
-         * behaviour (docs/SELECTION.md, "Selections never span hosts") and
-         * also its limitation: two unrelated `<SelectableMarkdown>` trees in
-         * a split view clear each other unless one of them sets
-         * `exclusiveSelection={false}` (see `setExclusiveSelection`), which
-         * is the only opt-out and is per-host, not per-tree.
+         * Main thread only, so unsynchronized; weak, so an unmounted host is collected.
+         * Process-wide: separate trees clear each other unless one sets `exclusiveSelection={false}`.
          */
         private var activeHost: java.lang.ref.WeakReference<SelectableRunHostView>? = null
 
@@ -1433,25 +1078,10 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
                 null
             }
 
-        /**
-         * First of the distinctive high item ids ("SM" + index); the nth
-         * rendered custom item gets `ITEM_ID_BASE + n`, so the default
-         * two-item menu keeps the exact ids it always had.
-         *
-         * They can never equal the small sequential ids OEM menus and
-         * ACTION_PROCESS_TEXT items use, nor any android.R.id constant
-         * (those live in 0x0102xxxx) — and a list long enough to walk out of
-         * the 0x534Dxx band walks into 0x534Exx, which collides with neither.
-         */
+        /** "SM" + index: clear of the small OEM and ACTION_PROCESS_TEXT ids and of android.R.id's 0x0102xxxx. */
         private const val ITEM_ID_BASE = 0x53_4D_01
 
-        /**
-         * The character `src/view/selectionActions.ts` packs an item's
-         * identifier and title around: U+001F INFORMATION SEPARATOR ONE,
-         * chosen because no menu title can legitimately contain it and no
-         * identifier in this library uses it. An entry without it is a bare
-         * identifier, which is the pre-title wire format unchanged.
-         */
+        /** Must match the separator `src/view/selectionActions.ts` packs with. */
         private const val ACTION_TITLE_SEPARATOR = '\u001F'
     }
 }

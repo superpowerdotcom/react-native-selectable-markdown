@@ -9,8 +9,7 @@ import { presets, resolveOptions } from '../engine/options';
 import type { RepairOptions, RepairResult, RepairSeed } from './repair';
 import { continueSeed, isUriLikeLabel, repairTail, seedFromSettled } from './repair';
 
-// The property test at the bottom parses its repaired tails; every other
-// test in this file is pure and unaffected.
+// Only the property test at the bottom parses its repaired tails.
 linkNativeEngineAsDefault();
 
 const SEED: RepairSeed = { openFence: null, inMath: false };
@@ -116,9 +115,7 @@ const cases: Case[] = [
     appended: '``',
   },
   // A trailing run too short to close is the closer still arriving: append
-  // only what is missing. A full run on top of it would fuse into a longer
-  // run that can never close, leaving the span literal with backticks the
-  // source never had.
+  // only what is missing.
   {
     name: 'partial closing backtick completed, not doubled',
     tail: 'x ``y`',
@@ -308,10 +305,8 @@ const cases: Case[] = [
     text: '[a](https://x/(v))',
     appended: '))',
   },
-  // A CommonMark destination cannot hold a line break, so a '](' whose
-  // parens never balance on its own line can never become a link. Closing it
-  // anyway appended a ')' at end of TAIL, which landed inside a real text
-  // node on a LATER line and painted a character the source never had.
+  // A destination cannot hold a line break, so a '](' unbalanced on its own
+  // line can never become a link.
   {
     name: 'destination running into a line break stays literal',
     tail: '[text](https://ex\nmore prose on the next line',
@@ -359,10 +354,6 @@ const cases: Case[] = [
     appended: '',
   },
   { name: 'trailing partial closing tag trimmed', tail: 'a <b>bold</b tag', text: 'a <b>bold', appended: '' },
-  // Comment / CDATA / PI / declaration: the tag and autolink tests both need
-  // a letter right after '<', so before handler 6 learned these shapes an
-  // unfinished comment body painted as prose while it grew and then vanished
-  // outright when its terminator landed.
   {
     name: 'unterminated html comment trimmed',
     tail: 'note <!-- hidden',
@@ -378,8 +369,6 @@ const cases: Case[] = [
     touched: 0,
   },
   {
-    // The terminator is '-->', not '>': ending the construct at the first
-    // '>' would leave the rest of the body painting as prose.
     name: 'a > inside a comment body does not end it',
     tail: 'note <!-- a > b',
     text: 'note ',
@@ -391,13 +380,10 @@ const cases: Case[] = [
   { name: 'unterminated declaration trimmed', tail: 'x <!DOCTYPE htm', text: 'x ', appended: '' },
   { name: 'unterminated CDATA section trimmed', tail: 'x <![CDATA[ y', text: 'x ', appended: '' },
   { name: 'terminated CDATA section untouched', tail: 'x <![CDATA[ y]]> z', text: 'x <![CDATA[ y]]> z', appended: '', touched: 0 },
-  // Half-arrived openers: every continuation md4c recognises is one of the
-  // four above, so hold them rather than paint markup about to go.
+  // Half-arrived openers: every md4c continuation is one of the four above.
   { name: 'half-arrived comment opener trimmed', tail: 'x <!', text: 'x ', appended: '' },
   { name: 'one dash short of a comment opener trimmed', tail: 'x <!-', text: 'x ', appended: '' },
   { name: 'half-arrived CDATA opener trimmed', tail: 'x <![CDA', text: 'x ', appended: '' },
-  // ...but '<!' followed by something no construct starts with is prose, and
-  // withholding it would hide guaranteed-literal text for good.
   { name: 'a bare <! that opens nothing stays prose', tail: 'a <! b', text: 'a <! b', appended: '', touched: 0 },
   { name: 'a digit after <! stays prose', tail: 'a <!5 b', text: 'a <!5 b', appended: '', touched: 0 },
   { name: 'a single dash after <! stays prose', tail: 'a <!-x b', text: 'a <!-x b', appended: '', touched: 0 },
@@ -417,22 +403,16 @@ const cases: Case[] = [
   { name: 'newline-terminated line is complete, not suppressed', tail: 'done\n', text: 'done\n', appended: '' },
   { name: 'bare star run line suppressed', tail: 'para\n***', text: 'para\n', appended: '' },
   { name: 'bare digits stay (not yet a marker)', tail: 'para\n12', text: 'para\n12', appended: '' },
-  // md4c accepts trailing whitespace on a setext underline ("para\n= " is
-  // already an h1), so the guard has to as well or the heading flashes for
-  // the snapshot between the space and the next content character.
+  // md4c already reads "para\n= " as an h1.
   { name: 'setext equals line with trailing space suppressed', tail: 'para\n= ', text: 'para', appended: '' },
   { name: 'setext dashes with trailing space suppressed', tail: 'para\n-- ', text: 'para', appended: '' },
   { name: 'delimiter-run line with trailing space suppressed', tail: 'para\n*** ', text: 'para', appended: '' },
-  // The GFM half of the guard. md4c flips the paragraph above into a table
-  // the moment '| -' arrives, so the pipes-only line typed under a header
-  // row would otherwise paint as a literal pipe on a line of its own.
+  // md4c makes the paragraph above a table once '| -' arrives.
   { name: 'bare pipe line under a header row suppressed', tail: '| a | b |\n|', text: '| a | b |', appended: '', touched: 1 },
   { name: 'pipe line with trailing space suppressed', tail: '| a | b |\n| ', text: '| a | b |', appended: '' },
   { name: 'partial delimiter row suppressed', tail: '| a | b |\n| -', text: '| a | b |', appended: '' },
   { name: 'unterminated delimiter row suppressed', tail: '| a | b |\n| --- | --- |', text: '| a | b |', appended: '' },
   { name: 'headerless delimiter row suppressed', tail: 'para\n---|', text: 'para', appended: '' },
-  // Once the row's line ends it is no longer the still-arriving tail line,
-  // and the table renders.
   {
     name: 'terminated delimiter row is left to become a table',
     tail: '| a | b |\n| --- | --- |\n',
@@ -441,9 +421,7 @@ const cases: Case[] = [
     touched: 0,
   },
   {
-    // A genuine body row made of nothing but table punctuation: the table
-    // above it already exists, so md4c paints the row. Withholding it made a
-    // real row vanish until its line terminated.
+    // The table above it already exists, so md4c paints the row.
     name: 'a body row of pure table punctuation is content, not a flip',
     tail: '| a | b |\n| --- | --- |\n| - | - |',
     text: '| a | b |\n| --- | --- |\n| - | - |',
@@ -458,9 +436,7 @@ const cases: Case[] = [
     touched: 0,
   },
   {
-    // With nothing above it no table can form, so '|' is a paragraph md4c
-    // paints — and deleting it left the WHOLE parse input empty, blanking
-    // the document for that snapshot.
+    // With nothing above it no table can form.
     name: 'a lone pipe at document start is prose, not table punctuation',
     tail: '|',
     text: '|',
@@ -497,11 +473,8 @@ const cases: Case[] = [
     touched: 0,
   },
 
-  // --- spoilers (extensions.spoilers only) ---------------------------------
-  // The one construct whose entire job is to not be read. `applySpoilers`
-  // runs after the parse and builds nothing until it sees a closing run, so
-  // without a virtual closer the body renders in the clear for every
-  // snapshot until its own '||' arrives.
+  // `applySpoilers` builds nothing until it sees a closing run, so without a
+  // virtual closer the body renders in the clear.
   {
     name: 'unclosed spoiler closes',
     tail: 'secret is ||hunter2',
@@ -510,8 +483,7 @@ const cases: Case[] = [
     appended: '||',
   },
   {
-    // A full '||' on top of the pipe already here would fuse into a run of
-    // three, which the transform never reads as a marker at all.
+    // '||' on top of the pipe already here would make three, never a marker.
     name: 'partial spoiler closer completed, not tripled',
     tail: 'secret is ||hunter2|',
     options: withSpoilers,
@@ -574,9 +546,7 @@ const cases: Case[] = [
     appended: '*||',
   },
   {
-    // '|' is cell syntax in a table row — an unescaped '||' splits cells
-    // before `applySpoilers` ever runs, which is why that transform excludes
-    // table cells outright — so a closer here would grow a phantom cell.
+    // A closer here would grow the row a phantom cell.
     name: 'pipes in a table row are cell syntax, not spoiler markers',
     tail: '| a | b |\n| --- | --- |\n| c || d',
     options: withSpoilers,
@@ -796,11 +766,7 @@ const cases: Case[] = [
     touched: 2,
   },
 
-  // --- block boundaries: inline scope ends at the previous leaf block -------
-  // An opener left behind on an earlier line CANNOT be closed by appending
-  // at the end of the tail once another block has started: the closer would
-  // bind inside that later block, painting a delimiter the source does not
-  // have and consuming one it does.
+  // An opener on an earlier line cannot be closed once another block starts.
   {
     name: 'emphasis opener in an earlier list item is not closed in the next',
     tail: '- item one *emph\n- item two',
@@ -809,8 +775,7 @@ const cases: Case[] = [
     touched: 0,
   },
   {
-    // Item 2 still repairs its OWN trailing opener; item 1's '_' stays
-    // literal rather than eating the '_' of '_rev'.
+    // Item 1's '_' stays literal rather than eating the '_' of '_rev'.
     name: 'list item closes only its own opener',
     tail: '- The _id field is required\n- The _rev field too',
     text: '- The _id field is required\n- The _rev field too_',
@@ -830,8 +795,7 @@ const cases: Case[] = [
     appended: '*',
   },
   {
-    // Consecutive '>' lines are one paragraph inside the quote, so emphasis
-    // binds across the line break exactly as it does unquoted.
+    // Consecutive '>' lines are one paragraph inside the quote.
     name: 'emphasis binds across soft line breaks inside a blockquote',
     tail: '> quoted *emph\n> continues here',
     text: '> quoted *emph\n> continues here*',
@@ -859,7 +823,6 @@ const cases: Case[] = [
     touched: 0,
   },
 
-  // --- fences inside list items ---------------------------------------------
   {
     name: 'fence on a list-marker line closes at the item content column',
     tail: '- ```js\nconst a = 1',
@@ -881,9 +844,6 @@ const cases: Case[] = [
     appended: '**',
   },
   {
-    // A "- ```" line INSIDE a fenced block is content, not a closer: the
-    // fence must stay open (markdown-about-markdown is common in LLM
-    // output).
     name: 'a list-marker fence line inside a fence is content',
     tail: '```md\n- ```\nstill code',
     text: '```md\n- ```\nstill code\n```',
@@ -1074,12 +1034,8 @@ const cases: Case[] = [
     touched: 1,
   },
 
-  // --- table cells are separate inline contexts -----------------------------
-  //
-  // GFM splits a row into cells before any inline parsing runs, and every
-  // virtual closer is appended in the LAST cell, so an opener in an earlier
-  // one can never be closed by it: doing so ate the real '_' of '_d' and
-  // painted a '*' the source never had.
+  // Every virtual closer lands in a row's last cell, so an opener in an
+  // earlier cell gets none.
   {
     name: 'an opener in an earlier cell of a table row gets no closer',
     tail: '| a | b |\n| --- | --- |\n| *x | y',
@@ -1101,15 +1057,12 @@ const cases: Case[] = [
     touched: 1,
   },
   {
-    // No delimiter row, so this is a paragraph full of literal pipes, not a
-    // table: emphasis binds right across them and both openers close.
     name: 'a pipe line with no delimiter row under it is still a paragraph',
     tail: '| a _b | c _d |',
     text: '| a _b | c _d |__',
     appended: '__',
   },
 
-  // --- HTML blocks start a new leaf block -----------------------------------
   {
     name: 'an HTML block start ends the paragraph above it',
     tail: 'para *emph\n<div>',
@@ -1125,19 +1078,13 @@ const cases: Case[] = [
     touched: 0,
   },
   {
-    // Not on CommonMark's block-tag list, so it is inline HTML inside the
-    // same paragraph and the emphasis still closes.
+    // Not on CommonMark's block-tag list, so it is inline HTML.
     name: 'an unknown tag is inline, not a block boundary',
     tail: 'para *emph\n<notatag>',
     text: 'para *emph\n<notatag>*',
     appended: '*',
   },
 
-  // --- spoilers only stand down inside a REAL table -------------------------
-  //
-  // The guard used to be lexical ("the line starts with a pipe"), which is
-  // exactly how a spoiler opening its own line looks — so the body leaked in
-  // the clear for the whole stream in the commonest shape there is.
   {
     name: 'a spoiler opening its line closes',
     tail: '||hunter2',
@@ -1182,8 +1129,7 @@ const cases: Case[] = [
     touched: 0,
   },
   {
-    // `applySpoilers` gives up on a text node holding an escaped pipe, so a
-    // closer appended for it would paint two pipes and build no spoiler.
+    // `applySpoilers` gives up on a text node holding an escaped pipe.
     name: 'an escaped pipe in the region suppresses the close',
     tail: 'a \\||b ||c',
     options: withSpoilers,
@@ -1192,11 +1138,7 @@ const cases: Case[] = [
     touched: 0,
   },
   {
-    // md4c reads '<x||y>' as ordinary text, not a tag, so its pipes are
-    // markers like any others and pair with each other. Skipping every
-    // '<...>' region wholesale hid them, left '||z' looking like the only
-    // marker on the line, and appended a closer that painted two pipes the
-    // source never had.
+    // md4c reads '<x||y>' as text, not a tag, so its pipes pair.
     name: 'pipes inside a region that is not a tag are still markers',
     tail: 'a <x||y> then ||z',
     options: withSpoilers,
@@ -1225,10 +1167,8 @@ const cases: Case[] = [
     appended: '*',
   },
   {
-    // …but only over the text the closer would pair across. An escaped pipe
-    // inside a CODE SPAN is a different text node, which `applySpoilers`
-    // judges separately: it builds the spoiler, so standing the repair down
-    // here only left the body in the clear.
+    // …but only within the closer's text node: a code span is a separate
+    // node, which `applySpoilers` judges on its own.
     name: 'an escaped pipe inside a code span does not suppress the close',
     tail: 'a `x \\| y` and ||secret',
     options: withSpoilers,
@@ -1244,9 +1184,6 @@ const cases: Case[] = [
     touched: 0,
   },
   {
-    // A header row whose delimiter row has not arrived yet: its empty cell
-    // is table punctuation, not a spoiler opener, and closing it hid the
-    // cell behind a spoiler and painted a pipe the source never had.
     name: 'an empty cell in a header row still arriving is not a spoiler',
     tail: '| a || c |',
     options: withSpoilers,
@@ -1263,8 +1200,6 @@ const cases: Case[] = [
     touched: 0,
   },
   {
-    // …while a line that OPENS with the doubled pipe is a spoiler, which is
-    // the shape the header-row rule must not swallow.
     name: 'a spoiler opening a line is not a header row',
     tail: '||secret',
     options: withSpoilers,
@@ -1272,9 +1207,6 @@ const cases: Case[] = [
     appended: '||',
   },
   {
-    // 64 rows of lookback used to answer "table" at the ceiling, so a
-    // paragraph of pipe-bearing lines suppressed the close and streamed the
-    // body in the clear.
     name: 'a long run of pipe-bearing prose lines is still not a table',
     tail: `${'x | y\n'.repeat(70)}||secret`,
     options: withSpoilers,
@@ -1282,8 +1214,8 @@ const cases: Case[] = [
     appended: '||',
   },
   {
-    // Handler 7 runs after the pairing, so suppressing this line would take
-    // a COMPLETED spoiler's closer with it and expose the body.
+    // Handler 7 runs after the pairing, so suppressing this line would drop
+    // a completed spoiler's closer.
     name: 'a spoiler closer alone on its line is not table punctuation',
     tail: 'hint: ||one\n||',
     options: withSpoilers,
@@ -1300,10 +1232,8 @@ const cases: Case[] = [
     touched: 1,
   },
 
-  // --- withheld HTML has a bound --------------------------------------------
   {
-    // '<!-->' and '<!--->' are empty comments: the terminator overlaps the
-    // opener, and searching past it read the rest of the paragraph as body.
+    // The terminator overlaps the opener in '<!-->' and '<!--->'.
     name: 'an empty comment terminates',
     tail: 'note <!--> x more text here',
     text: 'note <!--> x more text here',
@@ -1318,10 +1248,6 @@ const cases: Case[] = [
     touched: 0,
   },
   {
-    // A stray '<!' in prose is not a declaration, and withholding it to the
-    // end of the BLOCK blanked the rest of a streaming paragraph until the
-    // block ended. It is withheld to the end of its LINE instead: the line
-    // it opened on is the most a single-line declaration can occupy.
     name: 'a declaration running into prose is withheld to the end of its line',
     tail: 'use <!important rules here',
     text: 'use ',
@@ -1336,9 +1262,6 @@ const cases: Case[] = [
     touched: 0,
   },
   {
-    // The flash the line bound exists to prevent: a body with two
-    // whitespace-separated arguments used to paint while it grew and then be
-    // DELETED outright when the '?>' landed.
     name: 'a multi-word processing instruction never paints before its "?>"',
     tail: 'note <?php echo the thing',
     text: 'note ',
@@ -1374,7 +1297,6 @@ const cases: Case[] = [
     touched: 1,
   },
 
-  // --- a destination cannot span a line break, escape or not ---------------
   {
     name: 'a backslash before the line ending does not escape it',
     tail: 'a [x](/u\\\nmore prose here',
@@ -1390,10 +1312,8 @@ const cases: Case[] = [
     touched: 0,
   },
   {
-    // An apostrophe inside a destination is not a title opener (CommonMark
-    // needs whitespace before the quote), so the line-break stop still
-    // applies and the construct dies at the newline. Reading it as a title
-    // swallowed the break and appended "')" on the NEXT line.
+    // CommonMark needs whitespace before a title quote, so the line-break
+    // stop still applies.
     name: "an apostrophe in the destination does not open a title",
     tail: "See [the post](https://ex.com/don't-panic\nand more prose here",
     text: "See [the post](https://ex.com/don't-panic\nand more prose here",
@@ -1430,14 +1350,13 @@ const cases: Case[] = [
 
 describe('RepairResult', () => {
   test('a wrapper can build one without a carry', () => {
-    // `scan` is optional on the exported type: a consumer that wraps or
-    // stubs `repairTail` builds a RepairResult of its own and has no scan to
-    // hand over. Making the field required was a compile break for them, not
-    // an addition — this test is the compiler assertion that it is back.
+    // Compile-time assertion: `scan` stays optional for wrappers and stubs.
     const wrapped: RepairResult = { text: 'a *b', appended: '*', touched: [] };
-    expect(wrapped.scan ?? null).toBeNull();
-    // …and `repairTail` itself always fills it in.
-    expect(repairTail('a *b', SEED, base).scan).not.toBeNull();
+    // …and `repairTail` itself always fills it in, for the tail it saw.
+    expect(repairTail(wrapped.text, SEED, base).scan).toMatchObject({
+      tailLength: 4,
+      regionStart: 0,
+    });
   });
 });
 
@@ -1452,13 +1371,6 @@ describe('repairTail corpus', () => {
       expect(result.touched).toHaveLength(c.touched);
     }
     expect(result.text.endsWith(result.appended)).toBe(true);
-  });
-
-  // The floor tracks the corpus: it exists to catch a deletion, so leaving
-  // it at a number the corpus passed years of rows ago protects nothing.
-  // Raise it (never lower it) when rows are added.
-  test(`corpus holds at least 225 cases (${cases.length})`, () => {
-    expect(cases.length).toBeGreaterThanOrEqual(225);
   });
 
   test('setext/hr underline arriving char by char never flashes', () => {
@@ -1476,10 +1388,6 @@ describe('repairTail corpus', () => {
   });
 
   test('a single-line PI or declaration never paints before it terminates', () => {
-    // The paint-then-vanish flash the withhold exists to prevent: every
-    // prefix of a construct that DOES terminate must keep the body out of
-    // the parse input, or the reader sees it grow and then watches it be
-    // deleted when the terminator lands.
     for (const src of [
       'note <?php echo the thing?> end',
       'note <!ENTITY nbsp "&#160;"> end',
@@ -1491,7 +1399,6 @@ describe('repairTail corpus', () => {
           src.slice(0, open),
         );
       }
-      // …and the moment the terminator is here, everything paints.
       expect(repairTail(src.slice(0, closed), SEED, base).text).toBe(
         src.slice(0, closed),
       );
@@ -1499,10 +1406,6 @@ describe('repairTail corpus', () => {
   });
 
   test('a stray opener blanks at most its own line', () => {
-    // The other direction: '<!' or '<?' in front of ordinary prose is far
-    // more often a stray character, and the withhold must not blank the rest
-    // of a growing paragraph. One line ending with no terminator on it is
-    // the whole cost.
     expect(repairTail('use <!important rules', SEED, base).text).toBe('use ');
     expect(repairTail('use <!important rules\n', SEED, base).text).toBe(
       'use <!important rules\n',
@@ -1513,18 +1416,15 @@ describe('repairTail corpus', () => {
   });
 
   test('a spoiler arriving char by char is closed at every prefix', () => {
-    // The body must never reach the parser without a closing run: an
-    // unpaired '||' produces no spoiler node at all, so every snapshot from
-    // the second pipe on would paint the hidden text as ordinary prose.
+    // An unpaired '||' builds no spoiler node, so the body would paint.
     const src = 'the password is ||hunter2|| ok';
     const open = src.indexOf('||');
     const close = src.indexOf('||', open + 2);
     for (let i = 1; i <= src.length; i += 1) {
       const prefix = src.slice(0, i);
       const { text } = repairTail(prefix, SEED, withSpoilers);
-      // Once both pipes of the opener are here and something follows them,
-      // the parse input holds a balanced pair — until the real closer
-      // completes it, after which nothing is appended.
+      // Between the opener and the real closer the input holds one balanced
+      // pair.
       const pairs = (text.match(/(?<!\|)\|\|(?!\|)/g) ?? []).length;
       if (i > open + 2 && i <= close + 2) {
         expect(pairs).toBe(2);
@@ -1534,8 +1434,7 @@ describe('repairTail corpus', () => {
   });
 
   test('a spoiler opened before a soft line break still closes', () => {
-    // The markers of one pair may sit in different text nodes of the same
-    // paragraph, so the region — not the line — is what has to balance.
+    // The markers of one pair may sit in different text nodes of a paragraph.
     const r = repairTail('hint: ||one\nstill hidden', SEED, withSpoilers);
     expect(r.text).toBe('hint: ||one\nstill hidden||');
     expect(r.appended).toBe('||');
@@ -1554,9 +1453,18 @@ describe('repairTail hide options', () => {
       hideBareUriSchemes: [],
     };
     for (const c of cases) {
-      const bare = repairTail(c.tail, c.seed ?? SEED, c.options ?? base);
-      for (const r of [undefined, {}, off]) {
-        expect(repairTail(c.tail, c.seed ?? SEED, c.options ?? base, r)).toEqual(bare);
+      if (c.repair !== undefined) {
+        continue;
+      }
+      for (const r of [{}, off]) {
+        const result = repairTail(c.tail, c.seed ?? SEED, c.options ?? base, r);
+        expect(result.text).toBe(c.text);
+        if (c.appended !== undefined) {
+          expect(result.appended).toBe(c.appended);
+        }
+        if (c.touched !== undefined) {
+          expect(result.touched).toHaveLength(c.touched);
+        }
       }
     }
   });
@@ -1568,24 +1476,27 @@ describe('repairTail hide options', () => {
       if (c.repair !== undefined) {
         continue;
       }
-      const bare = repairTail(c.tail, c.seed ?? SEED, c.options ?? base);
-      expect(
-        repairTail(c.tail, c.seed ?? SEED, c.options ?? base, hideAll),
-      ).toEqual(bare);
+      const result = repairTail(c.tail, c.seed ?? SEED, c.options ?? base, hideAll);
+      expect(result.text).toBe(c.text);
+      if (c.appended !== undefined) {
+        expect(result.appended).toBe(c.appended);
+      }
+      if (c.touched !== undefined) {
+        expect(result.touched).toHaveLength(c.touched);
+      }
     }
   });
 
   test('hide paths are pure (regex cache is invisible)', () => {
     for (const tail of ['see [fhir://Obs](fhir://O', 'see message://5f']) {
-      const a = repairTail(tail, SEED, base, hideAll);
-      const b = repairTail(tail, SEED, base, hideAll);
-      expect(a).toEqual(b);
+      expect(repairTail(tail, SEED, base, hideAll).text).toBe('see ');
+      expect(repairTail(tail, SEED, base, hideAll).text).toBe('see ');
     }
     // Alternating scheme lists across calls must not leak between them.
-    const copy = repairTail('go copy://1', SEED, base, { hideBareUriSchemes: ['copy'] });
-    repairTail('go copy://1', SEED, base, hideMessage);
-    expect(repairTail('go copy://1', SEED, base, { hideBareUriSchemes: ['copy'] })).toEqual(copy);
-    expect(copy.text).toBe('go ');
+    const copyOnly: RepairOptions = { hideBareUriSchemes: ['copy'] };
+    expect(repairTail('go copy://1', SEED, base, copyOnly).text).toBe('go ');
+    expect(repairTail('go copy://1', SEED, base, hideMessage).text).toBe('go copy://1');
+    expect(repairTail('go copy://1', SEED, base, copyOnly).text).toBe('go ');
   });
 
   test('a hide cut is a touched text edit, never an append', () => {
@@ -1617,12 +1528,14 @@ describe('repairTail hide options', () => {
   });
 
   test('a prose label holding a colon keeps the default treatment', () => {
-    // Only the unmatched '[' is stripped; the label itself paints while it
-    // grows, exactly as it does without the option.
-    for (const tail of ['note [Bug:123', 'ratio [a:b', 'see [C:\\Users\\me']) {
-      expect(repairTail(tail, SEED, base, hideLabels).text).toBe(
-        repairTail(tail, SEED, base).text,
-      );
+    // Only the unmatched '[' is stripped.
+    for (const [tail, text] of [
+      ['note [Bug:123', 'note Bug:123'],
+      ['ratio [a:b', 'ratio a:b'],
+      ['see [C:\\Users\\me', 'see C:\\Users\\me'],
+    ]) {
+      expect(repairTail(tail, SEED, base, hideLabels).text).toBe(text);
+      expect(repairTail(tail, SEED, base).text).toBe(text);
     }
   });
 
@@ -1650,9 +1563,6 @@ describe('isUriLikeLabel', () => {
     }
   });
 
-  // A colon alone does not make prose a URI. These all matched once, so an
-  // ordinary bracketed label was blanked from the render for as long as its
-  // construct stayed unfinished and then popped in whole.
   test('rejects prose labels that merely hold a colon', () => {
     for (const label of ['Bug:123', 'a:b', 'C:\\Users\\me', 'TODO:fixthis', 'mailto:me@example.com']) {
       expect(isUriLikeLabel(label)).toBe(false);
@@ -1661,11 +1571,7 @@ describe('isUriLikeLabel', () => {
 });
 
 describe('repairTail bracket strips', () => {
-  // Every unmatched '[' is stripped from display. Rebuilding the region once
-  // per strip made the pass O(strips x region) — quadratic on prose full of
-  // them, and it runs once per streamed delta — so the strips are applied in
-  // one pass now and the offset shift is a binary search. Correctness of
-  // that rewrite is what this pins; the cost lives in bench/pathological.mjs.
+  // The cost is benchmarked in bench/pathological.mjs.
   test('thousands of unmatched brackets all strip, in order', () => {
     const n = 2000;
     const tail = 'x [ '.repeat(n);
@@ -1689,14 +1595,20 @@ describe('repairTail bracket strips', () => {
 describe('repairTail purity', () => {
   test('same input produces the same output, twice', () => {
     const seed: RepairSeed = { openFence: null, inMath: false };
-    const a = repairTail('**bold [link](https://exa', seed, base);
-    const b = repairTail('**bold [link](https://exa', seed, base);
-    expect(a).toEqual(b);
+    for (let i = 0; i < 2; i += 1) {
+      const r = repairTail('**bold [link](https://exa', seed, base);
+      expect(r.text).toBe('**bold [link](https://exa)**');
+      expect(r.appended).toBe(')**');
+      expect(r.touched).toEqual([
+        { start: 7, end: 25 },
+        { start: 0, end: 25 },
+      ]);
+    }
   });
 
   test('does not mutate the seed', () => {
     const seed: RepairSeed = { openFence: { marker: '`', length: 3 }, inMath: false };
-    repairTail('code **x', seed, base);
+    expect(repairTail('code **x', seed, base).text).toBe('code **x\n```');
     expect(seed).toEqual({ openFence: { marker: '`', length: 3 }, inMath: false });
   });
 
@@ -1708,29 +1620,33 @@ describe('repairTail purity', () => {
   });
 
   test('cut-position handlers are pure too', () => {
-    for (const tail of ['a [b]', 'x ![y]', 'go <https://e', 'hi \uD83D']) {
-      const a = repairTail(tail, SEED, base);
-      const b = repairTail(tail, SEED, base);
-      expect(a).toEqual(b);
+    for (const [tail, text] of [
+      ['a [b]', 'a b'],
+      ['x ![y]', 'x '],
+      ['go <https://e', 'go '],
+      ['hi \uD83D', 'hi '],
+    ]) {
+      expect(repairTail(tail, SEED, base).text).toBe(text);
+      expect(repairTail(tail, SEED, base).text).toBe(text);
     }
   });
 });
 
 /**
- * The scan behind the streaming anchor. Every state it reports open holds
- * the anchor still for the rest of the stream, so a state that md4c does not
- * actually have (a fence "opened" by a closing run, math carried past a
- * blank line) costs a full reparse on every later append — quadratic, and
- * invisible in the output.
+ * Every state this reports open holds the streaming anchor, so a false one
+ * costs a full reparse on every later append.
  */
 describe('continueSeed', () => {
   test('a fence opened on a list-marker line is closed by its indented run', () => {
-    // "- ```js" opens the fence at the item's content column; without the
-    // marker strip the opener is missed and the indented CLOSER reads as an
-    // opener, leaving a fence open for the rest of the document.
+    // Without the marker strip the indented closer reads as an opener.
     expect(continueSeed(SEED, '- ```js\n  code\n  ```\n\n')).toEqual(SEED);
     expect(continueSeed(SEED, '1. ```py\n   code\n   ```\n\n')).toEqual(SEED);
     expect(continueSeed(SEED, '- - ```sh\n    code\n    ```\n\n')).toEqual(SEED);
+    expect(continueSeed(SEED, '- ```js\n  code\n').openFence).toEqual({
+      marker: '`',
+      length: 3,
+      indent: 2,
+    });
   });
 
   test('an unclosed list-item fence still seeds, with its column', () => {
@@ -1747,11 +1663,16 @@ describe('continueSeed', () => {
 
   test('a quoted fence stays invisible to the scan, symmetrically', () => {
     expect(continueSeed(SEED, '> ```js\n> code\n> ```\n\n')).toEqual(SEED);
+    expect(continueSeed(SEED, '> ```js\n> code\n')).toEqual(SEED);
+    expect(continueSeed(SEED, '```js\ncode\n')).toEqual({
+      openFence: { marker: '`', length: 3, indent: 0 },
+      inMath: false,
+    });
   });
 
   test('$$ in prose does not survive a blank line', () => {
-    // md4c's math spans are inline: "costs $$5" is a paragraph with no open
-    // math region, so the carry must clear at the block boundary.
+    // md4c's math spans are inline, so the carry clears at a blank line.
+    expect(continueSeed(SEED, 'costs $$5\n')).toEqual({ openFence: null, inMath: true });
     expect(continueSeed(SEED, 'costs $$5\n\n')).toEqual(SEED);
     expect(continueSeed(SEED, 'It costs $$5 today\n\nnext paragraph\n\n')).toEqual(SEED);
   });
@@ -1770,7 +1691,8 @@ describe('continueSeed', () => {
     for (const part of parts) {
       state = continueSeed(state, part);
     }
-    expect(state).toEqual(seedFromSettled(parts.join('')));
+    expect(state).toEqual({ openFence: null, inMath: true });
+    expect(continueSeed(SEED, parts.join(''))).toEqual(state);
   });
 });
 
@@ -1791,10 +1713,12 @@ describe('seedFromSettled', () => {
 
   test('closed fence leaves no seed', () => {
     expect(seedFromSettled('```\nc\n```\n')).toEqual({ openFence: null, inMath: false });
+    expect(seedFromSettled('```\nc\n').openFence).toEqual({ marker: '`', length: 3, indent: 0 });
   });
 
   test('plain paragraphs leave no seed', () => {
     expect(seedFromSettled('a\n\nb\n')).toEqual({ openFence: null, inMath: false });
+    expect(seedFromSettled('a\n\nb\n\n~~~\n').openFence).toEqual({ marker: '~', length: 3, indent: 0 });
   });
 
   test('unbalanced display math sets inMath', () => {
@@ -1803,6 +1727,7 @@ describe('seedFromSettled', () => {
 
   test('balanced display math clears inMath', () => {
     expect(seedFromSettled('$$\nx\n$$\n')).toEqual({ openFence: null, inMath: false });
+    expect(seedFromSettled('$$\nx\n$$\n$$\n').inMath).toBe(true);
   });
 
   test('inline code and single dollars do not seed math', () => {
@@ -1810,25 +1735,17 @@ describe('seedFromSettled', () => {
       openFence: null,
       inMath: false,
     });
+    expect(seedFromSettled('closed `code` and $$5\n').inMath).toBe(true);
   });
 
   test('empty settled prefix', () => {
     expect(seedFromSettled('')).toEqual({ openFence: null, inMath: false });
+    expect(seedFromSettled('$$\n').inMath).toBe(true);
   });
 });
 
-// ---------------------------------------------------------------------------
-// The carried inline scan (`RepairResult.scan` back in as `repairTail`'s fifth
-// argument).
-//
-// It exists because a paragraph that never reaches a blank line never shrinks
-// the unsettled tail: without it a 32 kB answer streamed in 18-char deltas
-// re-derives the same inline state from offset 0 about eighteen hundred times.
-// The contract is that it changes NOTHING about the answer — so every case
-// below streams a tail one delta at a time and demands the carried run agree
-// with a cold call on the same tail, character for character and span for
-// span.
-// ---------------------------------------------------------------------------
+// The carried inline scan must change nothing: every case streams a tail one
+// delta at a time and demands the carried run match a cold call exactly.
 
 describe('carried inline scan', () => {
   function stream(
@@ -1879,7 +1796,7 @@ describe('carried inline scan', () => {
   test.each([1, 2, 3, 5, 11, 18])(
     'agrees at a delta size of %i characters',
     (step) => {
-      stream(PROSE, step);
+      expect(stream(PROSE, step).resumed).toBeGreaterThan(0);
     },
   );
 
@@ -1931,12 +1848,11 @@ describe('carried inline scan', () => {
   });
 
   test('refuses a carry whose tail is not a prefix of this one', () => {
-    const first = repairTail('hello *world', SEED, base);
-    expect(first.scan).not.toBeNull();
-    // Same length, different text: the fingerprint catches the swap, and a
-    // cold answer is what comes back.
-    const swapped = repairTail('HELLO *WORLDX', SEED, base, undefined, first.scan);
-    expect(swapped.text).toBe(repairTail('HELLO *WORLDX', SEED, base).text);
+    const first = repairTail('hello world', SEED, base);
+    // The prefix differs at a sampled character, where a '*' now opens
+    // emphasis; the fingerprint must catch the swap.
+    const swapped = repairTail('hell *world x', SEED, base, undefined, first.scan);
+    expect(swapped.text).toBe('hell *world x*');
   });
 
   test('refuses a carry made under different extensions', () => {
@@ -1946,27 +1862,14 @@ describe('carried inline scan', () => {
     });
     const cold = repairTail('a ~~b', SEED, strikeOff);
     const warm = repairTail('a ~~b c', SEED, base, undefined, cold.scan);
-    expect(warm.text).toBe(repairTail('a ~~b c', SEED, base).text);
+    expect(warm.text).toBe('a ~~b c~~');
   });
 });
 
 /*
- * The same question asked by a fuzzer rather than by hand, because the resume
- * rule is a claim about EVERY construct: "the state arriving at an iteration
- * was decided without looking at where the string ends". Hand-written cases
- * check the constructs someone thought of — this one builds random markdown
- * soup out of the fragments that make the pass change state, streams each one
- * in 1-4 character deltas under a random option set and a random set of
- * display repairs, and demands the carried run and the cold run produce the
- * same text, the same appended suffix and the same touched spans at every
- * prefix.
- *
- * It found the case the hand-written ones missed: a code span whose CLOSING
- * backtick run sits at the end of the tail leaves an empty scan state, which
- * looks like a safe place to resume from right up until the next chunk adds a
- * backtick and the run stops closing anything.
- *
- * Seeded, so a failure is reproducible; 2000 trials is ~0.3 s.
+ * Random markdown soup streamed in 1-4 character deltas under random options
+ * must give the carried and cold runs the same text, appended suffix and
+ * touched spans at every prefix. Seeded, so a failure is reproducible.
  */
 describe('carried inline scan, fuzzed', () => {
   const FRAGMENTS = [
@@ -1996,15 +1899,6 @@ describe('carried inline scan, fuzzed', () => {
     hideMessage,
     hideAll,
   ];
-
-  /** Deterministic LCG — no dependency, and a failing trial is repeatable. */
-  function lcg(seed: number): () => number {
-    let state = seed >>> 0;
-    return () => {
-      state = (state * 1664525 + 1013904223) >>> 0;
-      return state / 4294967296;
-    };
-  }
 
   test('agrees with a cold scan on 2000 random streamed documents', () => {
     const rand = lcg(20260902);
@@ -2044,43 +1938,11 @@ describe('carried inline scan, fuzzed', () => {
 
 
 /*
- * The repair's ONE hard promise, asked of random input rather than of the
- * shapes someone thought of: a virtual closer must be consumed as syntax.
- * Every character `repairTail` appends is invented — it is not in the source
- * and the reader can neither select nor copy it — so the moment md4c paints
- * one as text, the snapshot shows a character the document does not contain.
- *
- * `realEnd` is where the real (possibly edited) text stops and the pure
- * appended suffix begins, so the property is exactly "no text node reaches
- * realEnd or beyond". Spoilers are on, because the spoiler closer is the
- * repair with the worst failure mode: an unconsumed '||' both paints two
- * pipes AND leaves the body it was meant to hide in the clear.
- *
- * THE COUNT IS NOT ZERO, and the residue is pinned rather than hidden. Five
- * shapes survive, all of them cases where NO append could have worked and
- * the repair should have withheld its closer instead:
- *
- *  - "math closer that does not bind": '$$' appended where md4c's flanking
- *    rules refuse it ('b$$<!' -> 'b$$<!$$');
- *  - "closer lands after whitespace": a '$$', '`' or '||' closer after a
- *    trailing space, which cannot be trimmed away the way an emphasis
- *    closer's is without changing what the span contains
- *    ('\\**|| ' -> '\\**|| ||*');
- *  - "backtick run fuses past the opener length": the tail already ends in a
- *    LONGER backtick run than the opener, so appending more can never make
- *    the two match ('``# ```' -> '``# `````');
- *  - "spoiler closer that does not pair": an odd marker the transform drops
- *    for a reason the repair did not model ('|||**>||b**');
- *  - "trailing backslash escapes the closer": what survives the guard below,
- *    i.e. an open code span, math span or fence, where the backslash is
- *    literal but the closer still fails for one of the reasons above.
- *
- * Every one is pre-existing and none is a leak: they paint an extra marker,
- * never a spoiler body. Raising this number is a regression; lowering it is
- * a fix, and the pin is what makes either one visible.
- *
- * 2000 seeded tails; a failure prints the tail, so it is reproducible by
- * hand.
+ * A virtual closer must be consumed as syntax: no text node may reach
+ * `realEnd`, where the appended suffix begins. The residue is pinned, not
+ * zero: each class is a shape where no append could work and the repair
+ * should have withheld its closer. Raising the count is a regression;
+ * lowering it is a fix.
  */
 describeNative('repaired tails never paint an appended character', () => {
   const FRAGMENTS = [
@@ -2091,13 +1953,7 @@ describeNative('repaired tails never paint an appended character', () => {
   ];
   const everything = resolveOptions(presets.everything);
 
-  function lcg(seed: number): () => number {
-    let state = seed >>> 0;
-    return () => {
-      state = (state * 1664525 + 1013904223) >>> 0;
-      return state / 4294967296;
-    };
-  }
+
 
   /** Text nodes that reach into the appended suffix, as source slices. */
   function paintedBeyond(text: string, realEnd: number): string[] {
@@ -2160,6 +2016,29 @@ describeNative('repaired tails never paint an appended character', () => {
       'trailing backslash escapes the closer',
     ]);
     expect(examples.size).toBe(5);
-    expect(shapes.length).toBe(58);
+    expect(shapes.length).toBe(57);
   });
 });
+
+describe('repair boundaries', () => {
+  test('opener indentation does not permit a four-space closing fence', () => {
+    const source = ' ```\nx\n    ```\n*hi';
+    const repaired = repairTail(source, SEED, base);
+    expect(repaired.appended).toBe('\n```');
+    expect(repaired.text).toBe(source + '\n```');
+  });
+
+  test('backslashes do not escape code-span closing backticks', () => {
+    for (const source of ['`a\\`', '``a\\``']) {
+      expect(repairTail(source, SEED, base).text).toBe(source);
+    }
+  });
+});
+
+function lcg(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+}

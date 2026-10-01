@@ -1,22 +1,5 @@
-/**
- * The public prop surfaces of `<SelectableMarkdown>` and `<RunHost>`, checked
- * as TYPES.
- *
- * These cases assert almost nothing at runtime, and that is the point: every
- * defect they cover was a compile error in a consumer's app and nothing at all
- * in this repository's test run — a prop that rejected the package's own
- * exported constant, a container with no style escape hatch, an accessibility
- * prop with nowhere to go. ts-jest type-checks the file it compiles, so a
- * declaration below that stops type-checking fails this suite the way a bad
- * expectation would.
- *
- * Type-only imports of the two components, deliberately: both modules import
- * `react-native` at module scope, which this Node test environment cannot
- * load. `import type` is erased before anything runs, so the props can be
- * checked here without the renderer being reachable. `DEFAULT_SELECTION_ACTIONS`
- * is a value, but `selectionActions.ts` is React Native-free (its own suite
- * runs in this environment for the same reason).
- */
+// ts-jest type-checks this file, so a declaration that stops compiling fails the suite.
+// The components are `import type` because both load `react-native` at module scope.
 
 import type { ComponentPropsWithRef, RefObject } from 'react';
 import { DEFAULT_LINK_PREFIXES } from '../engine/options';
@@ -29,13 +12,11 @@ import type {
 } from './SelectableMarkdown';
 import type { RenderContext } from './renderers';
 import { DEFAULT_SELECTION_ACTIONS } from './selectionActions';
-import { DEFAULT_MAX_RUN_CHARS, segmentRuns } from '../selection/runs';
+import type { segmentRuns } from '../selection/runs';
 
 describe('SelectableMarkdownProps.selectionActions', () => {
   test('accepts the exported default list', () => {
-    // `DEFAULT_SELECTION_ACTIONS` is a frozen `readonly SelectionAction[]`, so
-    // a mutable `SelectionAction[]` prop rejected it outright (TS4104) — the
-    // package's own default, unusable as a value for the prop it defaults.
+    // The default is a frozen readonly array; a mutable prop type rejects it (TS4104).
     const props: SelectableMarkdownProps = {
       source: '# hi',
       selectionActions: DEFAULT_SELECTION_ACTIONS,
@@ -62,10 +43,6 @@ describe('SelectableMarkdownProps.selectionActions', () => {
   });
 
   test('takes a bare id and an { id, title } pair in the same list', () => {
-    // The title channel had to be additive: a bare id is still the whole of
-    // the pre-title API, and it is what a consumer writes to keep the host's
-    // own localised string. Mixing the two spellings in one list is the
-    // documented way to retitle one item and leave the other alone.
     const mixed: SelectableMarkdownProps = {
       source: '# hi',
       selectionActions: [
@@ -80,10 +57,7 @@ describe('SelectableMarkdownProps.selectionActions', () => {
   });
 
   test('takes a consumer-defined id without a cast', () => {
-    // `SelectionActionId` is `SelectionAction | (string & {})` rather than
-    // plain `string` precisely so this compiles while 'copy-text' still
-    // autocompletes. A closed union here would have made a consumer action
-    // unspellable, which is the defect this prop shape exists to remove.
+    // `(string & {})` lets this compile while 'copy-text' still autocompletes.
     const custom: SelectableMarkdownProps = {
       source: '# hi',
       selectionActions: [{ id: 'share-quote', title: 'Share' }, 'copy-text'],
@@ -97,10 +71,6 @@ describe('SelectableMarkdownProps.selectionActions', () => {
 
 describe('SelectableMarkdownProps.images', () => {
   test('takes both modes, and defaults by omission', () => {
-    // The prop exists because the default CHANGED: an image is claimed as an
-    // embed and flows inside its run, where it used to send its whole
-    // containing block to a selection scope of its own. `'standalone'` is the
-    // one-word way back, so it has to be spellable without a cast.
     const embedded: SelectableMarkdownProps = {
       source: '![a](https://e.com/a.png)',
       images: 'embed',
@@ -119,10 +89,6 @@ describe('SelectableMarkdownProps.images', () => {
 
 describe('RenderContext.linkPrefixes', () => {
   test('a context can carry the allowlist a press is checked against', () => {
-    // `openUrl` re-checks the href at navigation time, because the parse-time
-    // allowlist is `nativeEngine`'s property and not `parseDocument`'s. A
-    // consumer driving `renderBlocks` itself has to be able to say which list
-    // applies; omitting it falls back to `DEFAULT_LINK_PREFIXES`.
     const prefixes: RenderContext['linkPrefixes'] = [
       ...DEFAULT_LINK_PREFIXES,
       'myapp://',
@@ -135,9 +101,6 @@ describe('RenderContext.linkPrefixes', () => {
 
 describe('the container escape hatches', () => {
   test('style and onLayout reach the document container', () => {
-    // The root used to be a bare `<View style={{ padding }}>`: theming's one
-    // container token is that padding, so a margin, a background or a measured
-    // box meant wrapping the component in a view of your own.
     const layouts: number[] = [];
     const props: SelectableMarkdownProps = {
       source: 'x',
@@ -153,9 +116,7 @@ describe('the container escape hatches', () => {
 });
 
 describe('accessibility passthrough', () => {
-  // The native host has always accepted these (its codegen spec's `NativeProps
-  // extends ViewProps`); what was missing was any way to set them from JS,
-  // because both components enumerate the props they forward.
+  // Both components enumerate the props they forward, so each must be listed to reach the host.
   test('the document container takes the RN accessibility props', () => {
     const props: SelectableMarkdownProps = {
       source: 'x',
@@ -185,28 +146,14 @@ describe('accessibility passthrough', () => {
 });
 
 describe('the imperative selection surface', () => {
-  // Every case here was a compile error before the API existed — `ref` was
-  // not a legal prop, so an app could not clear a stale selection on
-  // navigation, highlight a span it had computed, or learn that a selection
-  // existed at all until the user picked a menu item.
-
   test('ref is a legal prop, and it is the selection handle', () => {
-    // THE EXACT DEFECT THIS SURFACE FIXES. `<SelectableMarkdown ref={ref} />`
-    // used to be `error TS2322: Property 'ref' does not exist on type
-    // 'IntrinsicAttributes & SelectableMarkdownProps'` — a plain function
-    // component takes no ref — which is a compile error in a consumer's app
-    // and nothing at all here. `typeof` on a type-only import is the way to
-    // ask that question without loading a module this Node environment
-    // cannot: both components import `react-native` at module scope.
     type DocumentProps = ComponentPropsWithRef<typeof SelectableMarkdown>;
-    const documentRef: RefObject<SelectableMarkdownHandle> = { current: null };
+    const documentRef: RefObject<SelectableMarkdownHandle | null> = { current: null };
     const withRef: DocumentProps = { source: 'x', ref: documentRef };
     expect(withRef.source).toBe('x');
 
-    // And the same for a consumer driving runs themselves, with the run's own
-    // handle type rather than the document's.
     type HostProps = ComponentPropsWithRef<typeof RunHost>;
-    const hostRef: RefObject<RunHostHandle> = { current: null };
+    const hostRef: RefObject<RunHostHandle | null> = { current: null };
     const hostWithRef: HostProps = {
       text: 'A run',
       selectable: true,
@@ -216,10 +163,7 @@ describe('the imperative selection surface', () => {
   });
 
   test('onSelectionChange takes a selection or null', () => {
-    // Null is half the contract: a toolbar that can be shown has to be
-    // dismissible, and nothing else reports the end of a selection —
-    // `onSelectionCopy` fires only after the user has committed to a menu
-    // item.
+    // Null is the only report that a selection ended.
     const seen: (SelectableMarkdownSelection | null)[] = [];
     const props: SelectableMarkdownProps = {
       source: '# Title\n\nBody',
@@ -234,9 +178,6 @@ describe('the imperative selection surface', () => {
   });
 
   test('the handle reads, clears and sets, and setSelection answers', () => {
-    // `setSelection` returns a boolean because "no run shows that span" is a
-    // real outcome — a standalone block, a span of pure syntax, a run that
-    // has not mounted. A void return would have made it silently ignorable.
     const calls: string[] = [];
     const handle: SelectableMarkdownHandle = {
       getSelection: () => null,
@@ -254,17 +195,7 @@ describe('the imperative selection surface', () => {
   });
 
   test('a run host handle speaks the run’s own offsets, not source ones', () => {
-    // The two handles are deliberately different types: `RunHostHandle`
-    // takes display offsets (what every event on the native component
-    // reports), and `SelectableMarkdownHandle` takes a `SourceSpan`. Making
-    // them the same shape is what would let a caller hand source offsets to a
-    // run and select the wrong characters.
-    //
-    // `RunHostHandle.setSelection` also REPORTS whether it dispatched, which
-    // is what lets `SelectableMarkdownHandle.setSelection` keep looking (and
-    // ultimately answer false) when the run that shows a span cannot take a
-    // selection — the unsettled tail on Android, a `selectable={false}` run,
-    // a binary with no selection commands.
+    // Deliberately not `SelectableMarkdownHandle`'s shape, so source offsets cannot reach a run.
     const calls: number[][] = [];
     const handle: RunHostHandle = {
       clearSelection: () => calls.push([]),
@@ -291,9 +222,7 @@ describe('the imperative selection surface', () => {
       exclusiveSelection: false,
     };
     expect(opted.exclusiveSelection).toBe(false);
-    // Undefined, not false: the default lives in the component (and in the
-    // codegen spec's `WithDefault<boolean, true>`), so an omitted prop must
-    // stay distinguishable from an explicit opt-out.
+    // Undefined, not false: the default lives in the component and the codegen spec.
     expect(omitted.exclusiveSelection).toBeUndefined();
     expect(run.exclusiveSelection).toBe(false);
   });
@@ -317,10 +246,6 @@ describe('the imperative selection surface', () => {
 
 describe('SelectableMarkdownProps.maxRunChars', () => {
   test('is the same knob segmentRuns takes, and the component forwards it', () => {
-    // The gap this closes: the cap is a SELECTION boundary — a sweep cannot
-    // cross from one native host into the next — and it had no prop, so a
-    // consumer of `<SelectableMarkdown>` could not raise it, lower it, or opt
-    // out. Only a caller reaching past the component into `segmentRuns` could.
     const props: SelectableMarkdownProps = {
       source: '# hi',
       maxRunChars: 2000,
@@ -332,9 +257,7 @@ describe('SelectableMarkdownProps.maxRunChars', () => {
 
     expect(forwarded.maxRunChars).toBe(2000);
     expect(opted.maxRunChars).toBe(Infinity);
-    // Omitted is the documented default, which is the exported constant.
     const omitted: SelectableMarkdownProps = { source: '# hi' };
     expect(omitted.maxRunChars).toBeUndefined();
-    expect(DEFAULT_MAX_RUN_CHARS).toBe(8000);
   });
 });

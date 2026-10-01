@@ -47,6 +47,9 @@ linkNativeEngineAsDefault();
 describeNative('resolveRunPressables', () => {
   test('a plain paragraph has no pressables', () => {
     expect(resolveRunPressables(project('just prose, nothing tappable'))).toEqual([]);
+    expect(resolveRunPressables(project('just prose, [one](https://a.example) tappable'))).toEqual([
+      { start: 12, end: 15, href: 'https://a.example' },
+    ]);
   });
 
   test('an inline link yields its display range and href', () => {
@@ -83,12 +86,6 @@ describeNative('resolveRunPressables', () => {
   });
 
   test('an autolink inside link text yields ONE range, not two over the same text', () => {
-    // The case that made "links cannot nest, so the ranges never overlap"
-    // false: md4c parses this as a link whose text is an autolink, and the
-    // projection emits a link mark for each — two marks, identical range,
-    // different hrefs. Both hosts hit-test with "the first containing range",
-    // so the second was already unreachable; sending it left the documented
-    // non-overlap guarantee false for no benefit.
     const projected = project('[<https://a.example>](https://b.example)');
     const linkMarks = projected.marks.filter((m) => m.kind === 'link');
     expect(linkMarks).toHaveLength(2);
@@ -97,17 +94,11 @@ describeNative('resolveRunPressables', () => {
 
     const pressables = resolveRunPressables(projected);
     expect(pressables).toHaveLength(1);
-    // The first mark wins, which is what the hosts already resolved to.
-    expect(pressables[0].href).toBe(linkMarks[0].href);
+    // Identical ranges keep push order, innermost first.
+    expect(pressables[0].href).toBe('https://a.example');
   });
 
   test('an autolink with text beside it loses to the OUTER link, not the inner', () => {
-    // The companion to the case above, and the reason the dedupe is not
-    // "the inner one wins": the marks sort by start ascending then by end
-    // DESCENDING (mapSelection.ts, Projector.finish), so identical ranges keep
-    // their push order (innermost first) while a wider outer range sorts ahead
-    // of the autolink it contains. Add any text outside the autolink and the
-    // surviving pressable is the outer link over the whole display range.
     const projected = project('[<https://a.example> tail](https://b.example)');
     const linkMarks = projected.marks.filter((m) => m.kind === 'link');
     expect(linkMarks).toHaveLength(2);
@@ -171,6 +162,34 @@ describeNative('resolveRunPressables', () => {
     const projected = projectRun(run, doc);
     expect(projected.text).toBe('tail label');
     expect(resolveRunPressables(projected)).toEqual([]);
+
+    // The same link once its paren arrives is pressable.
+    const settledSource = 'tail [label](https://exam)';
+    const settled: ParsedDocument = {
+      source: settledSource,
+      blocks: [
+        {
+          kind: 'paragraph',
+          span: { start: 0, end: settledSource.length },
+          children: [
+            { kind: 'text', value: 'tail ', span: { start: 0, end: 5 } },
+            {
+              kind: 'link',
+              href: 'https://exam',
+              span: { start: 5, end: settledSource.length },
+              children: [
+                { kind: 'text', value: 'label', span: { start: 6, end: 11 } },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const settledRun = segmentRuns(settled, {}).find((r) => !r.standalone);
+    if (!settledRun) throw new Error('expected a prose run');
+    expect(resolveRunPressables(projectRun(settledRun, settled))).toEqual([
+      { start: 5, end: 10, href: 'https://exam' },
+    ]);
   });
 
   test("a blocked href is not pressable under the default 'text' policy", () => {
@@ -181,8 +200,15 @@ describeNative('resolveRunPressables', () => {
     // explicit is the point, because for a while this test was read as proving
     // "blocked links are never pressable" when it only ever exercised the mode
     // where the node does not survive at all.
-    const projected = project('bad [click](javascript:alert(1)) link');
-    expect(resolveRunPressables(projected)).toEqual([]);
+    const projected = project(
+      'bad [click](javascript:alert(1)) link [ok](https://ok.example)',
+    );
+    expect(
+      resolveRunPressables(projected).map((p) => [
+        projected.text.slice(p.start, p.end),
+        p.href,
+      ]),
+    ).toEqual([['ok', 'https://ok.example']]);
   });
 
   describe("blockedLinks: 'node'", () => {
@@ -211,12 +237,14 @@ describeNative('resolveRunPressables', () => {
     });
 
     test('a live link carries no blocked flag', () => {
-      const [live] = resolveRunPressables(
-        project('see [the docs](https://example.com/docs)', KEEP_BLOCKED),
+      const [live, blocked] = resolveRunPressables(
+        project('see [the docs](https://example.com/docs) [3](#src-citation-3)', KEEP_BLOCKED),
       );
       // Absent rather than `false`: the field is optional so a live pressable
       // serializes to exactly what it did before blocked ranges existed.
-      expect(live.blocked).toBeUndefined();
+      expect('blocked' in live).toBe(false);
+      expect(live.href).toBe('https://example.com/docs');
+      expect(blocked.blocked).toBe(true);
     });
 
     test('live and blocked ranges coexist, in order, each correctly flagged', () => {
@@ -258,10 +286,15 @@ describeNative('resolveRunPressables', () => {
     const projected = project(
       '# Heading with [a link](https://example.com)\n\n- item <https://example.com/two>\n- plain',
     );
-    for (const pressable of resolveRunPressables(projected)) {
+    const pressables = resolveRunPressables(projected);
+    for (const pressable of pressables) {
       expect(pressable.start).toBeGreaterThanOrEqual(0);
       expect(pressable.end).toBeGreaterThan(pressable.start);
       expect(pressable.end).toBeLessThanOrEqual(projected.text.length);
     }
+    expect(pressables.map((p) => projected.text.slice(p.start, p.end))).toEqual([
+      'a link',
+      'https://example.com/two',
+    ]);
   });
 });

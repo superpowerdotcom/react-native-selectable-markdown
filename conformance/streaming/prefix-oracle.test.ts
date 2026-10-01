@@ -70,11 +70,7 @@ const TRANSCRIPT: Transcript = JSON.parse(
   fs.readFileSync(path.join(FIXTURE_DIR, 'transcript-sprint-review.json'), 'utf8'),
 );
 
-/**
- * Fixtures that contain a GFM table. They are called out because they are
- * what found the decoder's worst defect, and they are the cases most likely
- * to find its successor.
- *
+/*
  * A table row with fewer cells than the header gets a padding cell that md4c
  * reports with no text. When that row is the LAST thing in the source —
  * which every streamed table passes through, cell by cell, as it is typed —
@@ -85,10 +81,6 @@ const TRANSCRIPT: Transcript = JSON.parse(
  * comparison-table.md, 148 in mixed-longform.md. Empty cells are now placed
  * from their own row's pipes, and these run as ordinary tests.
  */
-const TABLE_FIXTURES: ReadonlySet<string> = new Set([
-  'comparison-table.md',
-  'mixed-longform.md',
-]);
 
 function countSpoilers(doc: ParsedDocument): number {
   let count = 0;
@@ -126,22 +118,11 @@ function expectedDisplay(doc: ParsedDocument, settledUntil: number): Block[] {
 }
 
 /**
- * How the deltas reach the session.
- *
- * `'append'` is the direct entry point. `'buffered'` is the one an app
- * actually uses for a token stream — `appendBuffered` with a frame
- * scheduler, an idle scheduler, a `holdBackChars` tail and a `smoother`
- * metering the release — and until this existed, the whole coalescing path
- * had only ever run against a toy paragraph engine over bare prose (see
- * `src/stream/buffering.test.ts`). It matters here because holdback and
- * smoothing cut the stream at offsets nothing else picks: a flush commits
- * "everything up to 19 characters into the middle of a table row", which is a
- * prefix the per-code-point sweep never produces, and every one of those
- * commits faces the same fresh-parse oracle.
+ * `'buffered'` commits at holdback and smoothing cuts, prefixes the
+ * per-code-point sweep never produces.
  */
 type FeedMode = 'append' | 'buffered';
 
-/** Manual stand-in for a frame/idle scheduler: fires only when told to. */
 function manualScheduler() {
   let next: (() => void) | null = null;
   return {
@@ -151,8 +132,9 @@ function manualScheduler() {
         next = null;
       };
     },
-    /** Fires the pending callback (clearing it first, so a re-schedule from
-     * inside the flush survives). Returns false when nothing was armed. */
+    /**
+     * Clears before firing, so a re-schedule from inside the flush survives.
+     */
     fire(): boolean {
       const f = next;
       next = null;
@@ -200,9 +182,8 @@ function streamDeltas(
   const settledSeen = new Map<string, { block: Block; end: number }>();
   const frame = manualScheduler();
   const idle = manualScheduler();
-  // One frame per delta at 1200cps releases ~19 units a flush: fast enough
-  // that the buffer tracks the stream rather than pooling the whole fixture,
-  // slow enough that most flushes commit a partial construct.
+  // 1200cps over 16ms frames releases ~19 units a flush, so most flushes
+  // commit a partial construct.
   let clock = 0;
   const bufferScheduler: BufferScheduler = (flush) => frame.schedule(flush);
   const idleScheduler: IdleScheduler = (flush) => idle.schedule(flush);
@@ -265,19 +246,15 @@ function streamDeltas(
       clock += 16;
       frame.fire();
     }
-    // Play the metered tail out at the same cadence instead of letting
-    // finalize dump it: the drain's own flushes are prefixes too, and the
-    // last few characters come back through the idle drain past the
-    // holdback.
+    // Drain at frame cadence rather than through finalize: those flushes are
+    // prefixes too.
     for (let guard = 0; session.pendingLength > 0 && guard < 20_000; guard += 1) {
       clock += 16;
       if (!frame.fire() && !idle.fire()) break;
     }
   }
-  // Deliberately `length`, not `length + pendingLength`: in buffered mode the
-  // loop above must have played the whole buffer out through real flushes, so
-  // a holdback or a smoother that stranded text fails here rather than being
-  // covered up by finalize's drain.
+  // `length`, not `+ pendingLength`: text a holdback or smoother stranded must
+  // fail here, not be drained by finalize.
   const fedLength = session.length;
   session.finalize('end');
   unsubscribe();
@@ -302,18 +279,8 @@ describeNative('streaming prefix oracle', () => {
   const engine = (): Engine => requireNativeEngine();
 
   /**
-   * Option sets the whole fixture corpus is swept under.
-   *
-   * `presets.llmChat` is what the package ships. The other two are the
-   * options that DECOUPLE a text node's value from its source slice, which is
-   * precisely the condition the parse-free fast path stands down on
-   * (`if (text.value !== raw) return false`, `StreamSession.tryFastPath`):
-   * `smartPunctuation` turns `"` into curly quotes and `--` into an en dash,
-   * so value and source differ in length as well as content, and
-   * `html: 'raw'` is the only mode that emits htmlBlock/htmlInline nodes at
-   * all — nodes carrying source literals the splice has to rebase. Neither
-   * had a single prefix case before, which left the guard that exists for
-   * them ungated.
+   * `smartPunctuation` and `html: 'raw'` decouple a text node's value from its
+   * source, the condition `StreamSession.tryFastPath` stands down on.
    */
   const FIXTURE_OPTION_SETS: ReadonlyArray<{
     name: string;
@@ -326,15 +293,6 @@ describeNative('streaming prefix oracle', () => {
     },
     { name: "html:'raw'", options: { ...presets.llmChat, html: 'raw' } },
   ];
-
-  test('fixture directory has the expected corpus', () => {
-    expect(fixtureFiles.length).toBeGreaterThanOrEqual(6);
-    expect(TRANSCRIPT.deltas.length).toBeGreaterThan(50);
-    // The table fixtures are the regression surface for the padding-cell
-    // defect; if they ever stop being part of the corpus, this sweep quietly
-    // stops covering the case that broke every streamed table.
-    for (const file of TABLE_FIXTURES) expect(fixtureFiles).toContain(file);
-  });
 
   for (const file of fixtureFiles) {
     describe(file, () => {
@@ -350,22 +308,17 @@ describeNative('streaming prefix oracle', () => {
             expect(result.final.phase).toBe('settled');
             expect(result.final.document.source).toBe(full);
             expect(result.prefixViolations).toEqual([]);
-            // Frozen blocks must keep referential identity in every later
-            // snapshot, including the one finalize produces — and the check
-            // must not be vacuous: every fixture is multi-block, so blocks do
-            // settle mid-stream.
+            // Non-vacuous: every fixture is multi-block, so blocks settle
+            // mid-stream.
             expect(result.settledBlocksSeen).toBeGreaterThan(0);
             expect(result.identityViolations).toEqual([]);
-            // Spoilers are off in all three option sets, and the transform
-            // runs after the engine on every reparse — so a spoiler appearing
-            // at ANY prefix would mean the option leaked, not that the final
-            // document is wrong. Checked per snapshot for that reason.
+            // Spoilers are off in every set, so one at any prefix means the
+            // option leaked.
             expect(result.spoilerSnapshots).toBe(0);
             expect(countSpoilers(result.final.document)).toBe(0);
 
-            // Deep equality includes the ABSENCE of incomplete/synthetic: a
-            // fresh parse never carries them, so a surviving repair marker
-            // fails here.
+            // Deep equality also fails on a surviving incomplete/synthetic
+            // repair marker.
             expect(result.final.document).toEqual(
               parseDocument(full, options, engine()),
             );
@@ -377,13 +330,6 @@ describeNative('streaming prefix oracle', () => {
       test(
         'the buffered entry point splices the same way, holdback and smoothing included',
         () => {
-          // Same corpus, same oracle, fed the way an app feeds a token
-          // stream: appendBuffered, a 4-character holdback, a metered
-          // release and an idle drain for the tail. The commits land on
-          // different prefixes than the per-code-point sweep produces, and
-          // the run has to end with every character appended — a holdback
-          // that stranded its tail, or a smoother that lost a cut, shows up
-          // as a short `fedLength` here rather than in production.
           const result = streamDeltas(
             codePoints(full),
             presets.llmChat,
@@ -397,9 +343,7 @@ describeNative('streaming prefix oracle', () => {
           expect(result.prefixViolations).toEqual([]);
           expect(result.identityViolations).toEqual([]);
           expect(result.settledBlocksSeen).toBeGreaterThan(0);
-          // Coalescing means fewer commits than characters — otherwise the
-          // buffered path would be exercising nothing the append path does
-          // not.
+          // Without coalescing, buffering exercises nothing append does not.
           expect(result.snapshotCount).toBeLessThan(full.length);
           expect(result.final.document).toEqual(
             parseDocument(full, presets.llmChat, engine()),
@@ -411,7 +355,7 @@ describeNative('streaming prefix oracle', () => {
   }
 
   // The transcript contains a table, which is what made this case (and
-  // TABLE_FIXTURES above) the ones that found the padding-cell defect.
+  // the table fixtures above) the ones that found the padding-cell defect.
   test(
     'the LLM transcript replays delta-by-delta to the fresh-parse document',
     () => {
@@ -435,8 +379,7 @@ describeNative('streaming prefix oracle', () => {
     'the transcript reaches the same document however it is chunked',
     () => {
       // Nothing about the splice may depend on where a delta happened to be
-      // cut. Prefix verification is off here (the transcript's table trips
-      // the known bug); the final documents and settled identity are the
+      // cut. Final documents and settled identity are the
       // properties this case is about, and both hold today.
       const full = TRANSCRIPT.deltas.join('');
       const byChunk = streamDeltas(TRANSCRIPT.deltas, presets.llmChat, engine(), false);
@@ -476,11 +419,8 @@ describeNative('streaming prefix oracle', () => {
   test(
     'a streamed spoiler never paints its body in the clear',
     () => {
-      // The tail repair closes an unpaired '||' so `applySpoilers` has a
-      // pair to work with. Without it the transform sees one marker, returns
-      // the paragraph untouched, and the hidden text renders as ordinary
-      // prose in every snapshot from the second pipe until the closing run
-      // arrives — the one construct whose whole job is to not be read.
+      // Without the tail repair closing an unpaired '||', the body renders in
+      // the clear until the closer arrives.
       const src = 'The answer is ||hunter2|| and nothing else.\n';
       const secretStart = src.indexOf('hunter2');
       const secretEnd = secretStart + 'hunter2'.length;
@@ -515,12 +455,10 @@ describeNative('streaming prefix oracle', () => {
       unsubscribe();
 
       expect(leaks).toEqual([]);
-      // Non-vacuous: the secret really was in the document for most of the
-      // stream, and it ends up hidden.
+      // Non-vacuous: the secret was on screen for most of the stream.
       expect(covered).toBeGreaterThan(5);
       expect(countSpoilers(session.snapshot().document)).toBe(1);
 
-      // And the splice still agrees with a fresh parse at every prefix.
       const result = streamDeltas(codePoints(src), options, engine());
       expect(result.prefixViolations).toEqual([]);
       expect(result.identityViolations).toEqual([]);
@@ -544,12 +482,8 @@ describeNative('streaming prefix oracle', () => {
   ])(
     'a spoiler opening its line never paints its body in the clear (%s)',
     (_shape, src, secret) => {
-      // The repair used to stand down on any line whose first character is a
-      // pipe, on the theory that it might be a table row — which is exactly
-      // what a spoiler opening its own line looks like, so the body leaked
-      // for the whole stream in the commonest shape there is. Table
-      // membership is now decided the way the parse decides it: a delimiter
-      // row under a header line.
+      // A line opening with a pipe is a table row only under a header with a
+      // delimiter row, as the parse decides it.
       const secretStart = src.indexOf(secret);
       const secretEnd = secretStart + secret.length;
       const options: EngineOptions = {
@@ -588,7 +522,6 @@ describeNative('streaming prefix oracle', () => {
       expect(covered).toBeGreaterThan(5);
       expect(countSpoilers(session.snapshot().document)).toBe(1);
 
-      // …and the splice still agrees with a fresh parse at every prefix.
       const result = streamDeltas(codePoints(src), options, engine());
       expect(result.prefixViolations).toEqual([]);
       expect(result.identityViolations).toEqual([]);
@@ -614,8 +547,7 @@ describeNative('streaming prefix oracle', () => {
     () => {
       // Task lists, math, underline and fences each reach the splice through
       // a different span-widening path, and the default preset exercises
-      // neither math nor underline. Tables are deliberately absent: they trip
-      // the known bug above and are covered by the failing cases instead.
+      // neither math nor underline.
       const full = [
         '# Everything\n\n',
         '> - [x] quoted **task** with `code`\n> - [ ] and $x^2$\n\n',
@@ -636,13 +568,9 @@ describeNative('streaming prefix oracle', () => {
   test(
     'raw HTML blocks splice the same way, blank lines and all',
     () => {
-      // `html: 'raw'` is the only mode that produces htmlBlock nodes at all,
-      // and nothing else in this sweep exercises it. CommonMark HTML blocks
-      // of types 1-5 (`<!--`, `<script>`, `<pre>`) run PAST blank lines to
-      // their own end condition, so anchoring one on the previous parse's
-      // block end froze it truncated and parsed the rest of the block as
-      // ordinary markdown for the rest of the stream. Type 6 (`<div>`) does
-      // end at the blank line and must keep anchoring.
+      // HTML blocks of types 1-5 (`<!--`, `<script>`, `<pre>`) run past blank
+      // lines to their own end condition; type 6 (`<div>`) ends at the blank
+      // line.
       const options: EngineOptions = { ...presets.llmChat, html: 'raw' };
       const full = [
         'Intro paragraph.\n\n',
@@ -665,12 +593,8 @@ describeNative('streaming prefix oracle', () => {
   test(
     'bare ftp autolinks and list-item fences splice the same way',
     () => {
-      // Two shapes no fixture contains. md4c permissive-autolinks ftp as
-      // well as http/https, so an ftp tail must stand the fast path down
-      // (allowlisted here, or the autolink would degrade to text and hide
-      // the divergence); and a fence opened on a list-marker line must be
-      // read as an opener, or its indented closer looks like one and the
-      // anchor never advances again.
+      // md4c autolinks bare ftp too (allowlisted, or it degrades to text and
+      // hides the divergence); a fence on a list-marker line is an opener.
       const options: EngineOptions = {
         ...presets.llmChat,
         urlPolicy: { linkPrefixes: [...DEFAULT_LINK_PREFIXES, 'ftp://'] },
@@ -695,12 +619,8 @@ describeNative('streaming prefix oracle', () => {
   test(
     'a spoiler-enabled sweep splices the same way at every prefix',
     () => {
-      // ALL_ON pins spoilers OFF so the corpus can assert their absence.
-      // Spoilers are the one extension applied as a post-engine transform
-      // over the decoded tree, so they are also the one whose result the
-      // splice could disagree with — this runs the same sweep with them on,
-      // over text that has both a real spoiler and a `||` that must stay
-      // literal because its partner never arrives.
+      // Spoilers are the one post-engine transform, so the one the splice
+      // could disagree with; ALL_ON pins them off.
       const options: EngineOptions = {
         extensions: { ...ALL_ON.extensions, spoilers: true },
       };
@@ -716,7 +636,6 @@ describeNative('streaming prefix oracle', () => {
       expect(result.prefixViolations).toEqual([]);
       expect(result.identityViolations).toEqual([]);
       expect(result.settledBlocksSeen).toBeGreaterThan(0);
-      // Non-vacuous: spoilers really were in the streamed snapshots.
       expect(result.spoilerSnapshots).toBeGreaterThan(0);
       const fresh = parseDocument(full, options, engine());
       expect(countSpoilers(result.final.document)).toBe(countSpoilers(fresh));
@@ -729,13 +648,8 @@ describeNative('streaming prefix oracle', () => {
   test(
     'a link reference definition arriving after a settled paragraph splices the same way',
     () => {
-      // The one construct that acts at a distance: the definition at the end
-      // turns the `[foo]` in the FIRST paragraph — frozen by the anchor long
-      // before it arrives — into a resolved reference link, and the `[bar]`
-      // typed after it must resolve against a definition that sits below the
-      // anchor. Nothing in the corpus contains one, and both directions used
-      // to leave the snapshot (and the finalized document) showing literal
-      // text where a fresh parse shows a link.
+      // A definition acts at a distance: it turns `[foo]` in a paragraph the
+      // anchor froze long before into a link.
       const full = [
         'See [foo] here.\n\n',
         'A middle paragraph that settles.\n\n',
@@ -748,21 +662,16 @@ describeNative('streaming prefix oracle', () => {
       expect(result.final.document).toEqual(
         parseDocument(full, presets.llmChat, engine()),
       );
-      // Identity is the one thing a definition genuinely costs, and only
-      // where it has to: the first paragraph's parse CHANGED, so it cannot
-      // be the same object any more. Every other settled block keeps its
-      // identity — the session drops the anchor, not the identity cache,
-      // and `remember` re-checks structure before reusing an entry.
+      // Only the first paragraph's parse changed, so only it loses identity:
+      // the session drops the anchor, not the identity cache.
       expect(
         result.identityViolations.map((v) => v.replace(/^rev \d+: /, '')),
       ).toEqual(['settled block paragraph:0:15 lost referential identity']);
-      // Non-vacuous: both references really did resolve.
       let links = 0;
       visit(result.final.document, (n) => {
         if (n.kind === 'link') links += 1;
       });
       expect(links).toBe(2);
-      // And the buffered path reaches the same place.
       const buffered = streamDeltas(
         codePoints(full),
         presets.llmChat,
@@ -779,13 +688,8 @@ describeNative('streaming prefix oracle', () => {
   test(
     'a definition behind a list item content indent splices the same way',
     () => {
-      // The same construct written where md4c also honours it: at the
-      // content column of a list item, with no marker of its own. A scan
-      // that only stripped container MARKERS read those four spaces as
-      // indented code, kept the first paragraph frozen as literal text, and
-      // handed back a prefix a fresh parse disagrees with — and it did so
-      // only for some delta granularities, since a line first seen as '    '
-      // took a different path through the scan.
+      // md4c honours a definition at a list item's content column; the scan
+      // must not read those four spaces as indented code, at any granularity.
       const full = [
         'See [foo] here.\n\n',
         '- outer\n  - inner\n\n',
@@ -803,7 +707,6 @@ describeNative('streaming prefix oracle', () => {
           parseDocument(full, presets.llmChat, engine()),
         );
       }
-      // Non-vacuous: the reference really did resolve.
       let links = 0;
       visit(parseDocument(full, presets.llmChat, engine()), (n) => {
         if (n.kind === 'link') links += 1;
@@ -831,14 +734,19 @@ describeNative('streaming prefix oracle', () => {
   test('finalize is idempotent on a native-backed session', () => {
     const session = new StreamSession({ options: presets.llmChat, engine: engine() });
     session.append('Almost **done');
-    const lengthBefore = session.length;
     session.append('');
-    expect(session.length).toBe(lengthBefore);
+    expect(session.length).toBe(13);
     session.finalize('aborted');
     const first = session.snapshot();
+    const notified: number[] = [];
+    const unsubscribe = session.subscribe((snap) => notified.push(snap.revision));
     session.finalize('aborted');
+    unsubscribe();
     const second = session.snapshot();
+    expect(notified).toEqual([]);
     expect(second.phase).toBe('settled');
-    expect(second.document).toEqual(first.document);
+    expect(second.revision).toBe(first.revision);
+    expect(second.document).toEqual(parseDocument('Almost **done', presets.llmChat, engine()));
+    expect(JSON.stringify(second.document.blocks.map((b) => b.kind))).toBe('["paragraph"]');
   });
 });

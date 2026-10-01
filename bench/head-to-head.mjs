@@ -51,15 +51,7 @@ import {
   stats,
 } from './support.mjs';
 
-// Before anything else, and before the `--only` child dispatch below, because
-// this bench is the one whose output is a LEADERBOARD: printing md4c's row
-// under a heading a stale `--engine reference` made the reader expect is the
-// exact misreading refuseEngineFlag exists to prevent. The other four benches
-// get this through resolveEngine; head-to-head resolves the engine itself
-// (loadNativeEngine directly, so an unbuildable addon is one skipped row
-// rather than the end of the run), which is how it went unrefused. Children
-// are spawned with an explicitly built argv rather than an inherited one, so
-// refusing here refuses for the whole run.
+// Before the `--only` dispatch: this bench skips resolveEngine, which refuses for the others.
 refuseEngineFlag();
 
 const replicas = numberFlag('replicas', 12);

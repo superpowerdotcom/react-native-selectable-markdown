@@ -100,14 +100,9 @@ try {
  * bindings receive them. `extensionBits` is an OR of the kExt* values,
  * mirrored in src/engine/native/protocol.ts.
  *
- * `htmlPolicy` is a reserved wire slot, not a switch: `configFromBits` reads
- * and discards it, so 0 (`kHtmlStrip`) and 1 (`kHtmlRaw`) produce
- * byte-identical buffers — md4c is always asked to parse HTML. Pass 1
- * (`HTML_PARSED`), which is what the package sends. Strip-vs-raw is decided
- * later, by `EngineOptions.html` in the decoder, and never crosses here.
+ * `htmlPolicy` is ignored (`configFromBits` discards it); the package sends 1.
  *
- * Bad argument types throw a TypeError; the count and types are checked, the
- * htmlPolicy *value* is not.
+ * Bad argument types throw a TypeError; the htmlPolicy value is not checked.
  */
 export const parse = addon.parse;
 

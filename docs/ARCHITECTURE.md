@@ -27,7 +27,7 @@ selection/         segmentRuns: adjacent flowing blocks -> selectable runs
    v
 view/              SelectableMarkdown
                    runs -> RunHost (native SelectableRunHost; required, throws where not linked)
-                   standalone blocks (image, spoiler, a classifyBlock claim) -> block renderers,
+                   standalone blocks (unclaimed image, spoiler, a classifyBlock claim) -> block renderers,
                      nesting capped at MAX_RENDER_DEPTH (64); deeper subtrees render flat text
                    per-run memoization keyed on span + settled identity
    v

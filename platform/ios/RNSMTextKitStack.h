@@ -52,7 +52,7 @@
  * UIKit views and are safe to use off the main thread as long as no single
  * instance is shared across threads. Every stack this class hands out is
  * freshly built and owned by its caller, which is what makes
- * +measureAttributedString:width:pointScaleFactor: legal on Fabric's layout
+ * +measureAttributedString:width: legal on Fabric's layout
  * thread. Nothing here reads a UIScreen, a UITraitCollection or a view — see
  * the `pointScaleFactor` parameter, which exists precisely so that this file
  * never has to.
@@ -112,15 +112,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 /**
  * Lays `string` out in a fresh stack `width` points wide and returns the size
- * it occupies, rounded up to whole device pixels.
- *
- * `pointScaleFactor` is `LayoutContext::pointScaleFactor`
- * (react/renderer/core/LayoutContext.h:26) and is a parameter rather than a
- * call to RCTScreenScale(). That function reads
- * `UIScreen.mainScreen.scale` behind a main-thread-only assertion, and this
- * method runs on Fabric's layout thread: calling it there is a debug-build
- * assertion failure and, in release, a UIKit read from the wrong thread. The
- * layout context already carries the number for exactly this reason.
+ * it occupies, unrounded; the Fabric measurer rounds to device pixels.
  *
  * A `width` that is not finite means "measure unconstrained" — Yoga passes an
  * infinite maximum width whenever the parent does not constrain it — and is
@@ -130,8 +122,7 @@ NS_ASSUME_NONNULL_BEGIN
  * mentions.
  */
 + (CGSize)measureAttributedString:(NSAttributedString *)string
-                            width:(CGFloat)width
-                 pointScaleFactor:(CGFloat)pointScaleFactor;
+                            width:(CGFloat)width;
 
 @end
 

@@ -50,8 +50,7 @@ export interface StreamSessionInit {
    * Characters withheld from the end of every scheduled flush (default 0),
    * so a half-typed construct ("**bo") sits in the pending buffer instead of
    * rendering and being repaired a frame later. Never cuts inside a visible
-   * glyph: the boundary moves down to the nearest cluster boundary (see
-   * `retreatToClusterBoundary`), so the whole cluster stays pending.
+ * glyph: the whole cluster stays pending.
    */
   holdBackChars?: number;
   /**
@@ -104,37 +103,13 @@ export interface StreamSessionInit {
 
 const CLEAN_SEED: RepairSeed = { openFence: null, inMath: false };
 
-/**
- * How many times the retry delay for a refused drain may double. Four steps
- * is 16 idle delays — 4s at the default — which is often enough to catch an
- * engine that recovers and rare enough not to be a timer storm behind one
- * that never will.
- */
+/** Four doublings: 16 idle delays, 4s at the default. */
 const MAX_DRAIN_BACKOFF_STEPS = 4;
 
-/**
- * How many refused drains the session retries before it gives up on the
- * buffered tail. Eight attempts run the ladder above out to the end and then
- * hold at its ceiling — about 20 seconds at the default idle delay — which
- * is far past any transient engine failure and well short of forever.
- *
- * The bound exists because "retry until it works" is not a terminal state.
- * An engine that throws on EVERY call (the unlinked native module
- * docs/STREAMING.md names) would otherwise throw out of a host timer
- * callback every four seconds for the life of the session, and every caller
- * parked on `drained()` — `bindRunTextEvents` awaits it at run end — would
- * wait for a drain that is never coming. See {@link StreamSession.drained}
- * for what the session does instead.
- */
+/** Bounded so an engine that always throws cannot strand `drained()`. */
 const MAX_DRAIN_RETRIES = 8;
 
-/**
- * How many times `notify` will re-run its listener pass because a listener
- * mutated the session from inside its own callback. Generous — a re-entrant
- * chain thousands of commits deep is unusual but legitimate, and used to
- * work until the stack ran out — while still bounding a listener that
- * mutates unconditionally, which would otherwise spin forever.
- */
+/** Bounds a listener that mutates the session unconditionally. */
 const MAX_NOTIFY_PASSES = 10_000;
 
 const defaultBufferScheduler: BufferScheduler = (flush) => {
@@ -169,25 +144,14 @@ const defaultIdleScheduler: IdleScheduler = (flush, ms) => {
  */
 const CONSTRUCT_CHARS = /[\n\r\\`*_~$[\]()<>#|!&\-=+.:'";]/;
 
-/**
- * Every scheme md4c's permissive autolinker recognises — its `scheme_map` is
- * {http, https, ftp} (platform/cpp/vendor/md4c/md4c.c) — kept as one list so
- * a future md4c bump is a one-line change here rather than a silent
- * divergence between the guard and the parser.
- * `src/stream/incremental.test.ts` reads that table out of the vendored C
- * source and fails if this list falls behind it.
- */
+/** md4c's `scheme_map`; `incremental.test.ts` fails if this falls behind. */
 const PERMISSIVE_AUTOLINK_SCHEMES = ['http', 'https', 'ftp'];
 
 /**
  * A trailing token that is (or is growing into) a bare autolink candidate.
- * Once a permissive scheme or "www." sits anywhere in the last
- * whitespace-delimited token of the line, even a plain letter can complete
- * or re-extend an autolink (`https://example.` + `c` pulls the trimmed `.`
- * back into the URL), so the fast path must stand down and let the engine
- * decide. Tested against the raw source's final line, not just the final
- * text node — the token may span an already-emitted autolink node plus
- * trimmed punctuation.
+ * Even a plain letter can re-extend one (`https://example.` + `c`). Tested on
+ * the raw final line, which may span an emitted autolink plus trimmed
+ * punctuation.
  */
 const URLISH_TAIL = new RegExp(
   `(?:^|[\\s*_~(])(?:(?:${PERMISSIVE_AUTOLINK_SCHEMES.join('|')}):|www\\.)\\S*$`,
@@ -195,25 +159,9 @@ const URLISH_TAIL = new RegExp(
 );
 
 /**
- * Whether the line's last whitespace-delimited token holds an '@' — the
- * EMAIL half of GFM's autolink extension, which `URLISH_TAIL` cannot see
- * because a bare email has no scheme to look for.
- *
- * The divergence it prevents: `mail foo@example.` is plain text (md4c wants
- * a dot inside the host), and the delta that turns it into an autolink is
- * the bare letter `c` — no construct character, no `https:` or `www.` token.
- * The fast path would extend the text node while a fresh parse of the same
- * source yields `mailto:foo@example.c`, and nothing corrects it until a
- * construct character or a trailing space happens along.
- *
- * Written as two native scans rather than as a regex alternative in
- * `URLISH_TAIL`: `[^\s@]+@` inside that pattern backtracks through the whole
- * token on every line that has no '@' in it, which is every line of ordinary
- * prose, and this runs per append against a line that can be kilobytes long.
- * `lastIndexOf` fails in one pass instead. Deliberately not conditioned on
- * `extensions.autolinks`: standing down when the extension is off costs one
- * parse of a tail that was going to be parsed anyway the moment the token
- * ended.
+ * The email half of GFM autolinks, which `URLISH_TAIL` cannot see:
+ * `foo@example.` + `c` becomes a link with no construct character. Two native
+ * scans, because a regex here backtracks on every '@'-free line.
  */
 function hasEmailTail(line: string): boolean {
   const at = line.lastIndexOf('@');
@@ -230,33 +178,10 @@ function hasEmailTail(line: string): boolean {
 const HTML_OPEN_TAIL = /^ {0,3}<[!/?]?$/;
 
 /**
- * Opener → end condition for the HTML block types that do NOT end at a blank
- * line (CommonMark types 1-4), transcribed from md4c's own start conditions
- * (`md_is_html_block_start_condition`, platform/cpp/vendor/md4c/md4c.c) and
- * tested in md4c's order, because that is the parser this session's blocks
- * come from and CommonMark's prose differs from it in ways that decide
- * whether a literal anchors:
- *
- * - type 1 needs no delimiter after the tag name — md4c compares the name
- *   alone, so `<pretty` opens a raw-text block that runs to `</pre>`;
- * - type 2 (`<!--`) needs at least one character AFTER the four, so the
- *   literal `<!--` on its own is type 4 and ends at the first `>`;
- * - type 4 is `<!` followed by ANY ASCII character, not just a letter (the
- *   comment above md4c's test says "uppercase letter", the code accepts all
- *   of ASCII), which is what makes `<!5`, `<!-`, `<! ` and the partial
- *   `<![CDATA` blank-line-spanning blocks that end at a `>`;
- * - type 5 (`<![CDATA[` … `]]>`) is therefore unreachable in md4c: `[` is
- *   ASCII, so type 4 claims the literal first and it ends at the first `>`.
- *   It has no row here for that reason.
- *
- * Types 6 and 7 end at a blank line, so a literal matching no row here needs
- * nothing waited for — see {@link htmlBlockClosed}.
- *
- * A block whose own literal already holds its end condition is CLOSED, and a
- * closed block cannot grow — which makes it as anchor-safe as a closed
- * fence. Refusing to anchor those as well cost every raw-HTML stream its
- * anchor entirely: a document of 40 one-line `<!-- … -->` blocks reparsed
- * from offset 0 on every append.
+ * md4c's start conditions for HTML block types 1-4
+ * (`md_is_html_block_start_condition`), in its order, which differ from
+ * CommonMark: type 1 needs no delimiter after the name, and type 4 takes `<!`
+ * plus any ASCII, so type 5 is unreachable.
  */
 const HTML_BLOCK_END_CONDITIONS: ReadonlyArray<readonly [RegExp, RegExp]> = [
   [
@@ -268,22 +193,7 @@ const HTML_BLOCK_END_CONDITIONS: ReadonlyArray<readonly [RegExp, RegExp]> = [
   [/^ {0,3}<![\x00-\x7f]/, />/],
 ];
 
-/**
- * Whether an HTML block literal has reached the end condition that lets it
- * stop growing. True for a type 6 or 7 block (nothing to wait for: those end
- * at the blank line the anchor scan already found) and for a type 1-4 block
- * whose literal holds its terminator.
- *
- * The fall-through is deliberately the SAFE answer, not the convenient one:
- * a literal that matches no row is one md4c did not start as type 1-4, so a
- * blank line really does end it. What must never happen is the reverse — a
- * type-4 literal falling through and being called closed, which froze
- * `<!5 note` at eight characters and rendered the rest of the block as
- * markdown for the remainder of the stream. Every row's opener is therefore
- * md4c's, exactly (see {@link HTML_BLOCK_END_CONDITIONS}), so the shapes
- * that used to fall through — `<!5`, `<!-`, `<! `, `<![CDATA` — now match
- * the type-4 row and wait for their `>`.
- */
+/** A literal matching no row is type 6 or 7, which a blank line ends. */
 function htmlBlockClosed(literal: string): boolean {
   for (const [opener, ender] of HTML_BLOCK_END_CONDITIONS) {
     if (opener.test(literal)) {
@@ -293,24 +203,10 @@ function htmlBlockClosed(literal: string): boolean {
   return true;
 }
 
-/**
- * Container prefixes a link reference definition can sit behind — any mix of
- * blockquote markers and one list-item marker per level, as deep as the
- * writer nested them (`> - [foo]: /url`). Applied repeatedly until the line
- * stops shrinking, so the label test below sees the definition's own
- * content rather than its containers.
- */
 const CONTAINER_PREFIX = /^ {0,3}(?:(?:>[ \t]?)+|(?:[-+*]|\d{1,9}[.)])[ \t]+)/;
 
-/**
- * A line that is so far ONLY indentation and a half-typed container marker
- * ('-', '1.', '>', '- >'): the next characters could still make it a
- * definition, so it must not be ruled out yet. Tested on what
- * {@link containerPrefixLength} left behind.
- */
 const PARTIAL_CONTAINER = /^ {0,3}(?:[-+*>]|\d{1,9}[.)]?)?[ \t]*$/;
 
-/** Offset of a line's content, past every container marker opening it. */
 function containerPrefixLength(line: string): number {
   let at = 0;
   for (;;) {
@@ -323,18 +219,9 @@ function containerPrefixLength(line: string): number {
 }
 
 /**
- * Offset of a line's content, past both halves of a container prefix: the
- * CONTENT INDENT of the containers already open above this line, and then any
- * marker this line opens for itself.
- *
- * Markers alone are not enough. A definition inside a list item is written at
- * the item's content column with no marker of its own —
- * `- outer` / `  - inner` / blank / `    [foo]: /url` — and reading that line
- * from column 0 finds four spaces, which looks like indented code and rules
- * the definition out. It is also what lets the marker scan reach past three
- * spaces of indentation: `CONTAINER_PREFIX` only allows ` {0,3}` before a
- * marker, so the `- c` of a third-level item is only found once the two
- * levels above it have been taken off.
+ * Strips the open containers' content indent before any marker: a definition
+ * at an item's content column has no marker, and read from column 0 it looks
+ * like indented code.
  */
 function contentStart(line: string, containerIndent: number): number {
   let at = 0;
@@ -348,41 +235,60 @@ function contentStart(line: string, containerIndent: number): number {
   return at + containerPrefixLength(line.slice(at));
 }
 
-/**
- * How far a line may be nothing but indentation and a half-typed marker and
- * still count as a definition that has not arrived yet. Past this it is ruled
- * out: no container's content column is 64 characters deep, and a line that
- * stays a candidate is re-read from its start on every append.
- */
+interface ReferenceFence {
+  marker: string;
+  length: number;
+  indent: number;
+  quotes: number;
+}
+
+function referenceFenceLine(
+  line: string,
+  previous: ReferenceFence | null,
+  containerIndent: number,
+): { fence: ReferenceFence | null; code: boolean } {
+  if (previous !== null) {
+    let offset = 0;
+    let quotes = 0;
+    while (quotes < previous.quotes) {
+      const quote = /^[ \t]*>[ \t]?/.exec(line.slice(offset));
+      if (!quote) break;
+      offset += quote[0].length;
+      quotes += 1;
+    }
+    while (offset < previous.indent && /[ \t]/.test(line[offset] ?? '')) offset += 1;
+    const blank = /^[ \t\r]*$/.test(line);
+    if (quotes === previous.quotes && (offset >= previous.indent || blank)) {
+      const closer = /^ {0,3}(`{3,}|~{3,})[ \t\r]*$/.exec(line.slice(offset));
+      const closed = closer !== null && closer[1][0] === previous.marker && closer[1].length >= previous.length;
+      return { fence: closed ? null : previous, code: true };
+    }
+  }
+  const offset = contentStart(line, containerIndent);
+  const opener = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line.slice(offset));
+  if (!opener || (opener[1][0] === '`' && opener[2].includes('`'))) {
+    return { fence: null, code: false };
+  }
+  return {
+    fence: {
+      marker: opener[1][0], length: opener[1].length, indent: offset,
+      quotes: (line.slice(0, offset).match(/>/g) ?? []).length,
+    },
+    code: true,
+  };
+}
+
+/** No content column is this deep, and a candidate is re-read every append. */
 const GROWING_PREFIX_LIMIT = 64;
 
 /**
- * How a source line relates to a link reference definition (`[label]: dest`).
- * `'definition'` — the line completes the `[label]:` opener; `'open'` — its
- * label is unterminated, so the definition may still complete on a LATER
- * line (`[foo` / `bar]: /url`, which md4c reads as one definition);
- * `'growing'` — nothing but indentation or a half-typed container marker so
- * far, which could still become one when more of THIS line arrives; `'no'`
- * — it cannot, whatever follows.
+ * `'definition'` completes `[label]:`; `'open'` has a label a later line may
+ * close; `'growing'` may still become one as this line arrives; `'no'` cannot.
+ * `scanned` is where the next scan of the line may resume, so an open label is
+ * not re-read end to end on every append.
  *
- * `from` resumes a scan of the same line a previous append already walked,
- * and the returned `scanned` is where the next one may resume: a paragraph
- * line that opens with `[` and has no `]` yet would otherwise be re-read end
- * to end on every append, which is quadratic in the line.
- *
- * Deliberately loose, in every direction that costs anchoring rather than
- * correctness — being wrong the other way would mean serving a stale parse.
- * All of these read as `'definition'`: an empty label; a label md4c would
- * reject; a definition-shaped line inside a fenced code block (this is a line
- * scan and knows nothing about fences); and any line reached by RESUMING a
- * label left open above, which hunts for `]:` and no longer asks whether the
- * line could open one — `- item one` / `- item two [x]: y` is two list items
- * to md4c and a definition here. The only consequence is a session that stops
- * freezing blocks it could have frozen (see
- * {@link StreamSession.scanForLinkReferenceDefinitions}).
- *
- * `containerIndent` is the content column of the containers open above this
- * line; see {@link contentStart}.
+ * Errs toward `'definition'` (empty labels, labels md4c rejects, any resumed
+ * open label): that costs anchoring, never correctness.
  */
 function linkReferenceDefinitionState(
   line: string,
@@ -401,19 +307,15 @@ function linkReferenceDefinitionState(
     const rest = line.slice(content);
     if (labelOpen) {
       if (/^[ \t]*$/.test(rest)) {
-        // A blank line ends a label — but a line that has not arrived yet is
-        // not a blank line, it is the newline that just landed.
+        // Unterminated, this "blank line" is just the newline that landed.
         return { state: terminated ? 'no' : 'growing', ...whole };
       }
       i = content;
     } else {
       const open = /^ {0,3}\[/.exec(rest);
       if (open === null) {
-        // Indentation, or a container marker still being typed, is still a
-        // possible opener; a fourth space past the content column is indented
-        // code, and any other character rules the line out for good. The
-        // length bound keeps a line that is ONLY indentation from being
-        // re-read from the start on every append forever.
+        // A fourth space past the content column is indented code; the length
+        // bound stops an indentation-only line from being re-read forever.
         return {
           state:
             rest.length <= GROWING_PREFIX_LIMIT && PARTIAL_CONTAINER.test(rest)
@@ -427,7 +329,6 @@ function linkReferenceDefinitionState(
   }
   for (; i < line.length; i += 1) {
     if (line[i] === '\\') {
-      // An escaped ']' stays inside the label.
       i += 1;
       continue;
     }
@@ -437,33 +338,18 @@ function linkReferenceDefinitionState(
     if (i + 1 >= line.length) {
       return { state: 'open', scanned: i };
     }
-    // The ':' must follow the label immediately; a later ']' cannot open a
-    // second label, so anything else ends the line's chances.
+    // The ':' must follow at once; a later ']' cannot open a second label.
     return { state: line[i + 1] === ':' ? 'definition' : 'no', ...whole };
   }
-  // The label is still open. Resume one character back, so a trailing
-  // backslash (which may yet escape the character that has not arrived) and
-  // a trailing ']' (whose next character decides everything) are re-read.
+  // Resume one back: a trailing backslash or ']' depends on what comes next.
   return { state: 'open', scanned: Math.max(from, line.length - 1) };
 }
 
 /**
- * Deep structural equality over two parsed blocks — same kinds, spans,
- * values, children, and streaming flags. Used by `finalize` to check a
- * cached settled block against the fresh parse of the same span before
- * substituting it (see {@link StreamSession.remember}); nothing on the
- * per-append path calls it.
- *
- * Iterative, like every other walk over a parsed tree in this library: the
- * tree's depth is whatever the model emitted, and a blockquote 20 000 levels
- * deep (40 kB of `'> '`, which md4c parses happily) recursed one frame per
- * level here and threw `RangeError: Maximum call stack size exceeded` out of
- * `finalize` — after the whole document had already streamed successfully.
- * A pair stack costs the same comparisons and is bounded by the heap.
+ * Only `finalize` calls this, to verify a cached settled block. Iterative:
+ * depth is model-controlled.
  */
 function sameStructure(a: unknown, b: unknown): boolean {
-  // Pairs still to compare; order does not matter, since a mismatch anywhere
-  // is the whole answer.
   const left: unknown[] = [a];
   const right: unknown[] = [b];
   while (left.length > 0) {
@@ -521,16 +407,7 @@ function sameStructure(a: unknown, b: unknown): boolean {
  * - `codeBlock` with `fenced: false` — indented code spans blank lines;
  * - `codeBlock` with `closed: false` — still consuming everything;
  * - `htmlBlock` of type 1-4 that has NOT reached its end condition — those
- *   span blank lines (see {@link HTML_BLOCK_END_CONDITIONS}). The anchor
- *   scan evaluates the PREVIOUS parse's block end against the already-grown
- *   source, so a comment or `<script>` md4c had to cut at the old
- *   end-of-source would look blank-line-terminated and freeze truncated,
- *   with the rest of the block parsed as markdown for the remainder of the
- *   stream. One whose literal already holds its `-->`, `?>` or closing tag
- *   is finished and anchors like anything else ({@link htmlBlockClosed}) —
- *   keying on the opener alone made every raw-HTML stream quadratic. Only
- *   reachable with `html: 'raw'`; under the default 'strip' the decoder
- *   emits no htmlBlock node at all.
+ *   span blank lines (see {@link HTML_BLOCK_END_CONDITIONS}).
  * These freeze only once a safe-kind block after them is itself followed by
  * a blank line.
  */
@@ -633,21 +510,8 @@ export class StreamSession {
   /** True when the last tail repair changed nothing (fast-path gate). */
   private lastRepairClean = true;
   /**
-   * `repairTail`'s carry-forward state for the CURRENT anchor, so a tail
-   * that keeps growing without ever anchoring is not re-scanned from its
-   * start on every append (see {@link RepairScan}).
-   *
-   * The session owns it because the session is what knows the tail is
-   * growing: `repairTail` itself is pure and takes it as an argument. The
-   * anchor travels with it and is checked before use, because the tail is
-   * `source.slice(anchor)` — an anchor that moved leaves every offset in the
-   * record pointing at a different string. Anything that is not a plain
-   * append clears it outright: a divergent replace and a reset through
-   * `resetIncrementalState`, a `finalize` (which reparses the whole source
-   * with no repairs at all, and whose blocks a resumed stream then splices
-   * against), and an anchor advance below. `appendNow` saves and restores it
-   * with the rest of the incremental state, so a parse that throws does not
-   * leave a record describing a tail no snapshot contains.
+   * `repairTail`'s carry-forward scan, valid only for its `anchor`; anything
+   * but a plain append clears it.
    */
   private tailScan: { anchor: number; scan: RepairScan } | null = null;
 
@@ -672,6 +536,7 @@ export class StreamSession {
   private readonly now: () => number;
   /** Deltas accepted by appendBuffered but not yet appended. */
   private pending = '';
+  private pendingEndKnown = false;
   /** Cancel for the scheduled flush; null means none is scheduled. */
   private cancelScheduledFlush: (() => void) | null = null;
   /** Cancel for the armed idle drain; null means none is armed. */
@@ -685,58 +550,35 @@ export class StreamSession {
   }> = [];
   /** Set by `dispose()`; every mutating entry point is inert afterwards. */
   private disposed = false;
+  private suspended = false;
   /** Consecutive drains the engine refused; backs off the retry timer. */
   private drainFailures = 0;
   /**
-   * The error the session gave up on after {@link MAX_DRAIN_RETRIES} refused
-   * drains, or null while the buffered path is healthy. While it is set no
-   * retry timer is armed and `drained()` rejects with it; the next drain that
-   * succeeds — or new buffered input, which is a fresh attempt — clears it.
+   * Set after {@link MAX_DRAIN_RETRIES} refused drains: no retry is armed and
+   * `drained()` rejects until a drain succeeds or new buffered input arrives.
    */
   private drainAbandoned: unknown = null;
-  /** True while `commit` is delivering a snapshot to the listener set. */
   private notifying = false;
   /**
-   * Set when a commit lands re-entrantly (a listener appended or finalized
-   * from inside its own callback): the delivery loop makes one more pass with
-   * the newest snapshot instead of letting the nested one overtake the
-   * listeners the outer pass has not reached yet.
+   * A listener committed re-entrantly: deliver it in another pass instead of
+   * overtaking the listeners the outer pass has not reached.
    */
   private notifyPending = false;
-  /**
-   * Start of the first line the link-reference-definition scan has not
-   * settled — always a line start (0, or just past a '\n').
-   */
+  /** Always a line start: the first line the definition scan left open. */
   private refScanFrom = 0;
+  private refFence: ReferenceFence | null = null;
   /** True when the partial line at `refScanFrom` can no longer open one. */
   private refLineRuledOut = false;
   /** How far into the line at `refScanFrom` the label scan has already got. */
   private refLineScanned = 0;
   /** True when a `[label` opened on an earlier line is still unterminated. */
   private refLabelOpen = false;
-  /**
-   * Content column of the containers open above `refScanFrom` — the column a
-   * definition inside a list item or blockquote is written at. See
-   * {@link contentStart}.
-   */
+  /** Content column of the containers open above `refScanFrom`. */
   private refContainerIndent = 0;
-  /** Whether the line above `refScanFrom` was blank. */
   private refPrevBlank = true;
-  /**
-   * True once a link reference definition has been seen anywhere in the
-   * source, which switches the incremental anchor off for the rest of the
-   * stream — see {@link scanForLinkReferenceDefinitions}.
-   */
+  /** Once set, the incremental anchor stays off for the rest of the stream. */
   private hasLinkReferenceDefinition = false;
-  /**
-   * The snapshot `snapshot()` returns before the first commit. Built once so
-   * the getter is referentially stable from construction — a fresh object per
-   * call would spin
-   * `useSyncExternalStore((cb) => session.subscribe(cb), () => session.snapshot())`
-   * until React gives up ("Maximum update depth exceeded") on every session
-   * whose stream has not started yet. `this.current` is null only in that
-   * window, where phase is 'streaming' and revision 0 by construction.
-   */
+  /** One object, so `useSyncExternalStore` cannot spin before a commit. */
   private readonly emptySnapshot: SessionSnapshot = {
     document: { source: '', blocks: [] },
     settledUntil: 0,
@@ -794,16 +636,9 @@ export class StreamSession {
    * deltas after resolution pend as usual; await again if the stream
    * resumed.
    *
-   * REJECTS with the engine's own error when the session has given up on the
-   * tail: {@link MAX_DRAIN_RETRIES} scheduled drains in a row threw, so no
-   * further retry is armed and no drain is coming. That is a terminal state
-   * for the buffered path and callers must handle it — awaiting a promise
-   * that can never settle is worse, and resolving it would claim a buffer
-   * that is not empty. Nothing is dropped: the text stays in `pending`
-   * (`pendingLength` still counts it) and any explicit drain —
-   * `append`, `flushBuffered`, `replace`, `finalize` — tries it again, so a
-   * session whose engine comes back keeps every character. New buffered
-   * input clears the state too, since it schedules a fresh attempt.
+   * Rejects with the engine's error once {@link MAX_DRAIN_RETRIES} scheduled
+   * drains in a row threw. Nothing is dropped: an explicit drain or new
+   * buffered input tries the tail again.
    */
   drained(): Promise<void> {
     if (this.pending === '') {
@@ -823,25 +658,22 @@ export class StreamSession {
    * `AdaptiveSmoother.notifyRunFinalized`) switches to it — a short
    * remaining tail releases instantly, a longer one races a bounded
    * deadline instead of trailing out at the steady pacing rate. Call it at
-   * run end, before awaiting `drained()`; a no-op for sessions without a
-   * smoother, with a policy that has no lifecycle method, or with nothing
-   * pending. Timestamped on this session's clock, so the policy
+   * run end, before awaiting `drained()`. It also releases the final complete
+   * cluster without waiting for another delta or the idle timer. With nothing
+   * pending it is a no-op. Timestamped on this session's clock, so the policy
    * and the per-flush `SmootherContext.now` stay on one timeline.
    *
-   * With nothing pending it is a no-op rather than a forward, because there
-   * is no drain to switch to and nothing would ever switch the policy back:
-   * a drain-armed policy resets on its next smoother call, and an empty
-   * session makes none — not even the zero-offer bookkeeping call, which
-   * only fires on a release that emptied the buffer. The armed state would
-   * then leak into the NEXT run on a reused session and release its first
-   * flush as a run-end drain instead of pacing it. `bindRunTextEvents`
-   * skips the call for empty sessions for the same reason.
+   * Not forwarded when empty: a drain-armed policy with no flush to reset it
+   * would pace the next run's first flush as a run-end drain.
    */
   notifyRunFinalized(): void {
     if (this.disposed || this.pending === '') {
       return;
     }
+    this.pendingEndKnown = true;
     this.smoother?.notifyRunFinalized?.(this.now());
+    this.clearIdleDrain();
+    this.scheduleFlush();
   }
 
   /**
@@ -874,12 +706,8 @@ export class StreamSession {
    * mutates the source. The buffered flush comes through here so it cannot
    * recursively re-drain the buffer it is flushing.
    *
-   * Atomic up to its commit through {@link captureState}: a parse that
-   * throws — an unlinked native module throws on its first call — puts
-   * everything back, leaving `length` and `snapshot()` in agreement instead
-   * of counting text no snapshot contains. Past the commit the new state IS
-   * the truth: a throw from a subscriber propagates with nothing rolled
-   * back.
+   * Atomic up to its commit through {@link captureState}: a throwing parse
+   * is rolled back, a throwing subscriber is not.
    */
   private appendNow(delta: string): void {
     if (delta === '') {
@@ -910,10 +738,9 @@ export class StreamSession {
       return;
     }
     this.pending += delta;
-    // New input means the stream is not stalled; the flush below re-arms the
-    // idle drain if it again leaves held-back characters behind. It is also
-    // a fresh attempt at a tail the session may have given up on, so the
-    // retry ladder starts over.
+    this.pendingEndKnown = false;
+    // New input means the stream is not stalled, and is a fresh attempt at a
+    // tail the session may have given up on.
     this.drainAbandoned = null;
     this.drainFailures = 0;
     this.clearIdleDrain();
@@ -922,7 +749,7 @@ export class StreamSession {
 
   /** Schedules the coalesced flush; a no-op while one is already scheduled. */
   private scheduleFlush(): void {
-    if (this.cancelScheduledFlush !== null) {
+    if (this.disposed || this.suspended || this.cancelScheduledFlush !== null) {
       return;
     }
     // The BufferScheduler contract only requires a cancel function — a
@@ -962,12 +789,7 @@ export class StreamSession {
    * everything the caller has streamed, not a flush-timing-dependent prefix
    * of it.
    *
-   * Atomic up to its commit, exactly like `appendNow`: the divergent path
-   * throws the whole incremental prefix away before it parses, so a parse
-   * that throws would otherwise leave `length` counting text no snapshot
-   * contains AND an anchor, frozen prefix and identity cache belonging to a
-   * document that was discarded. The identity cache is restored too, because
-   * unlike an append this path clears it outright.
+   * Atomic up to its commit like `appendNow`, identity cache included.
    */
   replace(full: string): void {
     if (this.disposed) {
@@ -984,9 +806,8 @@ export class StreamSession {
     const restore = this.captureState(true);
     this.source = full;
     this.resetIncrementalState();
-    // A divergent replace throws the old text away, so the
-    // link-reference-definition scan starts over on the new text.
     this.refScanFrom = 0;
+    this.refFence = null;
     this.refLineRuledOut = false;
     this.refLineScanned = 0;
     this.refLabelOpen = false;
@@ -1033,6 +854,7 @@ export class StreamSession {
     }
     if (full.startsWith(this.source)) {
       this.pending = full.slice(this.source.length);
+      this.pendingEndKnown = false;
       if (this.pending === '') {
         // The rewrite deleted the whole unrevealed tail: nothing left to
         // flush, hold, or meter — and the buffer emptied outside a smoothed
@@ -1047,7 +869,9 @@ export class StreamSession {
       // The swapped tail is new buffered input: cancel the stalled-stream
       // idle drain and keep one coalesced flush scheduled, exactly as
       // `appendBuffered` would (the flush re-arms the idle drain if it
-      // again leaves held-back characters behind).
+      // again leaves held-back characters behind); restart the retry ladder.
+      this.drainAbandoned = null;
+      this.drainFailures = 0;
       this.clearIdleDrain();
       this.scheduleFlush();
       return;
@@ -1071,40 +895,23 @@ export class StreamSession {
     if (this.phase === 'settled') {
       return;
     }
-    // Atomic up to its commit, exactly like `appendNow` and `replace`: the
-    // parse is what throws in practice, but everything after it mutates the
-    // anchor bookkeeping, and a session left half-finalized would report a
-    // frozen prefix belonging to a snapshot it never committed.
     const restore = this.captureState();
     try {
-      // One last full clean parse of the raw source (O(n), once per stream);
-      // previously frozen blocks are swapped back in by kind, span and
-      // structure so settled content survives finalize with the same object
-      // references.
       const doc = this.parse(this.source);
-      // Only past the parse: an engine that throws must leave the session
-      // streaming rather than settled with no settled snapshot to show.
+      // After the parse: a throwing engine must leave the session streaming.
       this.phase = 'settled';
       const blocks = doc.blocks.map((b) => this.remember(b));
       this.lastBlocks = blocks;
       this.lastRepairClean = true;
-      // Nothing was repaired, so there is no scan of a repaired tail to
-      // carry; a stream that resumes after this starts its next tail cold.
       this.tailScan = null;
-      // The fresh parse supersedes the incremental blocks, so the frozen
-      // prefix re-adopts its objects: a resumed stream then splices the same
-      // blocks `lastBlocks` holds. `remember` hands back the cached object
-      // for every block that still matches, so this is identity-preserving
-      // in the common case and corrects the prefix in the case where it does
-      // not.
+      // Re-adopt the fresh objects so a resumed stream splices `lastBlocks`.
       if (this.frozen.length > 0) {
         this.frozen = blocks.slice(0, this.frozen.length);
       }
       this.advanceAnchor(blocks);
       this.commit({ source: doc.source, blocks }, this.source.length);
     } catch (error) {
-      // A no-op past the commit, where the new state IS the truth and the
-      // throw came from a subscriber (see {@link captureState}).
+      // A no-op past the commit (see {@link captureState}).
       restore();
       throw error;
     }
@@ -1123,10 +930,8 @@ export class StreamSession {
   }
 
   /**
-   * Registers a snapshot listener and returns its unsubscribe — the
-   * `useSyncExternalStore` subscribe shape, so
-   * `useSyncExternalStore((cb) => session.subscribe(cb), () => session.snapshot())`
-   * is a correct integration.
+   * Registers a snapshot listener and returns its unsubscribe, in the
+   * `useSyncExternalStore` subscribe shape.
    *
    * Listeners are called synchronously, in registration order, with the
    * snapshot of the commit that woke them. A listener MAY mutate the session
@@ -1145,27 +950,27 @@ export class StreamSession {
     };
   }
 
+  /** Stops scheduled work while retaining the snapshot and buffered input. */
+  suspend(): void {
+    this.suspended = true;
+    this.clearScheduledFlush();
+    this.clearIdleDrain();
+  }
+
+  /** Resumes buffered work after a hidden view's effects reconnect. */
+  resume(): void {
+    if (this.disposed || !this.suspended) return;
+    this.suspended = false;
+    if (this.pending !== '') this.scheduleFlush();
+  }
+
   /**
    * Ends the session and releases everything it holds. Idempotent.
    *
-   * Concretely: cancels the scheduled flush and the armed idle drain, DROPS
-   * whatever `appendBuffered` text is still pending (it is never parsed,
-   * never committed, and appears in no snapshot), resolves every outstanding
-   * `drained()` promise, and drops every subscriber. Afterwards the session
-   * is inert — `append`, `appendBuffered`, `flushBuffered`, `replace`,
-   * `rewrite`, `finalize` and `notifyRunFinalized` do nothing, `subscribe`
-   * returns a no-op unsubscribe without registering, `drained()` resolves
-   * immediately — while `snapshot()`, `length` and `parseContext` keep
-   * reporting the last committed state, so a view mid-unmount reads
-   * something consistent.
-   *
-   * This is the cleanup for a session dropped before its stream ended: a row
-   * unmounting mid-run, a screen popping. Unsubscribing does not stop the
-   * work — a smoother re-schedules its flush every frame while it withholds
-   * text, and holdback arms an idle drain — so without `dispose()` a dropped
-   * session keeps parsing and committing into a document nobody reads. To
-   * KEEP the tail instead of discarding it, call `flushBuffered()` (or
-   * `finalize()`) first and then `dispose()`.
+   * DROPS pending `appendBuffered` text, resolves every `drained()` promise
+   * and drops every subscriber. Afterwards every mutator is a no-op, while
+   * `snapshot()`, `length` and `parseContext` keep the last committed state.
+   * To keep the tail, call `flushBuffered()` or `finalize()` first.
    */
   dispose(): void {
     if (this.disposed) {
@@ -1176,18 +981,15 @@ export class StreamSession {
     this.clearIdleDrain();
     this.pending = '';
     this.listeners.clear();
+    this.resetIncrementalState();
     this.resolveDrained();
   }
 
   /**
    * Unfreezes everything: the next update reparses the whole source.
    *
-   * `keepIdentityCache` keeps the settled-block map, for the caller that is
-   * invalidating the ANCHOR rather than the text (a link reference
-   * definition). `remember` verifies a cached block structurally before
-   * reusing it, so blocks the event did not actually change keep their
-   * objects through finalize while the changed ones are replaced. A divergent
-   * `replace` passes it up: the text under those spans is gone.
+   * `keepIdentityCache` is for invalidating the anchor, not the text:
+   * `remember` re-verifies cached blocks before reusing them.
    */
   private resetIncrementalState(keepIdentityCache = false): void {
     this.anchor = 0;
@@ -1203,20 +1005,9 @@ export class StreamSession {
 
   /**
    * Snapshots everything a parse touches and returns the undo for it. The
-   * undo is a no-op once a commit has landed: past the commit the new state
-   * IS the truth (a throw from a subscriber must not roll the document
-   * back), which is why it tests the revision rather than trusting the
-   * caller.
-   *
-   * Used by every path that mutates the source before parsing it, so a parse
-   * that throws — an unlinked native module throws on its first call — can
-   * never leave `length` counting text no snapshot contains.
-   *
-   * `includeIdentityCache` copies the settled-block map as well. Only the
-   * divergent `replace` needs it, because only that path CLEARS the map; an
-   * append merely adds entries, and the blocks those cache are the same
-   * objects a retry freezes (`remember` re-verifies structure anyway), so
-   * the hot path does not pay for a copy of the whole cache.
+   * undo is a no-op once a commit lands: a subscriber's throw must not roll
+   * the document back. Only the divergent `replace`, the one path that clears
+   * the settled-block map, needs `includeIdentityCache`.
    */
   private captureState(includeIdentityCache = false): () => void {
     const revisionBefore = this.revision;
@@ -1225,13 +1016,13 @@ export class StreamSession {
     const anchor = this.anchor;
     const seedAtAnchor = this.seedAtAnchor;
     const frozen = this.frozen;
-    // `advanceAnchor` appends to `frozen` in place, so the length is part of
-    // the state — restoring the reference alone would keep the new entries.
+    // `advanceAnchor` grows `frozen` in place, so its length is state too.
     const frozenLength = frozen.length;
     const lastBlocks = this.lastBlocks;
     const lastRepairClean = this.lastRepairClean;
     const tailScan = this.tailScan;
     const refScanFrom = this.refScanFrom;
+    const refFence = this.refFence;
     const refLineRuledOut = this.refLineRuledOut;
     const refLineScanned = this.refLineScanned;
     const refLabelOpen = this.refLabelOpen;
@@ -1255,6 +1046,7 @@ export class StreamSession {
       this.lastRepairClean = lastRepairClean;
       this.tailScan = tailScan;
       this.refScanFrom = refScanFrom;
+      this.refFence = refFence;
       this.refLineRuledOut = refLineRuledOut;
       this.refLineScanned = refLineScanned;
       this.refLabelOpen = refLabelOpen;
@@ -1288,31 +1080,20 @@ export class StreamSession {
     try {
       this.appendNow(held);
     } catch (error) {
-      // `appendNow` is atomic up to its commit: when it rolled the source
-      // back the text never landed, so it goes back in the buffer rather than
-      // disappearing between the two. (A throw from a subscriber lands past
-      // the commit — that text IS in the source and must not be drained
-      // twice.)
+      // Rolled back, the text never landed; past the commit, it did.
       if (this.source.length === sourceLength) {
         this.pending = held;
-        // This method cleared both timers on the way in, so without a fresh
-        // one the tail sits in the buffer with nothing left to release it
-        // and `drained()` never settles — a run parked behind it holds
-        // forever. An engine can fail transiently, so it is retried, backing
-        // off so a dead one is not polled every idle delay; and the retries
-        // are COUNTED, so an engine that never recovers ends in a terminal
-        // state instead of a permanent timer. The throw still propagates —
-        // out of whatever called in, which for a scheduled drain is the
-        // timer callback.
+        // Both timers were cleared on entry: without a backed-off retry the
+        // tail is stranded and `drained()` never settles.
         this.drainFailures += 1;
         if (this.drainFailures > MAX_DRAIN_RETRIES) {
-          // The ladder is out. Retrying forever is not a terminal state:
-          // stop the timers and settle the waiters instead — see
-          // {@link abandonDrain}.
           this.abandonDrain(error);
         } else {
           this.armIdleDrain(this.retryDelay());
         }
+      } else if (this.pending === '') {
+        this.noteExternalDrain();
+        this.resolveDrained();
       }
       throw error;
     }
@@ -1320,14 +1101,6 @@ export class StreamSession {
     this.resolveDrained();
   }
 
-  /**
-   * Delay before the next retry of a drain the engine refused: the idle
-   * delay, doubled per consecutive failure up to
-   * {@link MAX_DRAIN_BACKOFF_STEPS}. A transient failure is retried
-   * promptly; a permanent one settles into an occasional attempt rather than
-   * a timer storm, and the tail is still waiting whenever the engine works
-   * again.
-   */
   private retryDelay(): number {
     const steps = Math.min(this.drainFailures - 1, MAX_DRAIN_BACKOFF_STEPS);
     return this.holdIdleMs * 2 ** Math.max(0, steps);
@@ -1358,48 +1131,27 @@ export class StreamSession {
   }
 
   /**
-   * Tell the smoother how much of its last answer actually made it into the
-   * document — see {@link Smoother.notifyReleased}. Only the metered flush
-   * calls it: an unmetered release (a synchronous drain, the idle drain)
-   * reports itself through {@link noteExternalDrain} instead, and the
-   * zero-offer call it makes has no answer to settle.
+   * Only the metered flush settles; unmetered releases report through
+   * {@link noteExternalDrain}.
    */
   private settleSmoother(released: number): void {
     this.smoother?.notifyReleased?.(released);
   }
 
   /**
-   * Cluster-safe cut into `this.pending`: the largest cut at or below the
-   * proposed one that splits no visible glyph. Released text cannot be
-   * recalled, so a committed half-cluster paints as its own glyph for a
-   * frame — half a family emoji, the bare '❤' out of '❤️‍🔥', a lone '🇺'
-   * out of a flag, 'cafe' before its combining accent. The cut therefore
-   * moves DOWN only (never up — pending text can always wait for the rest of
-   * its cluster, and a full-buffer release is the drain's job, not a cut's).
-   *
-   * Judged against the committed source as well as the buffer, and against
-   * the fact that the buffer's end is not the text's end: the last cluster
-   * of a metered flush is held back until a following code point proves it
-   * finished, because otherwise a cluster split across two deltas commits
-   * its first half. With `holdBackChars` 0 that costs one code point of
-   * latency per flush, released by the next delta, the idle drain or
-   * `finalize`. {@link retreatToStreamBoundary} documents both rules, and
-   * which clusters are recognised — Hangul jamo and Indic conjuncts across a
-   * virama are not.
+   * Moves the cut down only, judged with the committed text, and holds back a
+   * last cluster the next delta could extend (see
+   * {@link retreatToStreamBoundary}).
    */
   private clusterSafeCut(cut: number): number {
-    return retreatToStreamBoundary(this.source, this.pending, cut);
+    return retreatToStreamBoundary(this.source, this.pending, cut, !this.pendingEndKnown);
   }
 
   /**
    * The scheduled flush: append the pending text up to the trailing
-   * `holdBackChars` characters — or less, when a `smoother` meters the
-   * release (its answer is clamped and retreated to a cluster boundary; a
-   * non-finite answer releases everything releasable). Whichever text a
-   * flush leaves behind is never stranded: while releasable text remains the
-   * next flush is scheduled immediately, so a smoothed drain keeps its
-   * cadence with no further input, and once only the holdback tail is left
-   * the idle drain takes over.
+   * `holdBackChars` characters, or less when a `smoother` meters it. Leftover
+   * releasable text schedules the next flush; a holdback-only tail falls to
+   * the idle drain.
    */
   private flushHeld(): void {
     if (this.inFlush) {
@@ -1423,11 +1175,7 @@ export class StreamSession {
     let metered: number | null = null;
     if (this.smoother) {
       // Context lengths are read before the release mutates them, so
-      // sourceLength + pendingLength is the total text arrived — the signal
-      // an adaptive smoother's arrival tracker samples. It only fails to be
-      // monotone when `rewrite` swaps a shorter tail in or a divergent
-      // `replace` shortens the document; the shipped policy rebases its
-      // window on the drop for that (see `SmootherContext`).
+      // sourceLength + pendingLength is the total text arrived.
       const context: SmootherContext = {
         now: this.now(),
         pendingLength: this.pending.length,
@@ -1453,27 +1201,18 @@ export class StreamSession {
         try {
           this.appendNow(ready);
         } catch (error) {
-          // Same atomicity as `drainPending`: text `appendNow` rolled back
-          // goes back in front of the buffer, in order. Either way the
-          // smoother is settled before the throw leaves: a policy that
-          // charged a budget for this answer must not be left holding it —
-          // `createSmoother` would run the next flush with a lifted cap and
-          // a phantom charge.
+          // Same atomicity as `drainPending`. Settle either way, or a budget
+          // policy keeps a phantom charge.
           if (this.source.length === sourceLength) {
             this.pending = ready + this.pending;
             this.settleSmoother(0);
           } else {
-            // The throw came from a subscriber, PAST the commit: the text is
-            // in the document, so the answer was released in full.
+            // A subscriber threw past the commit: the text landed in full.
             this.settleSmoother(take);
           }
           throw error;
         }
       }
-      // Settle the smoother against what actually landed — the retreat
-      // above releases less than the answer, the link snap more. A policy
-      // that charges a budget needs this or a cluster it cannot yet afford
-      // charges it every frame and the reveal never resumes.
       this.settleSmoother(take);
       if (this.pending === '') {
         this.resolveDrained();
@@ -1494,38 +1233,27 @@ export class StreamSession {
           // the rest at once — smoothing needs an asynchronous scheduler).
           this.armIdleDrain();
         } else if (take === 0) {
-          // Nothing was released at all, and the next flush may answer the
-          // same: a cut parked inside a cluster whose tail has not arrived
-          // retreats to 0 for as long as that lasts, and a budget smaller
-          // than the whole glyph never affords it. Frames alone would spin
-          // there forever, so the idle drain backs them up — it releases
-          // everything at once, which is the right answer for a stream that
-          // has stopped making progress. Armed only once per stalled run
-          // (re-arming every frame would push its deadline out of reach);
-          // progress disarms it below, and so does new input.
+          // A cut parked inside an unfinished cluster retreats to 0 every
+          // frame. Arm the idle drain once as the backstop: re-arming every
+          // frame would push its deadline out of reach.
           if (this.cancelIdleDrain === null) {
             this.armIdleDrain();
           }
         } else {
-          // Progress: the frame cadence owns the drain again, and a timer
-          // armed by an earlier stalled flush must not fire into it and
-          // dump the rest of the buffer in one commit.
+          // Progress: a drain armed by an earlier stall must not dump the rest.
           this.clearIdleDrain();
         }
       } else {
         this.armIdleDrain();
       }
     } catch (error) {
-      // The engine (or a subscriber) threw inside a scheduled flush. The
-      // scheduler wrapper cleared the flush cancel before calling in, and the
-      // re-schedule/arm branches above never ran, so without this the held
-      // text would sit in the buffer with no timer left to release it:
-      // `drained()` would never resolve and a run parked behind it would hold
-      // forever. The throw still propagates — out of the scheduler callback,
-      // which is where a buffered session surfaces an engine failure — it
-      // just does not strand the tail as well.
+      // The re-schedule branches above never ran, so without a timer the held
+      // text is stranded and `drained()` never settles.
       if (this.pending !== '') {
         this.armIdleDrain();
+      } else {
+        if (metered !== null && take > metered) this.noteExternalDrain();
+        this.resolveDrained();
       }
       throw error;
     } finally {
@@ -1545,12 +1273,7 @@ export class StreamSession {
    * `take === 0` too — a flush with no budget still snaps a cut parked at a
    * destination whose `)` just arrived, so the wait is one arrival, not one
    * budget refill. The snapped cut is retreated to a cluster boundary like
-   * any other (the landing spot, just past `)`, is a boundary unless a
-   * combining mark follows the paren — the retreat can only pull the cut
-   * back inside the destination the next flush skips again), and the
-   * skipped characters are deliberately not charged to the smoother —
-   * catch-up over invisible text must not indebt the visible tail into a
-   * pause.
+   * any other, and the skipped characters are not charged to the smoother.
    */
   private snapTakePastLinkDestination(take: number, cut: number): number {
     const contextTail = this.source.slice(-LINK_SNAP_WINDOW);
@@ -1586,16 +1309,7 @@ export class StreamSession {
     }
   }
 
-  /**
-   * Give up on the buffered tail after {@link MAX_DRAIN_RETRIES} refused
-   * drains: arm no further timer, and settle everyone parked on `drained()`
-   * with the engine's own error rather than leaving them waiting on a drain
-   * that is not coming. The text stays in `pending` — see
-   * {@link drained} — and the error itself still propagates out of the
-   * caller that hit the limit (the idle timer callback, for a scheduled
-   * drain), which is where a buffered session has always surfaced an engine
-   * failure.
-   */
+  /** The text stays in `pending`; see {@link drained}. */
   private abandonDrain(error: unknown): void {
     this.drainAbandoned = error;
     if (this.drainedWaiters.length === 0) {
@@ -1610,6 +1324,7 @@ export class StreamSession {
 
   private armIdleDrain(delayMs = this.holdIdleMs): void {
     this.clearIdleDrain();
+    if (this.disposed || this.suspended) return;
     this.cancelIdleDrain = this.idleScheduler(() => {
       this.cancelIdleDrain = null;
       this.drainPending();
@@ -1635,9 +1350,8 @@ export class StreamSession {
    * divergent replace, which can take no shortcut).
    */
   private update(delta: string | null): void {
-    // Before the anchor, because a link reference definition can change how
-    // text ANYWHERE in the document parses — including inside a block the
-    // anchor already froze.
+    // Before the anchor: a definition can change how text anywhere parses,
+    // frozen blocks included.
     this.scanForLinkReferenceDefinitions();
     // The delta may have completed a blank-line boundary that lets blocks
     // from the previous parse freeze now, shrinking this parse's input.
@@ -1662,9 +1376,6 @@ export class StreamSession {
       this.repairOptions,
       carried,
     );
-    // `RepairResult.scan` is optional on the type (a wrapper around
-    // `repairTail` need not produce one); absent means the same as null —
-    // nothing to resume from next append.
     this.tailScan = repaired.scan ? { anchor, scan: repaired.scan } : null;
     const tailDoc = this.parse(repaired.text);
     const shifted = tailDoc.blocks.map((b) => shiftSpans(b, anchor));
@@ -1715,9 +1426,7 @@ export class StreamSession {
     const tail = all.slice(this.frozen.length);
     const trimmed = trimTrailingPlaceholders(tail);
     if (trimmed === tail) {
-      // Nothing to trim, and every caller builds `all` as frozen prefix ++
-      // tail, so it already is the answer: re-splicing would copy the whole
-      // block list a second time on every append.
+      // `all` is always frozen ++ tail, so it already is the answer.
       return all;
     }
     return [...this.frozen, ...trimmed];
@@ -1837,8 +1546,6 @@ export class StreamSession {
    */
   private advanceAnchor(blocks: Block[]): void {
     if (this.hasLinkReferenceDefinition) {
-      // Nothing can be frozen once a definition is in play: it can rewrite
-      // any block in the document. See `scanForLinkReferenceDefinitions`.
       return;
     }
     let scanned = this.anchor;
@@ -1860,10 +1567,6 @@ export class StreamSession {
       if (state.openFence !== null) {
         continue;
       }
-      // Belt and braces: a candidate always sits after a blank line, and
-      // `continueSeed` clears `inMath` there (a math span is inline and
-      // cannot cross a block boundary), so this cannot fire today. It stays
-      // as the guard for any future seed state that CAN reach a candidate.
       if (state.inMath && this.resolved.extensions.math) {
         continue;
       }
@@ -1874,16 +1577,9 @@ export class StreamSession {
     if (bestAnchor > this.anchor) {
       this.anchor = bestAnchor;
       this.seedAtAnchor = bestState;
-      // The tail is `source.slice(anchor)`, so a moved anchor renames every
-      // offset in the carried repair scan. (`update` checks the recorded
-      // anchor too; dropping it here is what keeps the record from outliving
-      // the tail it describes.)
+      // A moved anchor renames every offset in the carried repair scan.
       this.tailScan = null;
-      // Only the newly frozen blocks are appended and registered. Rebuilding
-      // the prefix and re-walking ALL of it through `rememberFrozen` on every
-      // advance made a stream's anchor bookkeeping quadratic in its block
-      // count; the blocks below `frozen.length` are the same objects they
-      // were, by the precondition above.
+      // Blocks below `frozen.length` are unchanged, so register only new ones.
       for (let i = this.frozen.length; i <= bestIndex; i += 1) {
         this.frozen.push(blocks[i]);
         this.rememberFrozen(blocks[i]);
@@ -1892,39 +1588,10 @@ export class StreamSession {
   }
 
   /**
-   * Watches the source for a link reference definition (`[label]: dest`) and,
-   * on the first one, switches the incremental anchor off for the rest of the
-   * stream.
-   *
-   * Definitions act at a distance, in both directions. One arriving at the
-   * END of a document turns a `[foo]` written in its first paragraph into a
-   * resolved reference link — a block the anchor may long since have frozen
-   * as literal text. One written EARLY turns a `[foo]` typed later into a
-   * link that the anchored tail parse, which never sees the definition
-   * because it sits before the anchor, would leave as literal text. Either
-   * way "settled" would stop meaning settled, so the session gives up
-   * freezing and reparses the whole source per append. The identity cache is
-   * KEPT (`resetIncrementalState(true)`): `remember` verifies a cached block
-   * structurally before reusing it, so blocks the definition did not
-   * actually change keep their objects through finalize while the rewritten
-   * ones are replaced.
-   *
-   * It has to be a source scan: md4c reports a definition through no block of
-   * its own (the line simply produces nothing), so there is no node to notice
-   * afterwards.
-   *
-   * Definitions are found behind container markers (`- [foo]: /url`,
-   * `> [foo]: /url`), behind the CONTENT INDENT those containers establish
-   * (a definition written at a list item's content column, with no marker of
-   * its own — see {@link noteContainerIndent}), and across a line break in
-   * the label (`[foo` / `bar]: /url`), because md4c honours all of those and
-   * each one rewrites text above it just the same.
-   *
-   * Each line is examined once, and a line still growing resumes where the
-   * last append left off (`refLineScanned`) rather than being re-read from
-   * its start — including the paragraph line that opens with `[` and has no
-   * `]` yet, which is the shape that would otherwise cost a full rescan per
-   * append.
+   * On the first link reference definition, switches the incremental anchor
+   * off for the rest of the stream: a definition rewrites a `[foo]` before or
+   * after it, frozen blocks included. A source scan, because md4c emits no
+   * node for a definition. A growing line resumes at `refLineScanned`.
    */
   private scanForLinkReferenceDefinitions(): void {
     if (this.hasLinkReferenceDefinition) {
@@ -1933,8 +1600,17 @@ export class StreamSession {
     let lineStart = this.refScanFrom;
     for (;;) {
       const nl = this.source.indexOf('\n', lineStart);
+      if (this.refLineRuledOut && nl === -1) {
+        this.refScanFrom = lineStart;
+        return;
+      }
       const line = this.source.slice(lineStart, nl === -1 ? undefined : nl);
-      if (!this.refLineRuledOut) {
+      const fence = referenceFenceLine(line, this.refFence, this.refContainerIndent);
+      if (nl !== -1) this.refFence = fence.fence;
+      if (fence.code) {
+        this.refLabelOpen = false;
+        if (nl === -1) this.refLineRuledOut = true;
+      } else if (!this.refLineRuledOut) {
         const scan = linkReferenceDefinitionState(
           line,
           this.refLabelOpen,
@@ -1949,25 +1625,17 @@ export class StreamSession {
         }
         if (nl === -1) {
           this.refLineRuledOut = scan.state === 'no';
-          // A line that is still only indentation or a half-typed marker has
-          // not been READ yet, it has been measured — so the next append must
-          // re-run the candidate test from column 0 rather than resume the
-          // label hunt. Resuming it made a char-by-char stream answer
-          // differently from a line-by-line one on the same source: '- ' seen
-          // on its own left `from > 0`, which skips the "could this line even
-          // be a definition" test, and `- see [a]: b` then read as one.
+          // An indentation-only line was measured, not read: re-test it from
+          // column 0 on the next append.
           this.refLineScanned =
             this.refLineRuledOut || scan.state === 'growing' ? 0 : scan.scanned;
         } else {
-          // A label left open by a finished line continues on the next one.
           this.refLabelOpen = scan.state === 'open';
         }
       } else if (nl !== -1) {
-        // A ruled-out line opens no label for the next one either.
         this.refLabelOpen = false;
       }
       if (nl === -1) {
-        // The last line is still growing: leave the cursor on it.
         this.refScanFrom = lineStart;
         return;
       }
@@ -1979,17 +1647,8 @@ export class StreamSession {
   }
 
   /**
-   * Carry the container context of a FINISHED line to the next one, so a
-   * definition written at a list item's content column is read at that
-   * column ({@link contentStart}).
-   *
-   * The indent only comes DOWN on evidence that the containers really
-   * closed: a non-blank line at a shallower column that follows a blank one,
-   * which in CommonMark starts a new top-level block. A shallower line that
-   * does NOT follow a blank one is a lazy paragraph continuation and leaves
-   * every container open — dropping the indent there would put the scan back
-   * to reading `    [foo]: /url` as indented code, which is the miss this
-   * whole mechanism exists to prevent. Erring high only costs anchoring.
+   * The indent only drops after a blank line: a shallower line without one is
+   * a lazy continuation, and erring high only costs anchoring.
    */
   private noteContainerIndent(line: string): void {
     const blank = /^[ \t\r]*$/.test(line);
@@ -2026,14 +1685,8 @@ export class StreamSession {
    * block with the same kind, span AND structure is the same parse, so the
    * frozen object is returned and settled identity survives finalize.
    *
-   * The structural check is what makes "finalize equals a fresh
-   * `parseDocument`" unconditional. Kind and span do not pin a block's
-   * content — a construct that resolves at a distance can change what a span
-   * means without moving it — and substituting a cached block that no longer
-   * matches would smuggle a stale parse into the settled document. On a
-   * mismatch the fresh block wins and takes over the cache entry. It costs
-   * one structural walk of the settled prefix, once per stream, on a path
-   * that already reparses the whole source.
+   * Kind and span alone do not pin content: a construct resolving at a
+   * distance can change what a span means without moving it.
    */
   private remember(block: Block): Block {
     const key = this.blockKey(block);
@@ -2047,7 +1700,7 @@ export class StreamSession {
 
   private commit(document: ParsedDocument, settledUntil: number): void {
     this.current = {
-      document,
+      document: { ...document, blocks: document.blocks.slice() },
       settledUntil,
       phase: this.phase,
       revision: ++this.revision,
@@ -2056,29 +1709,10 @@ export class StreamSession {
   }
 
   /**
-   * Hands `this.current` to every listener, in revision order even when a
-   * listener mutates the session from inside its own callback.
-   *
-   * Delivery is a synchronous loop over the listener set, so a listener that
-   * appends (or finalizes) commits revision N+1 while the outer pass is only
-   * part-way through revision N. Recursing there would deliver N+1 to the
-   * listeners after it and only then hand THEM the older N — a listener that
-   * stores its argument would end on a stale document. The nested commit
-   * therefore just marks the pass dirty; the outer loop finishes, then runs
-   * again with the newest snapshot for everyone.
-   *
-   * Two failure modes are handled explicitly, because this loop is the one
-   * place a consumer's code runs inside the session:
-   *
-   * - A listener that mutates on EVERY callback never lets the loop settle.
-   *   Recursion used to end that in a stack overflow; a loop would simply
-   *   hang, which is worse to diagnose, so `MAX_NOTIFY_PASSES` ends it with
-   *   an error that names the cause.
-   * - A listener that throws must not cost the listeners after it their
-   *   snapshot, and must not abandon a pending pass — that would leave every
-   *   other listener a revision behind `snapshot()` for good. Delivery
-   *   therefore completes, and the first error is rethrown once the loop is
-   *   done.
+   * Hands `this.current` to every listener in revision order: a re-entrant
+   * commit marks the pass dirty instead of recursing, so no listener ends on
+   * an older revision. A throwing listener does not cost the others their
+   * snapshot; the first error is rethrown after delivery.
    */
   private notify(): void {
     if (this.notifying) {
@@ -2093,12 +1727,12 @@ export class StreamSession {
         this.notifyPending = false;
         const snap = this.current;
         if (snap === null) {
-          // Unreachable: `notify` is only ever called by `commit`, which has
-          // just assigned it.
+          // Unreachable: only `commit` calls this, right after assigning it.
           break;
         }
         passes += 1;
         if (passes > MAX_NOTIFY_PASSES) {
+          if (failure !== null) throw failure.error;
           throw new Error(
             `StreamSession: a subscriber kept mutating the session from its own callback for ${MAX_NOTIFY_PASSES} rounds of notifications. A listener that appends, replaces or finalizes on every snapshot never terminates — mutate conditionally, or schedule the mutation outside the callback.`,
           );

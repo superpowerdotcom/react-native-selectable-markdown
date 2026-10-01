@@ -1,17 +1,6 @@
 import type { AnyNode, ParsedDocument } from './nodes';
 
-/**
- * What a visitor may say about the rest of the traversal:
- *
- * - nothing (`undefined`): keep going, children included.
- * - `false`: SKIP this node's children; the walk continues with its siblings.
- * - `'stop'`: END the whole traversal, right here.
- *
- * The two signals are different questions — "is there anything worth seeing
- * under this node?" and "have I seen enough?" — and a walk that answers only
- * the first forces every search to be written by hand off `childrenOf`, which
- * is exactly what `runs.ts` used to do.
- */
+/** `false` skips this node's children; `'stop'` ends the whole traversal. */
 export type VisitSignal = void | false | 'stop';
 
 export type Visitor = (node: AnyNode, parent: AnyNode | null) => VisitSignal;
@@ -47,25 +36,15 @@ export function childrenOf(node: AnyNode): readonly AnyNode[] {
 /**
  * Pre-order traversal. Returning `false` from the visitor skips the node's
  * children (the traversal continues with its siblings); returning `'stop'`
- * ends the traversal outright, so a search does not have to walk the rest of
- * the document after it has found its answer.
+ * ends the traversal.
  */
 export function visit(node: AnyNode | ParsedDocument, fn: Visitor): void {
   walk('kind' in node ? [node] : node.blocks, fn);
 }
 
 /**
- * Depth-first, children left to right, OFF AN EXPLICIT STACK.
- *
- * Nesting depth is untrusted input: three kilobytes of `'> '` is 1500 levels
- * of blockquote, the native decoder builds its tree off a stack of its own
- * and so hands back a tree as deep as the source asks for, and a recursive
- * walk over it overflows the JS stack — inside React render, on the selection
- * path, wherever the walk happens to be called from. The two stacks below
- * hold the pending node and its parent in step (rather than one stack of
- * `{node, parent}` frames) so a traversal costs no allocation per node.
- * `mapSelection`'s projector and `runs.ts` avoid recursion for the same
- * reason.
+ * Iterative because nesting depth is untrusted input and recursion overflows
+ * the JS stack; parallel stacks, not frames, so no allocation per node.
  */
 function walk(roots: readonly AnyNode[], fn: Visitor): void {
   const nodes: AnyNode[] = [];

@@ -2,19 +2,9 @@
  * RNSMRunHostShadowNode — the measuring Fabric shadow node for
  * <SelectableRunHost>.
  *
- * WHY THE WHOLE PORT EXISTS, IN THE PAST TENSE, BECAUSE THE PATH IT REPLACED
- * IS GONE. Old-architecture leaf views got no measure function from React
- * Native, so the iOS host used to measure itself in `layoutSubviews` and
- * report back through `RCTUIManager.setIntrinsicContentSize(_:forView:)` —
- * *after* the frame had already been laid out at the wrong height. Every run
- * rendered at least one frame at the wrong size, and during streaming, where
- * the tail run's text changes on every snapshot, it did so continuously. That
- * was the prose-jumping artifact the rest of this library is built to
- * eliminate. Neither that reporting path nor the view manager that carried it
- * exists in this package any more — the `react-native >= 0.82` floor removed
- * the old architecture entirely, and `grep setIntrinsicContentSize platform/`
- * now matches nothing. The long form is docs/FABRIC-PLAN.md "Why do this at
- * all", which tells the same story without live line numbers.
+ * WHY THE WHOLE PORT EXISTS. A view that measures itself after layout renders
+ * at least one frame at the wrong height, continuously while streaming
+ * (docs/FABRIC-PLAN.md "Why do this at all").
  * `measureContent` below runs on the layout thread before the frame is
  * committed, so the first frame is the correct frame.
  *
@@ -115,22 +105,9 @@ class RNSMRunHostShadowNode final : public ConcreteViewShadowNode<
    *   `LayoutableShadowNode` by 0.86 and an inline call is
    *   `use of undeclared identifier` there.
    *
-   * - 0.86-era (react-native 0.86.0, read out of that tree): the base no
-   *   longer force-dirties in the constructor — the cloned yoga node inherits
-   *   the source's dirty flag — and `completeClone`, run by the component
-   *   descriptor *after* construction (ConcreteComponentDescriptor.h:84, so
-   *   virtual dispatch reaches a derived override), asks
-   *   `shouldNewRevisionDirtyMeasurement` whether the revision invalidates
-   *   measurement. `ParagraphShadowNode` answers `fragment.props != nullptr`
-   *   (ParagraphShadowNode.cpp:64-68 at 0.86.0) and so does the declaration
-   *   below. It deliberately carries no `override`: on 0.75-era headers there
-   *   is no base virtual and `override` is a compile error; where the virtual
-   *   exists the signature matches it exactly and overrides implicitly. The
-   *   risk of an implicit override — a signature drift that silently stops
-   *   overriding — is what the `static_assert` in the constructor exists
-   *   for: it probes the base for at least one live mechanism and turns
-   *   "neither" into a compile error instead of a silent full-document
-   *   re-measure per streamed token.
+   * - React Native 0.82+: completeClone asks
+   *   shouldNewRevisionDirtyMeasurement; like ParagraphShadowNode, we answer
+   *   fragment.props != nullptr.
    *
    * It also does something Paragraph cannot. Paragraph's content is built
    * from its *children*, so a clone must rebuild it; ours is a pure function
@@ -213,17 +190,9 @@ class RNSMRunHostShadowNode final : public ConcreteViewShadowNode<
   };
 
  protected:
-  /*
-   * The 0.86-era half of the clone guard — see the clone-constructor comment
-   * above for the whole shape, and the .cpp for the definition. No
-   * `override`, deliberately: the base virtual does not exist on 0.75-era
-   * headers. The signature is copied character for character from
-   * YogaLayoutableShadowNode.h at 0.86.0 so it overrides implicitly where
-   * the virtual exists.
-   */
   bool shouldNewRevisionDirtyMeasurement(
       const ShadowNode& sourceShadowNode,
-      const ShadowNodeFragment& fragment) const;
+      const ShadowNodeFragment& fragment) const override;
 
  private:
   /*

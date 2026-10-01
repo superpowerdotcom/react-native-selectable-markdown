@@ -2,22 +2,10 @@
 // Prints the CHANGELOG.md section for one version, for `gh release create
 // --notes-file`.
 //
-// WHY THE RELEASE DOES NOT USE `--generate-notes`. That flag writes notes from
-// the commits and pull requests in the tag range. `main` here is two squashed
-// commits ("Initial commit" at v0.10.0, one feature PR at v0.11.0), so the
-// generated notes for a release say "Initial commit" while README.md and
-// docs/FABRIC-PLAN.md discuss what 0.10.0 removed and 0.11.0 restored in
-// detail. A changelog section is the only place that history is written down
-// in the artifact a consumer sees.
-//
-// Exits non-zero when the section is missing, and the release workflow runs
-// this BEFORE the long gates so that a forgotten entry costs seconds rather
-// than a re-tag after a publish.
+// Not `--generate-notes`: main is squashed, so commit-derived notes say nothing.
+// Exits non-zero when the section is missing or empty.
 //
 //   node scripts/changelog-section.mjs v0.11.0   # or: 0.11.0
-//
-// Also usable as a lint: `node scripts/changelog-section.mjs "$(node -p
-// "require('./package.json').version")" > /dev/null`.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -31,8 +19,6 @@ if (!raw) {
   console.error('usage: node scripts/changelog-section.mjs <version|vX.Y.Z>');
   process.exit(2);
 }
-// Tags are `vX.Y.Z`; headings are `## [X.Y.Z] — date`. One `v` is the only
-// difference, so strip it rather than asking callers to.
 const version = raw.startsWith('v') ? raw.slice(1) : raw;
 
 if (!fs.existsSync(changelogPath)) {
@@ -41,8 +27,6 @@ if (!fs.existsSync(changelogPath)) {
 }
 
 const lines = fs.readFileSync(changelogPath, 'utf8').split('\n');
-// A section starts at its own `## [version]` heading and ends at the next
-// `## ` heading, or at the end of the file for the oldest entry.
 const isVersionHeading = (line) => /^##\s+\[?([^\]\s]+)\]?/.exec(line)?.[1] === version;
 const start = lines.findIndex(isVersionHeading);
 
@@ -64,13 +48,8 @@ for (let i = start + 1; i < lines.length; i += 1) {
   }
 }
 
-// Drop the heading itself: `gh release create` already titles the release with
-// the tag, and a repeated version line reads as a stutter in the release body.
-//
-// Trailing link-reference definitions go too. They sit at the bottom of the
-// file, so for the OLDEST section they fall inside the slice — and in a
-// release body they render as nothing at all, or as a stray `[0.10.0]:` line
-// depending on the renderer.
+// Drops the heading (gh titles the release with the tag) and trailing link
+// references, which fall inside the oldest section's slice.
 const section = lines.slice(start + 1, end);
 while (section.length > 0) {
   const last = section[section.length - 1];

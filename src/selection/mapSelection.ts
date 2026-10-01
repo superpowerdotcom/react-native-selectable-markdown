@@ -1,7 +1,9 @@
+import { IS_DEV } from '../dev';
 import type { AnyNode, Block, Inline, ParsedDocument } from '../document/nodes';
 import type { SourceSpan } from '../document/span';
+import { decodeEntityAt } from '../engine/entities';
 import type { EmbedContent, EmbedLookup, RunSegment } from './runs';
-import { embedContentFor } from './runs';
+import { constrainsEmbedWidth, embedContentFor } from './runs';
 
 export interface ProjectedRun {
   text: string;
@@ -15,35 +17,18 @@ export interface ProjectedRun {
    */
   embeds?: ProjectedRunEmbed[];
   /**
-   * Every construct whose SOURCE holds characters its projection does not
-   * show, outermost first — what `mapSelectionToSource` unions back in when a
-   * selection covers the whole of one. Absent when the run has none (plain
-   * prose with no markup at all).
+   * Every construct whose source holds syntax its projection does not show,
+   * outermost first; see `ProjectedExtent`. Absent when the run has none.
    */
   extents?: ProjectedExtent[];
 }
 
 /**
- * A construct's projected range paired with the source span it came from,
- * recorded ONLY when the two differ by characters no piece covers.
- *
- * WHAT IT IS FOR. A block's own syntax projects no text: the `# ` of a
- * heading, the `> ` of a quote, a list item's marker, a fence, a table's
- * pipes, and inline the `**` of a strong span or the `](url)` of a link. None
- * of it belongs to a piece, so the hull of the pieces a selection touched
- * cannot contain it — and copying that hull yields markdown that re-parses as
- * something else: a heading becomes body text, a list becomes a paragraph.
- * `mapSelectionToSource` therefore unions in an extent whenever the selection
- * covers the construct's WHOLE projected range, which is exactly the case
- * where the syntax is unambiguously part of what the user swept.
- *
- * A construct whose pieces already cover its whole span records nothing —
- * plain prose, an HTML block whose literal is its source — so this list holds
- * only what actually changes an answer.
- *
- * INCOMPLETE CONSTRUCTS ARE NOT RECORDED. A still-streaming heading or link
- * has a span that is still moving and syntax that is not written yet; copying
- * half of `[text](htt` is worse than copying `text`.
+ * A construct's projected range paired with its source span, recorded only
+ * when the source holds syntax no piece covers: a heading's `# `, a list
+ * marker, a link's `](url)`. `mapSelectionToSource` unions it in when a
+ * selection covers the whole projected range, so a whole construct copies
+ * with its syntax. Incomplete constructs are not recorded.
  */
 export interface ProjectedExtent {
   /** UTF-16 offsets into `ProjectedRun.text`, end-exclusive. */
@@ -66,18 +51,8 @@ export interface ProjectedRunEmbed {
   embedId: number;
   /**
    * UTF-16 offsets of the placeholder into `ProjectedRun.text`.
-   *
-   * `end === start + 1` ALWAYS — a placeholder is exactly one U+FFFC — and
-   * entries are recorded in ascending `start`. Together those two make the
-   * entries a strictly increasing, non-overlapping sequence in BOTH offsets,
-   * which is a load-bearing invariant and not just a description: consumers
-   * sweep the list in one pass and rely on `end` being non-decreasing as well
-   * as `start` (`embedLineHeightFloors` in src/view/runAttributes.ts retires
-   * covering attributes by `end` as it walks, and the copy-text substitution
-   * in `selectionDisplayText` walks the list backwards so earlier offsets stay
-   * valid). A multi-character or a zero-width placeholder would break both
-   * silently. `projectRun` is the only writer, and its embed task emits one
-   * character per claimed node.
+   * `end === start + 1` always and entries ascend by `start`; consumers sweep
+   * the list in one pass relying on both offsets increasing.
    */
   start: number;
   end: number;
@@ -225,15 +200,9 @@ export type MarkKind =
 /** The placeholder an embedded node projects: U+FFFC OBJECT REPLACEMENT
  * CHARACTER — the character both platforms' text systems already use to
  * stand for an inline attachment. Exported for consumers that post-process
- * projected text themselves.
- *
- * WHERE IT IS, AND WHERE IT IS NOT. `ProjectedRun.text` carries it, and so
- * does anything read straight off the native host — the platform's own Copy
- * included. A copy payload's `plain` does NOT: `handleSelectionAction`
- * substitutes each in-range placeholder for the embed's declared
- * `EmbedContent.text`, or deletes it when the claim declared none. So a
- * consumer scanning `plain` for this character finds nothing, and one
- * scanning `text` finds one per embed.
+ * projected text themselves. `ProjectedRun.text` and the native host's own
+ * Copy carry it; a copy payload's `plain` replaces each one with its
+ * `EmbedContent.text`, or removes it.
  */
 export const EMBED_PLACEHOLDER = '￼';
 
@@ -245,9 +214,8 @@ export const EMBED_PLACEHOLDER = '￼';
 //   - '\t'   between table cells
 //   - '• ' (bullet) before unordered list items
 //   - '<n>. '  before ordered list items (n = list.start ?? 1, incrementing)
-//   - '☑ ' / '☐ ' instead of the item's WHOLE marker for task list items —
-//            the bullet OR the ordinal, whichever the list would have used
-//            (see the `list` case)
+//   - '☑ ' / '☐ ' instead of the item's whole marker (bullet or ordinal) for
+//            task list items
 //   - '\n'   for a hard break, ' ' for a soft break — the two are not the same
 //            glyph, and the reason is on the `softBreak` case below
 // The separators are STRUCTURAL AND FIXED — they are what block boundaries,
@@ -278,7 +246,7 @@ const DEFAULT_GLYPHS: ProjectionGlyphs = {
   taskUnchecked: '☐ ',
 };
 
-const IS_DEV = typeof __DEV__ === 'boolean' ? __DEV__ : true;
+
 
 let warnedNewlineGlyph = false;
 
@@ -329,49 +297,26 @@ export interface ProjectRunOptions {
    */
   embed?: EmbedLookup;
   /**
-   * A projection of an earlier, SHORTER version of this same run, to extend
-   * instead of redoing. Ignored unless it is genuinely reusable; see
-   * `reusablePrefix` for the test and `PreviousProjection` for the contract.
-   *
-   * IT DOES NOT CARRY ITS OWN KEY, so the caller owns the same discipline the
-   * two options above spell out: a `previous` built with different glyphs or a
-   * different `embed` lookup would splice text projected under one set of rules
-   * onto text projected under another, and nothing here can tell. Callers that
-   * hold projections across renders should use `createRunProjectionCache`
-   * (src/view/projectionCache.ts), which keys on all three.
+   * A projection of an earlier, shorter version of this run, to extend
+   * instead of redoing; ignored unless `reusablePrefix` accepts it. It carries
+   * no key of its own, so it must have been projected with the same `glyphs`
+   * and `embed`. `createRunProjectionCache` (src/view/projectionCache.ts) keys
+   * on all three.
    */
   previous?: PreviousProjection;
 }
 
 /**
- * A projection to grow: the blocks it covered, and what it produced.
- *
- * `blocks` must be a PREFIX of the run's blocks BY IDENTITY. That is the whole
- * validity condition, and it is enough because a `Block` object belongs to one
- * parse of one source: `StreamSession` hands the same object back on every
- * later snapshot precisely because the source under it has frozen (docs/
- * STREAMING.md, "Identity"), and a block's subtree is immutable once parsed. So
- * the same blocks projected against the same glyph/embed key can only produce
- * the text they produced before, and the run's growth is pure APPEND — which is
- * the case this exists for: a settled prose run absorbs one newly settled block
- * per settle, and re-projecting the whole thing each time is what made view
- * work quadratic over a stream.
+ * A projection to grow. `blocks` must be a prefix of the run's blocks by
+ * identity: a parsed block's subtree is immutable, so the same blocks
+ * reproject to the same text and the run's growth is pure append.
  */
 export interface PreviousProjection {
   blocks: readonly Block[];
   projected: ProjectedRun;
 }
 
-/**
- * `previous` if it may be extended into `run`, else null.
- *
- * Identity, not equality: two structurally equal blocks from two different
- * parses are not interchangeable, because the source they index into is not.
- * The final length check is a cheap guard against the one way the invariant
- * could be violated from outside — a caller pairing a projection with a
- * document whose source has since been truncated (a `replace` that diverged),
- * where the reused prefix would map onto offsets that no longer exist.
- */
+/** The length check rejects a document whose source has since been truncated. */
 function reusablePrefix(
   run: RunSegment,
   doc: ParsedDocument,
@@ -402,19 +347,13 @@ function reusablePrefix(
  *
  * Real pieces whose display length equals their source length map
  * code-unit-for-code-unit; pieces whose display form differs from the source
- * keep their whole source range and are mapped as an indivisible unit. A node
- * whose display differs from its source only in places — a backslash escape,
- * an `&amp;`, an `&hellip;`, a smart quote — is covered by SEVERAL pieces
- * rather than pinned whole, so the respelling drags only itself; see
- * `literal`.
+ * keep their whole source range and are mapped as an indivisible unit. A
+ * respelling inside a node (an escape, an entity, a smart quote) is pinned
+ * alone rather than the whole node; see `literal`.
  *
- * With `options.previous` the projection is INCREMENTAL: the earlier
- * projection's text, pieces, marks and embeds are carried over and only the
- * blocks appended since are projected. The result is indistinguishable from a
- * projection from scratch — the corpus-scale proof of that is
- * conformance/selection/incremental-projection.test.ts — because the projector
- * is resumed in exactly the state it would have been in at that block
- * boundary; see the constructor.
+ * With `options.previous` only the blocks appended since are projected, and
+ * the result equals a projection from scratch
+ * (conformance/selection/incremental-projection.test.ts).
  */
 export function projectRun(
   run: RunSegment,
@@ -434,10 +373,7 @@ export function projectRun(
     : DEFAULT_GLYPHS;
   const reuse = reusablePrefix(run, doc, options?.previous);
   if (reuse !== null && reuse.blocks.length === run.blocks.length) {
-    // Nothing was appended. Returning the SAME object, not a copy: every memo
-    // downstream (attributes, decorations, pressables, embeds) keys on the
-    // projection's identity, so this is what makes a re-segmentation that
-    // changed nothing cost nothing.
+    // The same object, not a copy: downstream memos key on projection identity.
     return reuse.projected;
   }
   const projector = new RunProjector(
@@ -454,25 +390,9 @@ export function projectRun(
 }
 
 /**
- * One step of the projection walk.
- *
- * THE PROJECTOR RUNS THESE OFF AN EXPLICIT STACK INSTEAD OF RECURSING, AND
- * THE REASON IS UNTRUSTED INPUT. Markdown nesting depth is unbounded, and
- * three kilobytes of `'> '` is 1500 levels of blockquote — well inside what a
- * model can emit and nothing upstream caps it: the native decoder builds its
- * tree off an explicit stack (`decode.ts`), so it hands back a tree as deep as
- * the source asks for. The recursive form of this projector overflowed the JS
- * stack at roughly 1250 levels, and it did so inside the `useMemo` that
- * projects a run during React render — where a RangeError is not a dropped
- * frame but a torn-down tree. The stack below lives on the heap, so depth
- * costs memory and nothing else.
- *
- * `emit` and `literal` append text; `openMark`/`closeMark` bracket a
- * construct's range and record the mark when it closes, which is what keeps
- * `marks` in innermost-first push order for `finish` to sort;
- * `openExtent`/`closeExtent` do the same for the source span a construct's
- * syntax lives in (see `ProjectedExtent`); `block` and `inline` expand one
- * node into the tasks for its own text and its children.
+ * One step of the projection walk, run off an explicit stack because nesting
+ * depth is untrusted input: the recursive form overflowed at ~1250 levels of
+ * `> ` inside a render-time `useMemo`.
  */
 type ProjectionTask =
   | { op: 'block'; node: Block; topLevel: boolean; listDepth: number }
@@ -484,7 +404,6 @@ type ProjectionTask =
   | { op: 'openExtent'; source: SourceSpan }
   | { op: 'closeExtent' };
 
-/** A mark whose body is still being emitted. */
 interface OpenMark {
   kind: MarkKind;
   start: number;
@@ -492,21 +411,13 @@ interface OpenMark {
   href?: string;
 }
 
-/** An extent whose body is still being emitted. */
 interface OpenExtent {
   start: number;
   source: SourceSpan;
 }
 
-/** Shared empty task list — a node that expands to nothing (an embed claim,
- * a thematic break) returns this rather than allocating. */
 const NO_TASKS: ProjectionTask[] = [];
 
-/**
- * `body` bracketed by the mark tasks that record it: the task form of what
- * used to be `marked(kind, () => body())`, with the same rule that a mark
- * covering no text is dropped when it closes (see `closeMark`).
- */
 function marked(
   kind: MarkKind,
   body: ProjectionTask[],
@@ -516,7 +427,6 @@ function marked(
   return [{ op: 'openMark', kind, level, href }, ...body, { op: 'closeMark' }];
 }
 
-/** `tasksFor` over each item, with `separator` emitted between them. */
 function separated<T>(
   items: readonly T[],
   separator: string,
@@ -560,36 +470,16 @@ class RunProjector {
    * source span is exactly one code unit would otherwise read as linear and
    * merge into adjacent prose. */
   private embedPiece: RunPiece | null = null;
-  /** Tasks still to run, innermost last — `drain` takes from the end. */
   private readonly stack: ProjectionTask[] = [];
-  /** Marks whose body is still being emitted, innermost last. */
   private readonly openMarks: OpenMark[] = [];
-  /** Constructs whose source span outruns their pieces; see
-   * `ProjectedExtent`. */
   private readonly extents: ProjectedExtent[];
-  /** Extents whose body is still being emitted, innermost last. */
   private readonly openExtents: OpenExtent[] = [];
 
   /**
-   * `seed` RESUMES a projection at a top-level block boundary instead of
-   * starting one, which is what makes an append-only run cost only its append.
-   *
-   * The state restored is everything `emit` and `finish` read, and the boundary
-   * is why that is all of it: `openMarks` and `openExtents` are empty between
-   * top-level blocks (every mark and extent a block opens, it closes), and
-   * `stack` is empty because `drain` runs to exhaustion. So the resumed
-   * projector is in exactly the state the from-scratch one was in at the same
-   * point, and every later decision — piece merging, mark offsets, extent
-   * ranges, embed ids — falls out identically. The corpus-scale proof is
-   * conformance/selection/incremental-projection.test.ts, which deep-compares
-   * the whole projection at every block boundary of every corpus run.
-   *
-   * TWO THINGS ARE COPIED RATHER THAN SHARED, both because `seed` is still a
-   * live `ProjectedRun` that its holder may keep using. The arrays are sliced,
-   * so appending here does not lengthen theirs; and the LAST PIECE is cloned,
-   * because `emit` grows the last piece in place when the next chunk continues
-   * it. Everything else — the piece objects before the last, the embed and
-   * extent entries — is only ever read.
+   * `seed` resumes a projection at a top-level block boundary, where
+   * `openMarks`, `openExtents` and `stack` are always empty. Its holder may
+   * keep using it, so its arrays are sliced and its last piece cloned: `emit`
+   * grows the last piece in place.
    */
   constructor(
     private readonly source: string,
@@ -614,8 +504,7 @@ class RunProjector {
     if (last !== undefined) {
       const clone: RunPiece = { ...last };
       this.pieces[this.pieces.length - 1] = clone;
-      // Restore the atomic-embed-piece guard when the run ended on an embed,
-      // so a claimed node at the seam is no more mergeable than it was mid-run.
+      // The seed ended on an embed: keep its piece unmergeable across the seam.
       const lastEmbed = this.embeds[this.embeds.length - 1];
       if (
         lastEmbed !== undefined &&
@@ -627,17 +516,6 @@ class RunProjector {
     }
   }
 
-  /**
-   * Projects the run's blocks, which are direct children of the document —
-   * the only position that offers the embed lookup a top-level claim, and the
-   * only place list depth starts over at zero.
-   *
-   * `continuing` says these blocks follow ones already projected (a seeded
-   * projector), so the separator that would have been emitted between the last
-   * of those and the first of these leads the list. `separated` only ever puts
-   * separators BETWEEN the blocks it is given, which is exactly the one thing a
-   * resumed projection has to supply for itself.
-   */
   project(blocks: Block[], continuing = false): void {
     const tasks = separated(blocks, BLOCK_SEPARATOR, (block) => [
       { op: 'block', node: block, topLevel: true, listDepth: 0 },
@@ -652,14 +530,8 @@ class RunProjector {
     // Outermost-first at each offset: marks are pushed as their construct
     // *closes*, so the raw order is innermost-first and a consumer applying
     // them in sequence would let the outer construct overwrite the inner one.
-    //
-    // A SEEDED projector sorts an already-sorted head followed by raw new
-    // marks, and gets the same answer a from-scratch sort would: `Array#sort`
-    // is stable (required since ES2019), every seeded mark starts strictly
-    // before every new one (the appended blocks begin after a two-character
-    // BLOCK_SEPARATOR, and the only zero-length mark kind — `thematicBreak` —
-    // sits at most at the seam itself), and re-sorting a sorted head leaves it
-    // untouched. So ties keep their push order on both paths.
+    // Seeded marks all start before new ones, so the stable sort orders a
+    // seeded run exactly as a from-scratch one.
     const marks = this.marks
       .slice()
       .sort((a, b) => a.start - b.start || b.end - a.end);
@@ -670,10 +542,7 @@ class RunProjector {
     if (this.embeds.length > 0) {
       projected.embeds = this.embeds;
     }
-    // Extents sort exactly as marks do, and for the same reason: they are
-    // pushed as their construct closes, so the raw order is innermost-first,
-    // and a seeded projector sorts an already-sorted head followed by raw new
-    // entries to the same answer a from-scratch sort gives.
+    // Pushed as each construct closes, so sorted outermost-first like marks.
     if (this.extents.length > 0) {
       projected.extents = this.extents
         .slice()
@@ -682,7 +551,6 @@ class RunProjector {
     return projected;
   }
 
-  /** Runs `tasks` and everything they expand into, depth-first, in order. */
   private drain(tasks: ProjectionTask[]): void {
     this.push(tasks);
     for (;;) {
@@ -694,7 +562,6 @@ class RunProjector {
     }
   }
 
-  /** Pushed in reverse so the stack pops them in the order given. */
   private push(tasks: ProjectionTask[]): void {
     for (let i = tasks.length - 1; i >= 0; i -= 1) {
       this.stack.push(tasks[i]);
@@ -736,14 +603,8 @@ class RunProjector {
   }
 
   /**
-   * Records the mark whose body just finished. Empty ranges are dropped: a
-   * zero-width mark is not a construct anyone can style, and it would make
-   * every list item's bullet-only entry noise in the list.
-   *
-   * `level` and `href` stay off the mark when absent rather than riding along
-   * as `undefined`: marks are compared with deep equality in tests and
-   * serialized in debugging output, and a key that is present-but-undefined
-   * is a difference both of those see.
+   * Drops empty ranges, and leaves `level` and `href` off rather than
+   * `undefined` so marks deep-compare equal.
    */
   private closeMark(): void {
     const open = this.openMarks.pop();
@@ -760,12 +621,6 @@ class RunProjector {
     this.marks.push(mark);
   }
 
-  /**
-   * Records the extent whose body just finished, unless the pieces under it
-   * already say everything its span does — a construct that projects nothing
-   * (an empty range) or one whose syntax is not actually outside the range
-   * the body emitted.
-   */
   private closeExtent(): void {
     const open = this.openExtents.pop();
     if (open === undefined) {
@@ -774,13 +629,7 @@ class RunProjector {
     this.pushExtent(open.start, open.source);
   }
 
-  /**
-   * Records an extent over `[start, this.text.length)`, unless it says
-   * nothing: an empty range, or a repeat of the entry just pushed. The repeat
-   * is not hypothetical — a one-item list closes at the same offsets over the
-   * same span as its item, which is what a nested `- two` under `- one` is —
-   * and every duplicate would be walked again on every selection map.
-   */
+  /** Skips empty ranges and exact repeats, which a one-item list and its item produce. */
   private pushExtent(start: number, source: SourceSpan): void {
     const end = this.text.length;
     if (end <= start) {
@@ -800,20 +649,9 @@ class RunProjector {
   }
 
   /**
-   * The span an extent for `node` should carry, or null when it must not
-   * record one at all. THE ONE GATE, so the task form and the direct form
-   * cannot disagree about what is recordable.
-   *
-   * Three refusals. A SYNTHETIC node — or one whose span `realSpan` clamps
-   * away — has no source to point at. An INCOMPLETE one's span is still
-   * moving and its syntax is not written yet —
-   * copying half of `[text](htt` is worse than copying `text`. And a link or
-   * image whose destination is a DEFINITION somewhere else in the document
-   * (`[text]`, `[text][]`, `[text][label]`) is not self-contained: no slice
-   * of this selection can carry the definition, so copying the brackets would
-   * paste literal `[text]` where copying the words at least pastes the words.
-   * An inline destination is the only form that closes on ')', which is the
-   * whole of that test.
+   * The span an extent for `node` should carry, or null for a synthetic or
+   * incomplete node, or a reference-style link or image: no slice can carry
+   * its definition, and only an inline destination ends in ')'.
    */
   private extentSpan(node: AnyNode): SourceSpan | null {
     if (node.incomplete === true) {
@@ -832,11 +670,6 @@ class RunProjector {
     return span;
   }
 
-  /**
-   * `body` bracketed by the extent tasks that record this construct's own
-   * source span, so a selection covering the whole of it copies the syntax
-   * too.
-   */
   private extended(node: AnyNode, body: ProjectionTask[]): ProjectionTask[] {
     const source = this.extentSpan(node);
     if (source === null) {
@@ -856,11 +689,10 @@ class RunProjector {
    * a neighbour, because `mapSelectionToSource` treats it as an indivisible
    * unit (display length ≠ source length) — that is what makes a sweep
    * across the card yield the node's whole markdown. The mark is pushed
-   * directly too: the `openMark`/`closeMark` pair exists for ranges a body
-   * emits, and this range is known outright.
+   * directly too, since its range is known outright.
    */
   private tryEmbed(node: AnyNode, topLevel = false): boolean {
-    const content = embedContentFor(node, this.embedLookup, topLevel);
+    const content = embedContentFor(node, this.embedLookup, topLevel, this.withinContainer, node === this.soleParagraphChild);
     if (content === undefined) {
       return false;
     }
@@ -908,11 +740,18 @@ class RunProjector {
     this.pieces.push({ textStart, textEnd: this.text.length, source });
   }
 
+  private withinContainer = false;
+  private soleParagraphChild: AnyNode | null = null;
+
   private blockTasks(
     node: Block,
     topLevel: boolean,
     listDepth: number,
   ): ProjectionTask[] {
+    if (topLevel) {
+      this.withinContainer = constrainsEmbedWidth(node);
+      this.soleParagraphChild = node.kind === 'paragraph' && node.children.length === 1 ? node.children[0] : null;
+    }
     if (this.tryEmbed(node, topLevel)) {
       return NO_TASKS;
     }
@@ -920,14 +759,11 @@ class RunProjector {
       case 'paragraph':
         return inlineSeq(node.children);
       case 'heading':
-        // Extended: the `# ` (or the setext underline) is the difference
-        // between copying a heading and copying a line of body text.
         return this.extended(
           node,
           marked('heading', inlineSeq(node.children), node.level),
         );
       case 'blockquote':
-        // Extended: every line's `> ` is chrome the projection drops.
         return this.extended(
           node,
           marked(
@@ -942,19 +778,10 @@ class RunProjector {
         // amount of them could hang-indent a wrapped line. Indentation is the
         // view layer's job (runDecorations.ts), driven by these marks.
         const depth = listDepth + 1;
-        // Extended twice over: the whole list, so selecting all of it copies
-        // a list, and each item, so selecting one item copies an item. The
-        // item's span is what carries its marker — the projected glyph is
-        // synthetic and maps to no source at all.
         return this.extended(
           node,
           separated(node.items, ITEM_SEPARATOR, (item, index) => {
-          // A TASK GLYPH REPLACES THE ITEM'S WHOLE MARKER IN BOTH LIST KINDS,
-          // not just a bullet: `item.task` is tested before `node.ordered`,
-          // so `1. [x] done` projects '\u2611 done' and the ordinal is gone.
-          // The checkbox is the thing the reader acts on, and two markers in
-          // front of one line reads as chrome; the number is still in the
-          // source, which is what copying the item yields either way.
+          // A task glyph replaces the ordinal too: `1. [x] done` projects '\u2611 done'.
           const glyph =
             item.task === 'checked'
               ? this.glyphs.taskChecked
@@ -1025,10 +852,7 @@ class RunProjector {
         // Contributes no selectable text — a rule is chrome, and injecting a
         // glyph for it would put characters in the copy that the author never
         // wrote. What it leaves behind instead is a ZERO-LENGTH mark at this
-        // offset (pushed directly: a closing mark drops an empty range by
-        // design), which is how the view layer knows where to draw the rule.
-        // The surrounding BLOCK_SEPARATORs give it a blank line to be drawn
-        // in.
+        // offset, pushed directly because `closeMark` drops empty ranges.
         this.marks.push({
           kind: 'thematicBreak',
           start: this.text.length,
@@ -1055,8 +879,6 @@ class RunProjector {
       case 'strikethrough':
       case 'underline':
       case 'spoiler':
-        // Extended: the delimiters are the construct. Sweeping exactly the
-        // bold words and copying `bold words` loses the bold.
         return this.extended(node, marked(node.kind, inlineSeq(node.children)));
       case 'link':
         // Three outcomes, not two, and the middle one is the point.
@@ -1089,8 +911,6 @@ class RunProjector {
           undefined,
           node.href,
         );
-        // Extended when the source carries its own destination; see
-        // `extentSpan` for the reference-link case, which does not.
         return this.extended(node, linked);
       case 'codeSpan':
         return marked('code', [{ op: 'literal', node, display: node.value }]);
@@ -1156,33 +976,16 @@ class RunProjector {
 
   /**
    * Emits display text for a node whose rendered form may differ from its
-   * source, pinning it to as small a source range as the two forms allow.
-   * Three outcomes, in order of preference:
+   * source, pinning it to as small a source range as the two forms allow:
    *
-   * 1. The display text occurs verbatim inside the node's source slice
-   *    (plain text, a code span's content, a fenced block's body): the piece
-   *    is pinned to that exact sub-span and offsets map 1:1.
-   * 2. It does not, but the slice still spells the display piecewise — what a
-   *    backslash escape (`\*` → `*`), an entity that decodes to a character
-   *    the source already spells (`&amp;` → `&`), a respelled character
-   *    (`&hellip;` → `…`, `--` → `–`, `"` → `“`) or an indented code block's
-   *    stripped indent leaves behind. `alignLiteral` covers the display with
-   *    LINEAR pieces wherever the two agree and one INDIVISIBLE piece over
-   *    each stretch that is respelled, so a respelling costs only itself.
-   *    THIS IS NOT A MICRO-OPTIMIZATION: the native decoder merges an
-   *    escape's or an entity's text events into ONE text node spanning the
-   *    whole run (`appendText` in src/engine/native/decode.ts), and in plain
-   *    prose that node is the entire paragraph — so before this, a single
-   *    `\*` or `&hellip;` anywhere in a paragraph made a twelve-character
-   *    selection copy all hundred-odd characters of it.
-   * 3. No alignment exists at all: NOTHING in the display is spelled anywhere
-   *    in the slice (a repaired break marker, alt text against a span that no
-   *    longer holds it). The piece then keeps the whole node span and maps as
-   *    an indivisible unit. A slice that merely runs out early is NOT this
-   *    case — `alignLiteral` folds the unmatched tail into its last piece —
-   *    and the difference is load-bearing: the whole-span pin is only safe
-   *    when nothing matched, because a display and a slice of equal length
-   *    read as linear whether or not they say the same thing.
+   * 1. The display occurs verbatim in the node's slice: one linear piece.
+   * 2. Otherwise `alignLiteral` covers it with linear pieces where the two
+   *    agree and one indivisible piece per respelled stretch (`\*`,
+   *    `&hellip;`, a smart quote, a stripped indent). The native decoder
+   *    merges a paragraph's text into one node, so pinning it whole would make
+   *    any selection near a respelling copy the whole paragraph.
+   * 3. Nothing in the display is spelled in the slice: one indivisible piece
+   *    over the whole node span.
    */
   private literal(node: AnyNode, display: string): void {
     if (display.length === 0) {
@@ -1196,29 +999,27 @@ class RunProjector {
     const start = this.text.length;
     const raw = this.source.slice(span.start, span.end);
     const from = contentStart(node, raw);
+    // Only text and alt text arrive decoded; elsewhere `&copy;` displays as typed.
+    const refs =
+      node.kind === 'text' || node.kind === 'image'
+        ? scanReferences(raw, from)
+        : null;
     const at = raw.indexOf(display, from);
-    if (at >= 0) {
+    // A hit inside a reference is a coincidence: `&amp;amp` displays `&amp`,
+    // which the slice spells at 0, inside the entity.
+    if (at >= 0 && !overlapsReference(refs, at, at + display.length)) {
       this.emit(display, {
         start: span.start + at,
         end: span.start + at + display.length,
       });
-      // A construct whose content sits INSIDE its source — a code span's
-      // backticks, a fenced block's fences, an autolink's angle brackets, an
-      // image's `![...](...)`. The piece pins the content; the extent is what
-      // puts the delimiters back when the whole of it is selected. Two kinds
-      // of literal record nothing here: one that occupies its whole slice
-      // (plain prose, an HTML block), because there is nothing outside the
-      // piece; and a TEXT node, because whatever surrounds its value is
-      // markup the parse has already decided to drop — a link the URL policy
-      // degraded to text keeps the brackets in its span, and copying `[foo]`
-      // for the word `foo` would paste brackets that mean nothing where they
-      // land.
+      // Text records no extent: syntax around its value is markup the parse
+      // dropped, like the brackets of a link the URL policy degraded.
       if (node.kind !== 'text' && (at > 0 || display.length < raw.length)) {
         this.recordExtent(node, start);
       }
       return;
     }
-    const cover = alignLiteral(display, raw, from);
+    const cover = alignLiteral(display, raw, from, refs);
     if (cover === null) {
       // The whole span IS the piece, so an extent over it would say nothing.
       this.emit(display, span);
@@ -1226,11 +1027,8 @@ class RunProjector {
     }
     for (const piece of cover) {
       const chunk = display.slice(piece.display, piece.display + piece.length);
-      // `sourceLength === 0` is display the slice does not account for at all
-      // — an indented code block's leftover indent, which md4c SYNTHESIZES as
-      // spaces (md4c.c:5355-5357) rather than reporting from the source. It
-      // is a glyph like a bullet: real on screen, backed by nothing, so it
-      // maps to no source rather than to an empty span.
+      // md4c synthesizes an indented code block's leftover indent
+      // (md4c.c:5355-5357), so it maps to no source, like a bullet.
       this.emit(
         chunk,
         piece.sourceLength === 0
@@ -1241,18 +1039,9 @@ class RunProjector {
             },
       );
     }
-    // The cover skips whatever the source spells differently — a backslash,
-    // an entity, a fence, an indent. Selecting the whole literal should still
-    // copy all of it.
-    this.recordExtent(node, start);
+    if (node.kind !== 'text') this.recordExtent(node, start);
   }
 
-  /**
-   * An extent over the text emitted since `start`, for a construct whose
-   * pieces do not reach the edges of its span. The task pair exists for
-   * constructs with a BODY; this is the direct form, for the ones that emit
-   * one literal and know their own range outright.
-   */
   private recordExtent(node: AnyNode, start: number): void {
     const source = this.extentSpan(node);
     if (source !== null) {
@@ -1275,15 +1064,8 @@ class RunProjector {
 }
 
 /**
- * Where a literal's content can start inside the node's own source slice.
- * Zero for everything except a FENCED CODE BLOCK, whose slice opens with the
- * fence line: searching from 0 lets the body match inside the INFO STRING
- * when the two coincide (```` ```js\njs\n``` ````), which pins the piece to
- * the fence line and maps every offset in the block onto the wrong source
- * range — the lengths still agree, so the piece reads as linear and nothing
- * downstream notices; the copied markdown just repeats the code line and
- * loses the opening fence. A fenced body always starts after the first line
- * break.
+ * Past the fence line for a fenced code block, so a body equal to the info
+ * string (```` ```js\njs\n``` ````) cannot match inside the fence.
  */
 function contentStart(node: AnyNode, raw: string): number {
   if (node.kind !== 'codeBlock' || !node.fenced) {
@@ -1294,14 +1076,9 @@ function contentStart(node: AnyNode, raw: string): number {
 }
 
 /**
- * One piece of an `alignLiteral` cover: `length` display code units starting
- * at `display` stand for `sourceLength` source code units starting at
- * `source` (both offsets relative to their own string).
- *
- * `sourceLength === length` is a LINEAR piece — the two agree character for
- * character, and `mapSelectionToSource` maps offsets through it one for one.
- * Anything else is INDIVISIBLE: the source spells that stretch differently,
- * so any selection touching it maps to the whole of it.
+ * `length` display code units at `display` standing for `sourceLength` source
+ * code units at `source`: linear when the lengths are equal, indivisible
+ * otherwise.
  */
 interface AlignedPiece {
   display: number;
@@ -1312,61 +1089,26 @@ interface AlignedPiece {
 
 /**
  * Covers `display` with pieces against `raw`, consuming `raw` monotonically
- * from `from`. Returns null only when no cover exists at all (the slice runs
- * out before the display does), which leaves `literal` its whole-span pin.
- *
- * THE WALK HAS EXACTLY TWO MOVES, and the second is what makes a respelling
- * cost only itself:
- *
- *  - where display and source agree, take the longest verbatim run and emit
- *    it as a LINEAR piece;
- *  - where they do not, RESYNC: find the earliest later display character the
- *    source still spells ahead of the cursor, and cover everything between
- *    here and there with ONE indivisible piece. `\*` → `*` resyncs on the
- *    `*` itself, so nothing but the backslash is skipped and no indivisible
- *    piece is produced at all; `&hellip;` → `…` resyncs on the character
- *    after it, so the ellipsis alone is pinned to `&hellip;` and the prose on
- *    both sides stays linear; `"` → `“` resyncs the same way onto a
- *    one-for-one piece, which `emit` then merges straight into the linear
- *    prose around it. That last case is why a smart-punctuation paragraph is
- *    one linear piece rather than one indivisible one.
- *
- * A resync always advances the display OR the source, so the walk terminates.
- * It advances the source in the ordinary respelling case; it advances the
- * display alone where the display carries characters the slice never had (an
- * indented code block's synthesized indent), and that piece is emitted with
- * no source at all. Source offsets never move backwards, so the pieces stay
- * in order and a hull over them stays tight.
+ * from `from`; null only when the slice runs out before anything matched.
+ * Agreeing stretches become linear pieces; at a divergence the walk resyncs
+ * and covers the gap with one indivisible piece, so a respelling costs only
+ * itself.
  */
 function alignLiteral(
   display: string,
   raw: string,
   from: number,
+  refs: References | null = null,
 ): AlignedPiece[] | null {
   const pieces: AlignedPiece[] = [];
   let d = 0;
   let r = from;
+  let resyncer: Resyncer | null = null;
   while (d < display.length) {
     if (r >= raw.length) {
-      // THE SOURCE RAN OUT FIRST. Nothing matched at all (`pieces` empty)
-      // means there is no cover to build and the caller keeps its whole-span
-      // pin. Otherwise the display has a TAIL the slice does not spell, and
-      // the honest answer is to fold that tail into the last piece — which
-      // makes that piece indivisible, because its display is now longer than
-      // the source it stands for.
-      //
-      // AN INDENTED CODE BLOCK IS THE CASE THIS EXISTS FOR, and returning
-      // null there was a correctness bug rather than a missed optimization.
-      // `\tfoo\tbaz\t\tbim\n` has slice `\tfoo\tbaz\t\tbim` (the indent in,
-      // the newline out — `widenCodeBlock`) against the literal
-      // `foo\tbaz\t\tbim\n` (the indent stripped by md4c, the newline kept).
-      // One leading tab traded for one trailing newline: THE TWO ARE THE SAME
-      // LENGTH. So the whole-span fallback produced a piece whose display
-      // length equalled its source length — which is exactly what
-      // `mapSelectionToSource` reads as linear — and every offset in the
-      // block mapped one character to the left, silently. Folding the tail in
-      // here pins the block to the source it actually came from and makes the
-      // piece indivisible, so the arithmetic that was wrong is not attempted.
+      // Fold the unspelled tail into the last piece, making it indivisible.
+      // A whole-span pin would read as linear for an indented code block (one
+      // tab in, one newline out: equal lengths) and map it off by one.
       if (pieces.length === 0) {
         return null;
       }
@@ -1374,17 +1116,27 @@ function alignLiteral(
       last.length += display.length - d;
       return pieces;
     }
-    const length = verbatimRun(display, d, raw, r);
+    const ref = refs?.at.get(r);
+    if (ref !== undefined) {
+      const shown = referenceDisplay(ref, display, d, raw, r);
+      if (shown > 0) {
+        // Atomic: copying `©` copies `&copy;`, never `&`.
+        pieces.push({ display: d, length: shown, source: r, sourceLength: ref.length });
+        d += shown;
+        r += ref.length;
+        continue;
+      }
+    }
+    const length = verbatimRun(display, d, raw, r, refs);
     if (length > 0) {
       pieces.push({ display: d, length, source: r, sourceLength: length });
       d += length;
       r += length;
       continue;
     }
-    const resync = nextResync(display, d, raw, r);
+    resyncer ??= new Resyncer(display, raw, from, refs);
+    const resync = resyncer.next(d, r);
     if (resync === null) {
-      // Nothing left in the display is spelled in the rest of the slice, so
-      // what remains of each stands for what remains of the other.
       pieces.push({
         display: d,
         length: display.length - d,
@@ -1394,8 +1146,6 @@ function alignLiteral(
       return pieces;
     }
     if (resync.display > d) {
-      // The display between here and the resync point is respelled in the
-      // source: one indivisible piece over both stretches.
       pieces.push({
         display: d,
         length: resync.display - d,
@@ -1403,31 +1153,29 @@ function alignLiteral(
         sourceLength: resync.source - r,
       });
     }
-    // `resync.display === d` is the escape case: the character is spelled the
-    // same, just further along (the backslash sits between), so the skipped
-    // source belongs to no piece at all.
+    // `resync.display === d` is an escape: the skipped backslash belongs to no piece.
     d = resync.display;
     r = resync.source;
   }
   return pieces;
 }
 
-/**
- * The length of the longest stretch that `display` and `raw` share starting
- * at `d` and `r`, never ending between the halves of a surrogate pair — a
- * piece boundary inside one would hand a consumer half a code point.
- */
 function verbatimRun(
   display: string,
   d: number,
   raw: string,
   r: number,
+  refs: References | null = null,
+  limit = Infinity,
 ): number {
   let length = 0;
   while (
+    length < limit &&
     d + length < display.length &&
     r + length < raw.length &&
-    display[d + length] === raw[r + length]
+    display[d + length] === raw[r + length] &&
+    // Stop at a reference: in `a &amp; b` the `&` is the entity's, not the prose's.
+    (length === 0 || refs === null || !refs.at.has(r + length))
   ) {
     length += 1;
   }
@@ -1442,92 +1190,228 @@ function verbatimRun(
 }
 
 /**
- * The nearest place the two strings can meet again, measured in characters
- * skipped — `(display' - d) + (source' - r)` — with the two candidates below
- * as the only contenders. Whole code points at a time on both sides, so a
- * resync never lands between the halves of a surrogate pair. Null when they
- * cannot meet again at all.
+ * The nearest place `display` and `raw` can meet again after a divergence,
+ * or null.
  *
- * WHY THERE ARE TWO CANDIDATES AND NOT JUST THE FIRST. The obvious rule —
- * walk the display forward and take the first code point that occurs later in
- * the slice — is right for a respelling, where the source spells something
- * the display does not (`\*` → `*`, `&hellip;` → `…`). It is badly wrong
- * where the DISPLAY carries something the source never had, because it will
- * happily jump the source cursor across real content to find a spurious
- * later match for the synthesized character. CommonMark example 274
- * (`1.      indented code`) is the case: md4c synthesizes one leading space
- * for the leftover indent, and matching that space against the space in
- * `indented code` skipped eight source characters and mis-aligned the whole
- * block. So the HELD candidate is considered too: keep the source cursor
- * where it is and advance the display to wherever the slice's character at
- * `r` turns up.
+ * Two candidates: `forward` takes the first later display code point the
+ * slice spells (right for a respelling like `\*` → `*`); `held` keeps the
+ * source cursor and advances the display (right where md4c synthesized display
+ * text, CommonMark example 274). The winner is the one followed by the longer
+ * verbatim run, not the one skipping fewer characters; a tie goes to `forward`.
  *
- * THE WINNER IS THE ONE THE TWO STRINGS AGREE FOR LONGEST AFTER IT, not the
- * one that skips fewest characters. Skip count picks wrong on the very next
- * block of that same example: `       more code` against the literal `more
- * code\n` skips seven source spaces the forward way and four display
- * characters the held way, so fewest-skipped chooses `held` and mis-aligns it
- * — while the verbatim run after each says 9 against 1 and chooses right. A
- * tie goes to `forward`, which is the rule that was here before this one and
- * the one every respelling case takes.
+ * Both cursors only move forward, so the indexes and `frontier` keep the whole
+ * walk linear. `spelled` never lists an offset inside a reference.
  */
-function nextResync(
-  display: string,
-  d: number,
-  raw: string,
-  r: number,
-): { display: number; source: number } | null {
-  const forward = forwardResync(display, d, raw, r);
-  const held = heldResync(display, d, raw, r);
-  if (held === null) return forward;
-  if (forward === null) return held;
-  const heldRun = verbatimRun(display, held.display, raw, held.source);
-  const forwardRun = verbatimRun(display, forward.display, raw, forward.source);
-  return heldRun > forwardRun ? held : forward;
-}
+class Resyncer {
+  private readonly spelled: CodePointIndex;
+  private readonly shown: CodePointIndex;
+  private frontier = 0;
 
-/**
- * The first display code point at or after `d` that occurs in `raw` strictly
- * after `r`, and where it occurs. Advances the source cursor by at least one,
- * so the piece it produces covers real source.
- */
-function forwardResync(
-  display: string,
-  d: number,
-  raw: string,
-  r: number,
-): { display: number; source: number } | null {
-  for (let i = d; i < display.length; ) {
-    const point = String.fromCodePoint(display.codePointAt(i) ?? 0);
-    const at = raw.indexOf(point, r + 1);
-    if (at >= 0) {
-      return { display: i, source: at };
+  constructor(
+    private readonly display: string,
+    private readonly raw: string,
+    from: number,
+    private readonly refs: References | null,
+  ) {
+    this.spelled = new CodePointIndex();
+    for (let i = from; i < raw.length; ) {
+      if (refs !== null) {
+        if (refs.interior[i] === 1) {
+          i += 1;
+          continue;
+        }
+        const ref = refs.at.get(i);
+        if (ref !== undefined && ref.value != null && ref.value.length > 0) {
+          this.spelled.add(ref.value.codePointAt(0) ?? 0, i);
+          i += ref.length;
+          continue;
+        }
+      }
+      const point = raw.codePointAt(i) ?? 0;
+      this.spelled.add(point, i);
+      i += point > 0xffff ? 2 : 1;
     }
-    i += point.length;
+    this.shown = new CodePointIndex();
+    for (let i = 0; i < display.length; ) {
+      const point = display.codePointAt(i) ?? 0;
+      this.shown.add(point, i);
+      i += point > 0xffff ? 2 : 1;
+    }
   }
-  return null;
+
+  /** `d` and `r` must never decrease from one call to the next. */
+  next(d: number, r: number): { display: number; source: number } | null {
+    const forward = this.forward(d, r);
+    const held = this.held(d, r);
+    if (held === null) return forward;
+    if (forward === null) return held;
+    // Only which run is longer matters, so both are capped.
+    const cap = RUN_COMPARISON_CAP;
+    const { display, raw, refs } = this;
+    const heldRun = verbatimRun(display, held.display, raw, held.source, refs, cap);
+    const forwardRun = verbatimRun(display, forward.display, raw, forward.source, refs, cap);
+    return heldRun > forwardRun ? held : forward;
+  }
+
+  /** The first display code point at or after `d` spelled strictly after `r`, so the source advances. */
+  private forward(d: number, r: number): { display: number; source: number } | null {
+    const { display } = this;
+    for (let i = Math.max(d, this.frontier); i < display.length; ) {
+      const point = display.codePointAt(i) ?? 0;
+      const at = this.spelled.next(point, r + 1);
+      if (at >= 0) {
+        this.frontier = i;
+        return { display: i, source: at };
+      }
+      i += point > 0xffff ? 2 : 1;
+    }
+    this.frontier = display.length;
+    return null;
+  }
+
+  /**
+   * The source held at `r` and the display advanced strictly past `d`;
+   * strictly, or `&fjlig;` against `fx` would resync onto itself forever.
+   */
+  private held(d: number, r: number): { display: number; source: number } | null {
+    const value = this.refs?.at.get(r)?.value;
+    const point =
+      (value != null && value.length > 0
+        ? value.codePointAt(0)
+        : this.raw.codePointAt(r)) ?? 0;
+    let at = this.shown.next(point, d);
+    if (at === d) at = this.shown.next(point, d + 1);
+    return at < 0 ? null : { display: at, source: r };
+  }
+}
+
+/** Past this many characters, two agreeing runs are as good as each other. */
+const RUN_COMPARISON_CAP = 256;
+
+/** Offsets by code point; `next` assumes `from` never decreases per code point. */
+class CodePointIndex {
+  private readonly lists = new Map<number, { at: number[]; cursor: number }>();
+
+  add(point: number, offset: number): void {
+    const list = this.lists.get(point);
+    if (list === undefined) {
+      this.lists.set(point, { at: [offset], cursor: 0 });
+    } else {
+      list.at.push(offset);
+    }
+  }
+
+  next(point: number, from: number): number {
+    const list = this.lists.get(point);
+    if (list === undefined) return -1;
+    let k = list.cursor;
+    while (k < list.at.length && list.at[k] < from) k += 1;
+    list.cursor = k;
+    return k < list.at.length ? list.at[k] : -1;
+  }
 }
 
 /**
- * The source cursor held at `r`, with the display advanced to the first place
- * at or after `d` that spells `raw`'s code point there. Always strictly after
- * `d` when it exists — the caller only asks after `display[d]` and `raw[r]`
- * have already failed to match — so the walk still advances.
+ * A character reference or backslash escape. `value` is its display, or null
+ * for a well-formed name the JS entity table lacks but md4c may decode.
  */
-function heldResync(
+interface Reference {
+  length: number;
+  value: string | null;
+}
+
+interface References {
+  at: Map<number, Reference>;
+  /** Start offsets, ascending. */
+  starts: number[];
+  /** 1 at every offset strictly inside a reference. */
+  interior: Uint8Array;
+}
+
+const NAMED_REFERENCE = /^&[A-Za-z][A-Za-z0-9]{0,31};/;
+
+/**
+ * The references `raw` spells from `from` on, or null when there are none.
+ * One left-to-right pass, so `\&copy;` is an escape and not an entity.
+ */
+function scanReferences(raw: string, from: number): References | null {
+  let found: Array<[number, Reference]> | null = null;
+  for (let i = from; i < raw.length; ) {
+    const code = raw.charCodeAt(i);
+    let ref: Reference | null = null;
+    if (code === 0x5c /* \ */ && i + 1 < raw.length) {
+      if (isAsciiPunctuation(raw.charCodeAt(i + 1))) {
+        ref = { length: 2, value: raw[i + 1] };
+      }
+    } else if (code === 0x26 /* & */) {
+      const decoded = decodeEntityAt(raw, i);
+      if (decoded !== null) {
+        ref = { length: decoded.length, value: decoded.value };
+      } else {
+        const named = NAMED_REFERENCE.exec(raw.slice(i, i + 34));
+        if (named !== null) {
+          ref = { length: named[0].length, value: null };
+        }
+      }
+    }
+    if (ref === null) {
+      i += 1;
+      continue;
+    }
+    (found ??= []).push([i, ref]);
+    i += ref.length;
+  }
+  if (found === null) {
+    return null;
+  }
+  const interior = new Uint8Array(raw.length);
+  for (const [start, ref] of found) {
+    interior.fill(1, start + 1, start + ref.length);
+  }
+  return {
+    at: new Map(found),
+    starts: found.map(([start]) => start),
+    interior,
+  };
+}
+
+function overlapsReference(
+  refs: References | null,
+  start: number,
+  end: number,
+): boolean {
+  if (refs === null) return false;
+  for (const at of refs.starts) {
+    if (at >= end) return false;
+    if (at + (refs.at.get(at)?.length ?? 0) > start) return true;
+  }
+  return false;
+}
+
+/** Display width of a decoded reference or an unknown name left literal. */
+function referenceDisplay(
+  ref: Reference,
   display: string,
   d: number,
   raw: string,
   r: number,
-): { display: number; source: number } | null {
-  const point = String.fromCodePoint(raw.codePointAt(r) ?? 0);
-  const at = display.indexOf(point, d);
-  if (at < 0) return null;
-  // A match landing on the low half of a surrogate pair is not that code
-  // point at all; `indexOf` of a whole code point cannot do that, but a
-  // defensive check costs nothing and the alternative is a split pair.
-  if (at > 0 && isHighSurrogate(display.charCodeAt(at - 1))) return null;
-  return { display: at, source: r };
+): number {
+  if (ref.value !== null) {
+    return display.startsWith(ref.value, d) ? ref.value.length : 0;
+  }
+  if (display.startsWith(raw.slice(r, r + ref.length), d)) {
+    return ref.length;
+  }
+  return 0;
+}
+
+function isAsciiPunctuation(code: number): boolean {
+  return (
+    (code >= 0x21 && code <= 0x2f) ||
+    (code >= 0x3a && code <= 0x40) ||
+    (code >= 0x5b && code <= 0x60) ||
+    (code >= 0x7b && code <= 0x7e)
+  );
 }
 
 function isHighSurrogate(code: number): boolean {
@@ -1542,17 +1426,8 @@ function isHighSurrogate(code: number): boolean {
  * source range. Returns null when the selection is empty, out of range, or
  * touches only synthetic glyphs.
  *
- * THE HULL IS CONSTRUCT-AWARE, and without that copy would be lossy in a way
- * no piece can express. A construct's own syntax projects no text — a
- * heading's `# `, a quote's `> `, a list item's marker, a fence, a table's
- * pipes, a strong span's `**` — so it belongs to no piece and cannot be in
- * the hull of the pieces a selection touched. Copying that hull yielded
- * markdown that re-parsed as something else: `- one\n- two` came back as
- * `one\n- two`, a paragraph. So every `ProjectedExtent` the selection covers
- * WHOLE is unioned in as well, which is exactly the case where the syntax is
- * unambiguously part of what the user swept. A selection that covers only
- * part of a construct still maps to the pieces alone, because half a list is
- * not a list and its markers would be a guess.
+ * Every `ProjectedExtent` the selection covers whole is unioned in, so a whole
+ * construct copies with its syntax; a partial one maps to its pieces alone.
  */
 export function mapSelectionToSource(
   projected: ProjectedRun,
@@ -1572,7 +1447,16 @@ export function mapSelectionToSource(
   let sourceStart = Number.POSITIVE_INFINITY;
   let sourceEnd = Number.NEGATIVE_INFINITY;
 
-  for (const piece of projected.pieces) {
+  const pieces = projected.pieces;
+  let lo = 0;
+  let hi = pieces.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (pieces[mid].textEnd <= start) lo = mid + 1;
+    else hi = mid;
+  }
+  for (let i = lo; i < pieces.length && pieces[i].textStart < end; i += 1) {
+    const piece = pieces[i];
     if (piece.source === null) {
       continue;
     }
@@ -1605,13 +1489,20 @@ export function mapSelectionToSource(
   }
 
   if (sourceStart >= sourceEnd || !Number.isFinite(sourceStart)) {
-    // No real piece was touched, so there is nothing to copy and no construct
-    // to complete — an all-synthetic selection maps to nothing, extents or
-    // not.
+    // An all-synthetic selection maps to nothing, even over a whole extent.
     return null;
   }
 
-  for (const extent of projected.extents ?? []) {
+  const extents = projected.extents ?? [];
+  lo = 0;
+  hi = extents.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (extents[mid].start < start) lo = mid + 1;
+    else hi = mid;
+  }
+  for (let i = lo; i < extents.length && extents[i].start < end; i += 1) {
+    const extent = extents[i];
     if (start > extent.start || extent.end > end) {
       continue;
     }
@@ -1624,4 +1515,27 @@ export function mapSelectionToSource(
   }
 
   return { start: sourceStart, end: sourceEnd };
+}
+
+export function selectionDisplayText(
+  projected: ProjectedRun,
+  start: number,
+  end: number,
+): string {
+  let plain = projected.text.slice(start, end);
+  const embeds = projected.embeds;
+  if (embeds === undefined) {
+    return plain;
+  }
+  for (let i = embeds.length - 1; i >= 0; i -= 1) {
+    const embed = embeds[i];
+    if (embed.start < start || embed.end > end) {
+      continue;
+    }
+    plain =
+      plain.slice(0, embed.start - start) +
+      (embed.content.text ?? '') +
+      plain.slice(embed.end - start);
+  }
+  return plain;
 }

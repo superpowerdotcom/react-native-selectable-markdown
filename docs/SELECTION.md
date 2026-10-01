@@ -68,7 +68,7 @@ everything that follows and always means *flowing*.
 3. A prose block containing a `VIEW_KINDS` node is standalone. `VIEW_KINDS`
    is `image` and `spoiler`. The image half is now the FALLBACK, not the
    usual path: the view claims image nodes as embeds by default
-   (`images: 'embed'`, `src/view/imageEmbeds.ts`), so an ordinary image
+   (`images: 'embed'`, `src/view/imageEmbeds.ts`), so a sole image in a top-level paragraph
    flows — one placeholder, a `spacing.imageWidth` × `spacing.imageHeight`
    reservation, the `image` renderer overlaid on it. What still reaches rule
    3 is what no claim covered: `images: 'standalone'`, a theme box that is
@@ -80,10 +80,9 @@ everything that follows and always means *flowing*.
    and because an embed reserves one fixed box at a single placeholder,
    which cannot wrap, so a multi-line spoiler cannot be expressed as one.
 
-The image embed has two limits: it draws at the theme's box rather than at
-the picture's intrinsic aspect ratio, and on iOS an image mid-paragraph is
-clamped to the paragraph's leading — the inline-chip constraint that applies
-to every `embed`.
+Built-in image embeds draw at the theme's box. Only sole images in top-level
+paragraphs are claimed; inline images and images inside containers retain
+standalone layout. Custom claims may opt into other placements.
 
 A flowing sequence whose blocks ALL project no text demotes to standalone
 runs, so every non-standalone run projects non-empty text. It is not only the
@@ -776,6 +775,12 @@ Three behaviours to design around:
    inside one selects all of it. Round-tripping through `getSelection()`
    widens once and then settles.
 
+A span crossing multiple runs selects only the first mounted, selectable run that accepts an intersecting range. `true` means that partial selection was accepted; it does not select across native hosts. The default 8000-character run budget makes this possible even within prose. Read `getSelection()` for the accepted source range.
+
+Built-in image overlays do not intercept pointer events, so linked images and selection starts reach the native host. Their alt text remains an overlay accessibility label and can be read after the host's text. `images="standalone"` restores the prior image layout and accessibility grouping. Inline and container images use standalone layout unless a consumer provides its own embed claim.
+
+On iOS, prose gaps and semantic elements follow document order. A fully covered run retains a final, labeled "Select text" control for the native selection rotor. Android keeps blockquote bars on the physical left; iOS follows each paragraph's leading edge.
+
 Attaching a ref switches the selection subscription on, because
 `getSelection()` has nothing to report otherwise; with neither a ref nor an
 `onSelectionChange` handler, no run does the per-frame mapping work.
@@ -1202,3 +1207,7 @@ iOS:
 3. **Clipboard.** `markdown` is byte-for-byte the source slice; `plain` is
    byte-for-byte the display slice, except that embed placeholders are
    substituted for their declared text.
+
+With `exclusiveSelection={false}`, `getSelection()` and `onSelectionChange`
+represent the most recently selected run that still has a selection. Clearing
+that run falls back to another live selection; `clearSelection()` clears all runs.

@@ -52,14 +52,9 @@ import { isUriLikeLabel } from './repair';
  * `StreamSession.notifyRunFinalized` forwards to it on the session's clock.
  * A plain pacing function remains a valid `Smoother` without it.
  *
- * `notifyReleased` is the optional settlement channel, called once per
- * metered flush with the number of units the session ACTUALLY released.
- * That is rarely the answer: the cluster-safe retreat releases less when the
- * cut lands inside one visible glyph (possibly nothing at all), and the link
- * snap releases more, budget-free. A policy that charges a budget for its
- * own answer must implement this and settle up, or a glyph it cannot yet
- * afford charges it every frame and the reveal stalls for good —
- * `createSmoother` does. A stateless pacing function needs nothing.
+ * `notifyReleased` gets the units the session actually released per metered
+ * flush, which the cluster retreat and link snap make differ from the answer.
+ * A policy that charges a budget for its answer must settle here or stall.
  */
 export type Smoother = ((
   releasable: string,
@@ -79,19 +74,9 @@ export interface SmootherContext {
    * `holdBackChars` tail beyond the releasable slice this call was handed. */
   pendingLength: number;
   /** UTF-16 length of the committed source (everything already released into
-   * the document). `sourceLength + pendingLength` is therefore the total text
-   * that has arrived so far — the signal an arrival-rate tracker samples. It
-   * only grows while text is appended, but it is not guaranteed monotone:
-   * `StreamSession.rewrite` swaps the unrevealed tail for a shorter one (the
-   * citation rewrite `[ApoB](fhir://…)` → `ApoB [1](#…)` shrinks it on every
-   * completion), and `replace` can shorten it for good, which lowers the
-   * pair. A tracker must therefore REBASE when it sees a drop — subtract it
-   * from the history the window still holds, as `createAdaptiveSmoother`
-   * does — so the next sample measures real arrival again. Sampling the dip
-   * raw reads as negative arrival and depresses the estimate for a whole
-   * rate window; merely clamping to a high-water mark depresses it for
-   * longer still, because arrival then has to re-fill the deleted region
-   * before the series moves at all. */
+   * the document). Not monotone: `rewrite` and `replace` can lower
+   * `sourceLength + pendingLength`, so an arrival tracker must rebase on a
+   * drop. */
   sourceLength: number;
 }
 
@@ -100,17 +85,9 @@ export interface SmootherOptions {
   charsPerSecond: number;
   /**
    * Where release cuts may land (default 'char'). 'word' only releases up
-   * to a whitespace boundary, so words appear whole: a word longer than the
-   * accrued budget is released at once and paid off as a pause afterwards,
-   * which keeps the average rate honest.
-   *
-   * Only meaningful for space-delimited scripts. Text written without
-   * spaces — Chinese, Japanese, Thai, Lao, Khmer — has no whitespace to cut
-   * at, so once the current "word" runs more than ~32 units past the
-   * accrued budget this mode degrades to 'char' instead of dumping the whole
-   * buffer in one flush and freezing while the debt repays; the same guard
-   * bounds an over-long word in any script (a long URL). Pick 'char'
-   * outright for text that is mostly not space-delimited.
+   * to a whitespace boundary, paying an over-budget word off as a pause. A
+   * word more than 32 units past the budget falls back to 'char', so prefer
+   * 'char' for scripts written without spaces.
    */
   boundary?: 'char' | 'word';
   /**
@@ -134,23 +111,13 @@ export interface SmootherOptions {
  */
 const MAX_CREDIT_MS = 100;
 
-/**
- * How far past the accrued budget `boundary: 'word'` may overdraw to finish
- * a word. Long enough for any real word (the longest words in common use are
- * around 20 units, and the overdraw is measured on top of whatever budget
- * already accrued); short enough that a whitespace-free run — a script
- * written without spaces, a bare URL — cannot be dumped in one flush.
- */
 const WORD_OVERDRAW_LIMIT = 32;
 
 /**
  * The standard rate-based `Smoother`. Stateful — one instance per session.
  *
- * Charges its budget for the answer it gives, then settles up through
- * `notifyReleased` with what the session really released — the retreat off a
- * cluster boundary can be as little as nothing. A driver that meters with
- * this policy but never settles (a hand-rolled loop) still paces correctly
- * on plain text; it can stall on a glyph wider than one credit window.
+ * A driver that never calls `notifyReleased` can stall on a glyph wider than
+ * one credit window.
  */
 export function createSmoother(options: SmootherOptions): Smoother {
   const rate = options.charsPerSecond;
@@ -173,19 +140,7 @@ export function createSmoother(options: SmootherOptions): Smoother {
   let budget = 0;
   /** What the last answer was charged, until `notifyReleased` settles it. */
   let charged = 0;
-  /**
-   * The last settlement released nothing while something was charged: the
-   * session's cut is parked inside a cluster it cannot cut, so the budget is
-   * free to accrue past `budgetCap` until the whole glyph is affordable. Any
-   * cluster is shorter than the text it sits in, so the growth is bounded by
-   * the releasable length — and the cap's job (stopping a trickle from
-   * hoarding seconds of budget across a stall) still holds everywhere else.
-   *
-   * Cleared by a settlement that DID release, and by the zero-offer call
-   * that reports a drain behind this policy's back: with the buffer empty
-   * there is nothing left to be blocked on, and carrying the flag past it
-   * would hand the next flush a lifted cap it never earned.
-   */
+  /** The cut is parked inside a cluster: lift `budgetCap` until it fits. */
   let blocked = false;
 
   const meter = (releasable: string): number => {
@@ -193,12 +148,7 @@ export function createSmoother(options: SmootherOptions): Smoother {
     const elapsed = last === null ? 0 : Math.min(Math.max(t - last, 0), MAX_CREDIT_MS);
     last = t;
     if (releasable === '') {
-      // The session's zero-offer bookkeeping call: the buffer emptied
-      // WITHOUT this policy metering it (a synchronous drain, the idle
-      // drain, a link snap). Nothing is blocked when nothing is pending, and
-      // there is no answer left to settle — leaving either standing would
-      // lift the budget cap on the next real flush, spending credit the
-      // stall never earned.
+      // Zero-offer call: the buffer drained without this policy.
       blocked = false;
       charged = 0;
       budget = Math.min(budget + (elapsed / 1000) * rate, budgetCap);
@@ -217,9 +167,7 @@ export function createSmoother(options: SmootherOptions): Smoother {
       take = 0;
     } else {
       // Cut after the last whitespace inside the budgeted window so words
-      // appear whole. A window that is all one word overdraws — bounded, see
-      // below: the word plus its trailing whitespace is released and the
-      // budget goes negative, pausing until the debt is repaid.
+      // appear whole.
       take = 0;
       for (let i = budgeted - 1; i >= 0; i -= 1) {
         if (/\s/.test(releasable[i])) {
@@ -228,14 +176,8 @@ export function createSmoother(options: SmootherOptions): Smoother {
         }
       }
       if (take === 0) {
-        // No whitespace inside the budgeted window: the word runs past the
-        // budget. Release it whole — the overdraw is charged and paid off as
-        // a pause — but only while it is word-sized. Beyond that there is no
-        // usable boundary at all (Chinese, Japanese and Thai are written
-        // without spaces, so `\S+` matches the entire buffer and 'word'
-        // would dump thousands of characters in one flush and then freeze
-        // for seconds paying the debt), so the cut falls back to the
-        // budgeted char-mode one.
+        // Overdraw only while word-sized: in unspaced scripts `\S+` matches
+        // the whole buffer.
         const firstWord = /^\s*\S+\s*/.exec(releasable);
         const wordEnd = firstWord ? firstWord[0].length : releasable.length;
         take =
@@ -258,15 +200,7 @@ export function createSmoother(options: SmootherOptions): Smoother {
   };
 
   return Object.assign(meter, {
-    /**
-     * Settle the last answer against what the session actually released.
-     * Charging for text the cluster-safe retreat held back is what used to
-     * stall this policy for good: a flag, a keycap or an Indic matra at the
-     * head of the buffer released nothing, yet each frame's accrual was
-     * spent on that answer, so the budget could never reach the whole
-     * glyph. The unreleased part is refunded; releasing MORE than the answer
-     * (the link snap, the lag snap) stays free, exactly as it is charged.
-     */
+    /** Refunds what the cluster retreat held back; releasing more stays free. */
     notifyReleased(released: number): void {
       const unreleased = charged - Math.max(0, released);
       if (unreleased > 0) {
@@ -361,18 +295,7 @@ const WORD_SNAP_LOOKAHEAD = 8;
 /**
  * Cut point for a budgeted release: finish the current word when a
  * whitespace is within reach (the cut lands ON the whitespace so the slice
- * ends with a complete word), then move up to a cluster boundary so the
- * release never paints half a glyph. `Intl.Segmenter` is deliberately not
- * used — Hermes ships a limited Intl subset; `advanceToClusterBoundary`
- * documents which clusters the hand-rolled walk recognises (surrogate
- * pairs, ZWJ sequences, extenders, combining marks, flag pairs, tag
- * sequences) and which it does not. Mid-word cuts beyond the lookahead are
- * fine: network chunk boundaries land mid-word anyway, and tail repair
- * already withholds incomplete trailing constructs.
- *
- * The walk moves the cut UP, which is why the adaptive smoother does not
- * depend on the session's own retreat: the answer is already off a cluster
- * boundary when it leaves here.
+ * ends with a complete word), then move up to a cluster boundary.
  */
 function snapReleaseCut(text: string, target: number): number {
   let cut = Math.max(0, Math.min(target, text.length));
@@ -514,8 +437,7 @@ export function createAdaptiveSmoother(
   const maxRateCps = tuned('maxRateCps', options?.maxRateCps, MAX_RATE_CPS);
 
   let gateOpen = false;
-  /** Previous raw `sourceLength + pendingLength`; a lower one is a rewrite
-   * or a replace deleting text, and rebases the window. See `release`. */
+  /** Previous raw `sourceLength + pendingLength`; a drop rebases the window. */
   let lastArrived: number | null = null;
   let firstContentAt: number | null = null;
   let samples: ArrivalSample[] = [];
@@ -575,21 +497,8 @@ export function createAdaptiveSmoother(
         ? context.sourceLength + context.pendingLength
         : releasable.length;
     if (context != null) {
-      // `sourceLength + pendingLength` is arrival, and arrival cannot
-      // un-happen — but a `rewrite()` that shortens the unrevealed tail does
-      // lower it, and a divergent `replace()` can lower it for good (see
-      // `SmootherContext.sourceLength`). Sampling the dip raw would feed
-      // `arrivalRate` a negative slope for a full RATE_WINDOW_MS: the release
-      // rate would drop below the real arrival rate, the backlog would grow,
-      // and a large enough rewrite would pin the reveal at `minRateCps`.
-      //
-      // So rebase rather than clamp: the deletion is subtracted from the
-      // samples the window still holds, which puts the whole series on the
-      // post-rewrite scale and leaves the SLOPE across the event untouched.
-      // The next sample then measures real arrival immediately. (Clamping to
-      // a high-water mark keeps the series monotone but flattens it until
-      // arrival re-fills the deleted region — a depression that outlasts a
-      // rate window and gets worse the more was deleted.)
+      // Rebase, not clamp: a raw dip samples as negative arrival and a
+      // high-water clamp flattens the rate until the deletion refills.
       if (lastArrived !== null && total < lastArrived) {
         const dropped = lastArrived - total;
         samples = samples.map((sample) => ({

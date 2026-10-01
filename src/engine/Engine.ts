@@ -49,14 +49,9 @@ export interface Engine {
  * validation or normalization pass over what it returns. Whatever the engine
  * produces IS the document.
  *
- * THAT INCLUDES THE URL POLICY. `options.urlPolicy` is applied by
- * `nativeEngine` while it builds each node and is NOT re-applied here, so a
- * substituted engine owns it. The view re-checks an href at press time
- * (`openUrl` in `view/renderers.tsx`), which keeps navigation safe whoever
- * parsed — but any other consumer of a node's `href`, a preview card, a link
- * sheet, your own navigation, sees exactly what the engine returned.
- * `sanitizeUrl` and `isUrlAllowed` are exported from the package entry so an
- * engine can apply the same rule rather than approximate it.
+ * That includes `options.urlPolicy`, which is not re-applied here: only the
+ * view re-checks an href, at press time. `sanitizeUrl` and `isUrlAllowed` let
+ * a substituted engine apply the same rule.
  *
  * Extensions run *after* the engine, on whichever document came back, so an
  * opt-in transform behaves the same no matter who parsed. Right now that is

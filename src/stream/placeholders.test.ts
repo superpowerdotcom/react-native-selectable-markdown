@@ -105,13 +105,15 @@ describe('trimTrailingPlaceholders', () => {
   });
 
   test('drops a trailing empty paragraph', () => {
-    const out = trimTrailingPlaceholders([para('a'), para()]);
-    expect(out).toHaveLength(1);
+    const first = para('a');
+    expect(trimTrailingPlaceholders([first, para()])).toEqual([first]);
   });
 
   test('drops multiple trailing empties', () => {
-    const out = trimTrailingPlaceholders([para('a'), heading(), para()]);
-    expect(out).toHaveLength(1);
+    const first = para('a');
+    expect(trimTrailingPlaceholders([first, heading(), para()])).toEqual([
+      first,
+    ]);
   });
 
   test('untouched leading blocks keep identity after a trim', () => {
@@ -121,8 +123,10 @@ describe('trimTrailingPlaceholders', () => {
   });
 
   test('drops an empty trailing fence', () => {
-    const out = trimTrailingPlaceholders([para('a'), fence('', false)]);
-    expect(out).toHaveLength(1);
+    const first = para('a');
+    expect(trimTrailingPlaceholders([first, fence('', false)])).toEqual([
+      first,
+    ]);
   });
 
   test('keeps a non-empty unclosed fence', () => {
@@ -183,9 +187,12 @@ describe('trimTrailingPlaceholders', () => {
 
   test('drops a trailing all-empty table row', () => {
     const header = row([cell([text('a')]), cell([text('b')])]);
+    const full = row([cell([text('1')]), cell([text('2')])]);
     const empty = row([cell([]), cell([])]);
-    const out = trimTrailingPlaceholders([table(header, [empty])]);
-    expect((out[0] as TableNode).rows).toHaveLength(0);
+    const out = trimTrailingPlaceholders([table(header, [full, empty])]);
+    const trimmed = out[0] as TableNode;
+    expect(trimmed.header).toBe(header);
+    expect(trimmed.rows).toEqual([full]);
   });
 
   test('keeps a complete table untouched', () => {

@@ -67,11 +67,8 @@ function prose(count: number): string {
 }
 
 /**
- * The permissive-autolink schemes md4c actually recognises, read out of the
- * vendored parser's `scheme_map` so this file — not a comment — is what
- * fails if a bump adds one the session's stand-down guard does not know.
- * Falls back to the table as it stands today if the C source is not on disk
- * (a consumer running these tests from a packaged copy).
+ * Read from the vendored md4c `scheme_map`, so a scheme added by a bump fails
+ * here; falls back to today's table when the C source is absent.
  */
 function md4cAutolinkSchemes(): string[] {
   const file = path.resolve(
@@ -163,6 +160,16 @@ function streamVerified(
 }
 
 describeNative('tail-only reparse (recording engine)', () => {
+  test('mutating a snapshot block array does not alter later session updates', () => {
+    const session = new StreamSession();
+    session.append('First.\n\nSecond');
+    session.snapshot().document.blocks.length = 0;
+    session.append(' paragraph');
+    expect(strip(session.snapshot().document.blocks)).toEqual(
+      strip(parseDocument('First.\n\nSecond paragraph').blocks),
+    );
+  });
+
   test('parse input stays tail-sized once early blocks settle', () => {
     const paragraphs: string[] = [];
     for (let i = 1; i <= 12; i += 1) {
@@ -313,10 +320,8 @@ describeNative('construct-free fast path', () => {
   });
 
   test('every permissive-autolink scheme md4c knows stands the fast path down', () => {
-    // md4c permissive-autolinks http, https AND ftp. A scheme the guard does
-    // not know takes the fast path through the exact divergence the guard
-    // exists to prevent: the trimmed '.' md4c left in its own text node is
-    // extended by a construct-free delta and the autolink never re-forms.
+    // md4c permissive-autolinks http, https and ftp; a scheme the guard does
+    // not know fast-paths and its autolink never re-forms.
     const schemes = md4cAutolinkSchemes();
     expect(schemes).toEqual(expect.arrayContaining(['http', 'https', 'ftp']));
     for (const scheme of schemes) {
@@ -325,19 +330,13 @@ describeNative('construct-free fast path', () => {
   });
 
   test('a growing bare EMAIL autolink is never fast-pathed', () => {
-    // The third half of GFM's autolink extension, and the one the scheme
-    // guard cannot see: `mail foo@example.` is plain text (md4c wants a dot
-    // in the host), and the delta that turns it into an autolink is the bare
-    // letter `c` — no construct character, no `https:`/`www.` token, so the
-    // fast path used to extend the text node and the mailto link never
-    // appeared until a construct character or a trailing space came along.
+    // `mail foo@example.` is text until the bare letter `c` makes it an
+    // autolink: a delta with no construct character for the guard to see.
     streamVerified('mail foo@example.com now', presets.llmChat);
     streamVerified('write to a.b+c@e.co, then stop', presets.llmChat);
   });
 
   test('a bare email autolink lands as a mailto link', () => {
-    // The user-visible half of the guard above, spelled out: what a reader
-    // sees mid-stream is a link, with the href md4c synthesizes.
     const session = new StreamSession({ options: presets.llmChat });
     for (const cp of 'mail foo@e.com now') {
       session.append(cp);
@@ -351,9 +350,6 @@ describeNative('construct-free fast path', () => {
   });
 
   test('a bare ftp autolink survives the stream under an ftp link policy', () => {
-    // The user-visible shape: with ftp:// allowlisted the fresh parse has an
-    // autolink node where the fast-pathed snapshot had one flat text node,
-    // so the link did not render until a construct character arrived.
     streamVerified('see ftp://example.com/pub/file.txt now', {
       ...presets.llmChat,
       urlPolicy: { linkPrefixes: [...DEFAULT_LINK_PREFIXES, 'ftp://'] },
@@ -450,11 +446,8 @@ describeNative('safe-anchor regressions', () => {
   });
 
   test('a fence on a list-marker line does not stall the anchor', () => {
-    // "- ```js" opens the fence at the item's content column and "  ```"
-    // closes it. Reading each line raw missed that opener and then read the
-    // indented CLOSER as an opener of its own, so the scan reported a fence
-    // open for the rest of the stream and the anchor never moved again —
-    // every append reparsing the whole document.
+    // "- ```js" opens at the item's content column; misreading its indented
+    // closer as an opener leaves a fence open and stalls the anchor.
     const prefix = '- ```js\n  const a = 1;\n  ```\n\n';
     const full = `${prefix}${prose(6)}`;
     const inputs: number[] = [];
@@ -464,8 +457,7 @@ describeNative('safe-anchor regressions', () => {
     }
     const settled = session.snapshot().settledUntil;
     expect(settled).toBeGreaterThan(prefix.length);
-    // The stall's signature is a parse of the whole accumulated source on
-    // every append; anchored, no streamed parse ever reads it all.
+    // A stall reparses the whole accumulated source on every append.
     expect(Math.max(...inputs)).toBeLessThan(full.length);
     session.finalize('end');
     expect(strip(session.snapshot().document.blocks)).toEqual(
@@ -482,9 +474,7 @@ describeNative('safe-anchor regressions', () => {
   });
 
   test('a doubled currency sign does not stall the anchor with math on', () => {
-    // md4c's $$…$$ spans are inline, so "It costs $$5 today" has no open
-    // math region: carrying `inMath` past the blank line froze the anchor at
-    // 0 for the rest of the stream on ordinary prose.
+    // md4c's $$…$$ spans are inline, so a blank line clears them.
     const mathOn: EngineOptions = {
       ...presets.llmChat,
       extensions: { ...presets.llmChat.extensions, math: true },
@@ -507,10 +497,8 @@ describeNative('safe-anchor regressions', () => {
   });
 
   test('an unclosed $$ paragraph anchors like any other paragraph', () => {
-    // A math span cannot cross a blank line, so a paragraph left holding a
-    // lone '$$' is finished prose — nothing appended later can reopen it —
-    // and it anchors like any other. The snapshot check is the guard that
-    // this leniency is real and not just faster.
+    // A math span cannot cross a blank line, so a lone '$$' paragraph is
+    // finished prose.
     const mathOn: EngineOptions = {
       ...presets.llmChat,
       extensions: { ...presets.llmChat.extensions, math: true },
@@ -522,18 +510,17 @@ describeNative('safe-anchor regressions', () => {
       'paragraph',
       'paragraph',
     ]);
-    const frozen = steps.filter(
-      (s) => s.snap.phase === 'streaming' && s.snap.settledUntil > 0,
+    const settled = Math.max(
+      ...steps
+        .filter((s) => s.snap.phase === 'streaming')
+        .map((s) => s.snap.settledUntil),
     );
-    expect(frozen.length).toBeGreaterThan(0);
+    expect(settled).toBe(26);
   });
 
   test('a raw HTML block that spans blank lines never anchors truncated', () => {
-    // CommonMark HTML blocks of types 1-5 do not end at a blank line. The
-    // anchor scan reads the PREVIOUS parse's block end against the grown
-    // source, so a comment md4c had to cut at the old end-of-source looked
-    // blank-line-terminated: it froze truncated and everything after the
-    // blank line parsed as markdown for the rest of the stream.
+    // HTML blocks of types 1-5 do not end at a blank line, so a comment md4c
+    // cut at the old end of source must not anchor there.
     const full =
       'Intro.\n\n<!-- internal note\n\nstill inside the comment -->\n\nDone.\n';
     const { steps, final } = streamVerified(full, { html: 'raw' });
@@ -560,10 +547,7 @@ describeNative('safe-anchor regressions', () => {
   });
 
   test('a CLOSED comment block anchors like any finished block', () => {
-    // The guard used to key on the OPENER alone, so a comment that had
-    // already reached its `-->` still refused to anchor — every raw-HTML
-    // stream reparsed from offset 0 on every append, quadratic in the
-    // document. A block holding its own end condition cannot grow.
+    // A block holding its own end condition cannot grow.
     const full =
       '<!-- one -->\n\n<!-- two -->\n\n<!-- three -->\n\ntrailing prose';
     const { steps, final } = streamVerified(full, { html: 'raw' });
@@ -590,7 +574,7 @@ describeNative('safe-anchor regressions', () => {
     };
     expect(
       streamingSettled('<script>var a = 1;</script>\n\nprose after\n\nmore'),
-    ).toBeGreaterThan(0);
+    ).toBe(42);
 
     // …while one still waiting for its closing tag keeps the anchor at 0,
     // because everything after the blank line is still its content.
@@ -600,19 +584,14 @@ describeNative('safe-anchor regressions', () => {
   });
 
   test('a "<!" declaration with no letter after it still spans blank lines', () => {
-    // md4c's type-4 start condition is `<!` followed by ANY ascii character
-    // (md4c.c: `if(off + 1 < ctx->size && ISASCII(off+1)) return 4;`), so
-    // `<!5`, `<!-`, `<! ` and a partial `<![CDATA` all open a block that runs
-    // to the next `>`, not to the blank line. Matching only `<![A-Za-z]`
-    // made those literals fall through to "closed", and the block froze
-    // truncated with the rest of it rendered as markdown for the rest of the
-    // stream.
+    // md4c's type-4 start is `<!` plus any ASCII character (md4c.c:
+    // `if(off + 1 < ctx->size && ISASCII(off+1)) return 4;`), so these run to
+    // the next `>`, not to the blank line.
     for (const opener of ['<!5', '<!-', '<! ', '<![CDATA']) {
       const full = `${opener} note\n\nSECRET LEAKS *here*\n\nmore\n`;
       const { steps, final } = streamVerified(full, { html: 'raw' });
       expect(final.document.blocks.map((b) => b.kind)).toEqual(['htmlBlock']);
-      // Nothing may freeze while the declaration is still open: every
-      // character streamed so far still belongs to the one block.
+      // Every character streamed so far still belongs to the one block.
       for (const step of steps.filter((s) => s.snap.phase === 'streaming')) {
         expect(step.snap.settledUntil).toBe(0);
       }
@@ -620,8 +599,6 @@ describeNative('safe-anchor regressions', () => {
   });
 
   test('a "<!" declaration anchors again once its ">" lands', () => {
-    // The type-4 row must not cost anchoring either: a declaration that has
-    // reached its `>` is closed and freezes like any other finished block.
     const full = '<!5 note>\n\nplain prose here\n\nmore prose\n\ntail';
     const { steps } = streamVerified(full, { html: 'raw' });
     const settled = Math.max(
@@ -633,8 +610,7 @@ describeNative('safe-anchor regressions', () => {
   });
 
   test('a blank-line-terminated HTML block still anchors', () => {
-    // Types 6 and 7 DO end at a blank line, so they keep anchoring: the fix
-    // for types 1-5 must not cost every raw-HTML stream its anchor.
+    // Types 6 and 7 do end at a blank line.
     const full = '<div>one</div>\n\n<div>two</div>\n\ntrailing prose';
     const { steps, final } = streamVerified(full, { html: 'raw' });
     expect(final.document.blocks.map((b) => b.kind)).toEqual([
@@ -642,10 +618,12 @@ describeNative('safe-anchor regressions', () => {
       'htmlBlock',
       'paragraph',
     ]);
-    const frozen = steps.filter(
-      (s) => s.snap.phase === 'streaming' && s.snap.settledUntil > 0,
+    const settled = Math.max(
+      ...steps
+        .filter((s) => s.snap.phase === 'streaming')
+        .map((s) => s.snap.settledUntil),
     );
-    expect(frozen.length).toBeGreaterThan(0);
+    expect(settled).toBe(32);
   });
 
   test('an unclosed fence holds the anchor back across blank lines', () => {
@@ -696,30 +674,16 @@ describeNative('session protocol under incremental parsing', () => {
   });
 
   /*
-   * The session carries `repairTail`'s inline scan forward across appends
-   * (see `tailScan`), which is only sound while the tail keeps GROWING from
-   * the same anchor. A cache kept past a mutation that REWRITES the tail is
-   * not a crash and not a stale render — it is a repair computed against
-   * text that is no longer there, and `verifySnapshot` cannot see it,
-   * because a wrongly repaired source is still internally consistent with
-   * the blocks parsed from it.
-   *
-   * So this case asserts the repaired SOURCE, on a pair chosen to slip
-   * through every cheap guard `repairTail` applies on its own: same derived
-   * region start, a cached length that is not longer than the new tail, and
-   * the same character sitting at the cached end. All that is left to catch
-   * it is the session dropping the record — and if it does not, the
-   * unmatched '[' below is never stripped from the parse input.
+   * A carried scan kept past a tail rewrite repairs against text that is
+   * gone, and `verifySnapshot` cannot see it, so this asserts the repaired
+   * source on a pair that passes every cheap guard in `repairTail`.
    */
   test('a divergent replace drops the carried tail scan', () => {
     const session = new StreamSession();
     session.append('a *b* ccc');
     expect(session.snapshot().document.source).toBe('a *b* ccc');
-    // Same length, same derived region start, and the same characters at
-    // every position the repair's own fingerprint samples — chosen that way
-    // on purpose, because the point of the case is that NONE of those cheap
-    // checks is what makes the reuse sound. The session dropping the record
-    // is.
+    // Same length, region start and fingerprint samples: only the session
+    // dropping the record can catch it.
     session.replace('a *b* [cc');
     // The '[' opened nothing, so handler 5 strips it from the parse input.
     // A stale scan resumes past it and it survives into the source instead.
@@ -728,13 +692,8 @@ describeNative('session protocol under incremental parsing', () => {
   });
 
   /*
-   * The rest of the mutations, driven with a growing unanchored paragraph
-   * full of the constructs the scan actually tracks. These are consistency
-   * sweeps rather than traps: `finalize` does not change the source (so a
-   * carried scan of it stays true, and clearing it there is hygiene), and an
-   * anchor advance is also caught by the anchor recorded alongside the
-   * record. They are here so a future change to any of the three has to keep
-   * every snapshot agreeing with a fresh parse of itself.
+   * Consistency sweeps, not traps: every snapshot must agree with a fresh
+   * parse of itself.
    */
   test('finalize, rewrite and an advancing anchor keep every snapshot honest', () => {
     const feed = (session: StreamSession, text: string): void => {
@@ -745,15 +704,14 @@ describeNative('session protocol under incremental parsing', () => {
     };
     const OPENERS = 'a **bold** and *thin* and `code` and [a](http://e.co) ';
 
-    // finalize, then keep streaming: the finalize reparsed the whole source
-    // with no repairs at all, so nothing about the repaired tail survives it.
+    // finalize reparses with no repairs, so nothing of the repaired tail
+    // survives it.
     const finalized = new StreamSession();
     feed(finalized, OPENERS);
     finalized.finalize('end');
     feed(finalized, OPENERS + 'tail *open');
     verifySnapshot(finalized.snapshot());
 
-    // A divergent replace, streamed on afterwards.
     const replaced = new StreamSession();
     feed(replaced, OPENERS);
     replaced.replace('z **ZZZZ** znd *ZZZZ* znd `ZZZZ` znd [z](http://z.zz) ');
@@ -773,5 +731,42 @@ describeNative('session protocol under incremental parsing', () => {
     feed(anchored, OPENERS + '\n\n' + OPENERS + '\n\n' + OPENERS + 'x *o');
     expect(anchored.snapshot().settledUntil).toBeGreaterThan(0);
     verifySnapshot(anchored.snapshot());
+  });
+});
+
+
+describeNative('reference-shaped code', () => {
+  test.each([
+    '```\n[ref]: /url\n```\n\n',
+    '~~~\n[ref]: /url\n~~~\n\n',
+    '> ```\n> [ref]: /url\n> ```\n\n',
+    '- ```\n  [ref]: /url\n  ```\n\n',
+  ])('keeps anchoring after %j', (prefix) => {
+    const lengths: number[] = [];
+    const session = new StreamSession({ engine: recordingEngine(lengths) });
+    for (const char of prefix) session.append(char);
+    let fed = prefix;
+    for (let i = 0; i < 80; i++) {
+      session.append(`Paragraph ${i}.\n\n`);
+      fed += `Paragraph ${i}.\n\n`;
+    }
+    expect(session.snapshot().settledUntil).toBeGreaterThan(prefix.length);
+    expect(lengths.reduce((a, b) => a + b, 0)).toBeLessThan(session.length * 8);
+    session.finalize();
+    expect(session.snapshot().document).toEqual(parseDocument(fed));
+  });
+
+  test('a definition after a quoted fence ends still updates earlier references', () => {
+    const session = new StreamSession();
+    const chunks = ['[ref]\n\n', '> ```\n> code\n', '[ref]: /target\n\n'];
+    for (const chunk of chunks) session.append(chunk);
+    const mid = session.snapshot().document.blocks[0] as ParagraphNode;
+    // The default URL policy blocks '/target', so the resolved reference
+    // shows as its bare label; left unresolved it would read '[ref]'.
+    expect(mid.children).toEqual([
+      { kind: 'text', span: { start: 0, end: 5 }, value: 'ref' },
+    ]);
+    session.finalize();
+    expect(session.snapshot().document).toEqual(parseDocument(chunks.join('')));
   });
 });

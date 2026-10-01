@@ -28,20 +28,8 @@
  * own end-to-end test with the control character smuggled in as an entity,
  * which is how it would actually arrive.
  *
- * WHY A PREFIX WITH A PATH IN IT IS CHECKED HARDER. A prefix that stops at the
- * scheme (`https://`) admits a whole scheme and there is nothing inside it to
- * escape from. A prefix that reaches into the hierarchical part
- * (`myapp://checkout/`) is naming a scope root, and `startsWith` alone does
- * not give one: `myapp://checkout/../settings/wipe` satisfies it and names
- * exactly the destination the scope exists to refuse. The `..` cases below
- * are the ones that used to pass.
- *
- * The check counts levels rather than looking for the characters `..`, and
- * the two cases that separate those readings each have a test: `a/../b` under
- * a scoped prefix is a round trip that ends inside the scope and must be
- * allowed, and a `..` in a query string or a fragment is a parameter rather
- * than a path segment. Refusing either is over-blocking that shows up as a
- * link an app silently stops opening.
+ * Path-scoped prefixes count levels rather than refusing every `..`: `a/../b`
+ * and a `..` in a query must stay allowed.
  */
 
 import { isUrlAllowed, sanitizeUrl } from './urlPolicy';
@@ -115,12 +103,8 @@ describe('isUrlAllowed', () => {
   });
 
   test('a path-scoped prefix cannot be walked back out of', () => {
-    // The case a bare `startsWith` gets wrong, and the reason the prefix is
-    // worth anything at all: `myapp://checkout/../settings/wipe` starts with
-    // the allowed prefix and names the destination the prefix exists to keep
-    // out. The string stored on the node is un-normalized, so whatever the
-    // app's deep-link router does with the `..` happens after this check —
-    // which is why the check, not the router, has to refuse it.
+    // The stored href is un-normalized and the app's router resolves `..` after
+    // this check, so the check has to refuse it.
     for (const url of [
       'myapp://checkout/../settings/wipe',
       'myapp://checkout/%2e%2e/settings/wipe',
@@ -132,17 +116,14 @@ describe('isUrlAllowed', () => {
     ]) {
       expect(isUrlAllowed(url, ['myapp://checkout/'])).toBe(false);
     }
-    // Only a `..` *segment*: dots inside a name are ordinary characters, and
-    // a scope that refused them would break every file destination.
+    // Only a `..` segment: dots inside a name are ordinary characters.
     expect(isUrlAllowed('myapp://checkout/receipt..pdf', ['myapp://checkout/'])).toBe(true);
     expect(isUrlAllowed('myapp://checkout/a/b', ['myapp://checkout/'])).toBe(true);
   });
 
   test('a prefix that names no scope root leaves `..` alone', () => {
-    // The shipped defaults stop at the scheme, so they are not asking for a
-    // scope and there is nothing to escape from — the segment count below is
-    // never even run for them. A web URL with `..` in it is ordinary and must
-    // keep working, however many it has.
+    // The shipped defaults name no scope, so `..` in a web URL is never
+    // counted.
     expect(isUrlAllowed('https://e.com/docs/../blog', DEFAULT_LINK_PREFIXES)).toBe(true);
     expect(isUrlAllowed('https://e.com/../x', ['https://'])).toBe(true);
     expect(isUrlAllowed('https://e.com/a/../../../x', ['https://'])).toBe(true);
@@ -150,48 +131,35 @@ describe('isUrlAllowed', () => {
   });
 
   test('a `..` that comes back down stays inside the scope', () => {
-    // The rule is "does it climb ABOVE the prefix", not "does it contain
-    // `..`". `https://cdn.example.com/` is a very ordinary way to write an
-    // image allowlist, and `a/../b.png` under it names `b.png` on the same
-    // host — refusing it (which an any-`..` test does) blocks an in-scope
-    // destination and makes the trailing slash change the meaning of the
-    // prefix.
+    // The rule is "does it climb above the prefix", not "does it contain `..`".
     const scoped = ['https://cdn.example.com/'];
     expect(isUrlAllowed('https://cdn.example.com/a/../b.png', scoped)).toBe(true);
     expect(isUrlAllowed('https://cdn.example.com/a/b/../../c.png', scoped)).toBe(true);
-    // ...and writing the same prefix without the trailing slash agrees.
     expect(
       isUrlAllowed('https://cdn.example.com/a/../b.png', ['https://cdn.example.com']),
     ).toBe(true);
-    // One level too far is still an escape.
     expect(isUrlAllowed('https://cdn.example.com/a/../../b.png', scoped)).toBe(false);
-    // And a round trip inside a deep-link scope is fine too.
     expect(isUrlAllowed('myapp://checkout/a/../b', ['myapp://checkout/'])).toBe(true);
   });
 
   test('a `..` in a query or a fragment is a parameter, not a segment', () => {
-    // Scanning the whole remainder for `..` refused every deep link that
-    // carried a relative redirect — `?next=/../y` names nothing outside the
-    // scope, the path is still `x`.
+    // A query is not a path: under `?next=/../y` the path is still `x`.
     const scoped = ['myapp://checkout/'];
     expect(isUrlAllowed('myapp://checkout/x?next=/../y', scoped)).toBe(true);
     expect(isUrlAllowed('myapp://checkout/x#/../y', scoped)).toBe(true);
     expect(isUrlAllowed('myapp://checkout/?back=../..', scoped)).toBe(true);
-    // The path is still counted when a query follows it.
     expect(isUrlAllowed('myapp://checkout/../y?ok=1', scoped)).toBe(false);
   });
 
   test('case folding stops at the path', () => {
-    // Schemes and hosts are case-insensitive, so `JavaScript:` must not slip
-    // past a list written in lowercase — and an app that writes `HTTPS://` in
-    // its own allowlist must not thereby block every link it has.
+    // `JavaScript:` must not slip past a lowercase list, and `HTTPS://` in an
+    // allowlist must not block every link.
     expect(isUrlAllowed('HTTPS://E.COM', ['https://'])).toBe(true);
     expect(isUrlAllowed('https://e.com', ['HTTPS://'])).toBe(true);
     expect(isUrlAllowed('MYAPP://CHECKOUT/cart', ['myapp://checkout/'])).toBe(true);
     expect(isUrlAllowed('JavaScript:alert(1)', ['https://', 'http://'])).toBe(false);
-    // Paths are case-sensitive everywhere they are resolved, so a
-    // path-scoped prefix means what it says. Folding them too would let
-    // `/CHECKOUT/` stand in for a scope the consumer never granted.
+    // Paths are case-sensitive, so `/CHECKOUT/` must not stand in for
+    // `/checkout/`.
     expect(isUrlAllowed('myapp://checkout/Cart', ['myapp://checkout/cart'])).toBe(false);
     // `mailto:` has no `//authority`, so only its scheme folds.
     expect(isUrlAllowed('MAILTO:a@e.com', ['mailto:'])).toBe(true);
@@ -260,9 +228,8 @@ describeNative('the policy applied at parse time', () => {
   });
 
   test('a traversal out of a path-scoped prefix leaves no href behind', () => {
-    // End to end, because the href on the node is what reaches
-    // `onLinkPress` and `Linking.openURL`: the link has to be gone from the
-    // document, not merely rejected by a predicate.
+    // End to end: the node's href is what reaches `onLinkPress` and
+    // `Linking.openURL`.
     const options: EngineOptions = {
       ...CM,
       urlPolicy: { linkPrefixes: ['myapp://checkout/'] },
@@ -344,10 +311,8 @@ describeNative('control characters cannot smuggle a scheme past the allowlist', 
   test('a newline written as an entity is stripped BEFORE the prefix check', () => {
     // The attack, end to end and in the form it would actually arrive: the
     // source says `java&#10;script:`, so nothing in the raw text spells the
-    // scheme. md4c resolves the entity into a real newline while it builds
-    // the destination, `sanitizeUrl` removes it, and the prefix check then
-    // sees `javascript:alert(1)` and refuses it. Order is everything — check
-    // first and this link ships.
+    // scheme. md4c resolves it to a newline and `sanitizeUrl` strips it before
+    // the prefix check refuses `javascript:alert(1)`; check first and it ships.
     const doc = parse('[a](java&#10;script:alert(1))\n', KEEP_NODE);
     const [link] = inlines(doc);
     expect(link).toMatchObject({ kind: 'link', blocked: true });
@@ -363,49 +328,35 @@ describeNative('control characters cannot smuggle a scheme past the allowlist', 
   });
 });
 
-// ---------------------------------------------------------------------------
-// Flattening depth
-// ---------------------------------------------------------------------------
-
 /**
- * Blocking a destination is the one thing that makes the DECODER walk an
- * inline subtree, and the subtree's depth is whatever the model emitted.
- *
- * A blocked link becomes a text node whose value is its flattened label, and
- * an image's alt is flattened the same way whether or not its source is
- * allowed. That flattening (`plainText` in `native/decode.ts`) used to
- * recurse, and emphasis nests one node per delimiter pair — so a label of
- * 11,000 `*` on each side is ~5,500 levels deep and threw `RangeError:
- * Maximum call stack size exceeded` out of `parseDocument` itself. Untrusted
- * markdown is the stated premise of this whole module, and 22 kB of asterisks
- * is not a large document, so this is the same class of defect the allowlist
- * exists for: input that changes behaviour rather than content.
- *
- * The depth here is deliberately past V8's old limit for this shape. Hermes
- * has a smaller stack than V8, so a recursive walk would fail even lower on
- * device; nothing about the bound below is V8-specific.
+ * Blocked links and image alts flatten their label, and emphasis nests one
+ * level per delimiter pair. The depth is past V8's old limit; Hermes is lower.
  */
 describeNative('a blocked destination flattens a deep label without overflowing', () => {
   const DEEP = 11000;
   const label = '*'.repeat(DEEP) + 'x' + '*'.repeat(DEEP);
 
   test('a blocked link with a 22 kB nest of emphasis in its label', () => {
+    const source = `[${label}](ftp://e.com)\n`;
     for (const options of [presets.llmChat, presets.everything]) {
-      expect(() => parse(`[${label}](ftp://e.com)\n`, options)).not.toThrow();
+      expect(inlines(parse(source, options))).toEqual([
+        { kind: 'text', span: { start: 0, end: 22016 }, value: 'x' },
+      ]);
     }
   });
 
   test('and the same shape as an image alt', () => {
+    const source = `![${label}](ftp://e.com)\n`;
     for (const options of [presets.llmChat, presets.everything]) {
-      expect(() => parse(`![${label}](ftp://e.com)\n`, options)).not.toThrow();
+      expect(inlines(parse(source, options))).toEqual([
+        { kind: 'text', span: { start: 0, end: 22017 }, value: 'x' },
+      ]);
     }
   });
 
   /**
-   * The guard on the two cases above: not throwing would also be true of a
-   * walk that gave up at depth 200. The flattened value has to be the `x` at
-   * the very bottom of the nest, and the span has to cover the whole
-   * construct, exactly as the shallow cases higher up in this file assert.
+   * A walk that gave up early would not throw either, so value and span are
+   * checked.
    */
   test('the flattening really reaches the bottom of the nest', () => {
     const source = `[${label}](ftp://e.com)\n`;
@@ -413,9 +364,8 @@ describeNative('a blocked destination flattens a deep label without overflowing'
     expect(inlines(doc)).toEqual([
       { kind: 'text', span: { start: 0, end: source.length - 1 }, value: 'x' },
     ]);
-    // And the shape is genuinely nested rather than one flat text run: with
-    // an ALLOWED destination the same label keeps its emphasis nodes, which
-    // is the tree `plainText` has to walk.
+    // With an allowed destination the label keeps its emphasis nodes: really
+    // nested.
     const kept = parse(`[${label}](https://e.com)\n`);
     let node: Inline = inlines(kept)[0];
     let depth = 0;
@@ -425,5 +375,35 @@ describeNative('a blocked destination flattens a deep label without overflowing'
     }
     expect(depth).toBeGreaterThan(5000);
     expect(node).toMatchObject({ kind: 'text', value: 'x' });
+  });
+});
+
+test('an authority prefix ends at an authority boundary', () => {
+  const allowed = ['https://good.com'];
+  for (const url of ['https://good.com', 'https://good.com/x', 'https://good.com?q', 'https://good.com#x']) {
+    expect(isUrlAllowed(url, allowed)).toBe(true);
+  }
+  for (const url of ['https://good.com.evil.com/x', 'https://good.com@evil.com/x', 'https://good.com:99/x']) {
+    expect(isUrlAllowed(url, allowed)).toBe(false);
+  }
+  expect(isUrlAllowed('https://anything.test/x', ['https://'])).toBe(true);
+});
+
+test('case folding that changes authority length preserves path offsets', () => {
+  expect(isUrlAllowed('https://i\u0307.test/photos/../private', ['https://İ.test/photos/'])).toBe(false);
+  expect(isUrlAllowed('https://İ.test/photos/a.png', ['https://i\u0307.test/photos/'])).toBe(true);
+});
+
+
+describe('path-prefix boundaries', () => {
+  const prefix = 'https://cdn.e.com/photos';
+  test.each(['X/../secret', 'X', '%58/../secret'])('rejects a partial path match %s', (suffix) => {
+    expect(isUrlAllowed(prefix + suffix, [prefix])).toBe(false);
+  });
+  test.each(['', '/one.png', '?size=1', '#top'])('allows a scope boundary %s', (suffix) => {
+    expect(isUrlAllowed(prefix + suffix, [prefix])).toBe(true);
+  });
+  test('rejects traversal above a boundary without a trailing slash', () => {
+    expect(isUrlAllowed(prefix + '/../secret', [prefix])).toBe(false);
   });
 });

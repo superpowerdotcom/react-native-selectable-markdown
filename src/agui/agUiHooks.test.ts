@@ -1,19 +1,4 @@
-/**
- * The React wiring of the two ag-ui hooks — effect ordering, cleanup
- * scheduling, what a re-render does to a live session — which the other two
- * suites cannot reach: they exercise the React-free cores
- * (`bindMessageEvents`, `bindRunTextEvents`, `resolveSessionInit`).
- *
- * This package has no React renderer to lean on (react-dom and
- * react-test-renderer are neither dependencies nor devDependencies; `react`
- * alone is), so the hooks run against a minimal dispatcher installed in
- * React's own dispatcher slot. The hooks import the real `useRef`,
- * `useEffect`, `useState` and `useCallback`, each of which is a one-line
- * delegation to whatever sits in that slot, so the code under test is the
- * shipped code. `renderHook` commits the way React 18 does — every changed
- * effect's cleanup first, then every setup — which is the ordering these
- * tests turn on.
- */
+// No React renderer is a dependency, so the hooks run on a minimal dispatcher in React's own slot.
 import * as React from 'react';
 import type { ParsedDocument } from '../document/nodes';
 import type { Engine } from '../engine/Engine';
@@ -21,21 +6,17 @@ import type { BufferScheduler } from '../stream/StreamSession';
 import { useAgUiRunSessions } from './bindRunTextEvents';
 import { useAgUiSession, type TextMessageEvents } from './useAgUiSession';
 
-// ---------------------------------------------------------------------------
-// The hook runtime
-// ---------------------------------------------------------------------------
-
 interface DispatcherSlot {
   current: unknown;
 }
 
-const dispatcherSlot: DispatcherSlot = (
-  React as unknown as {
-    __SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED: {
-      ReactCurrentDispatcher: DispatcherSlot;
-    };
-  }
-).__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED.ReactCurrentDispatcher;
+const reactInternals = (React as unknown as {
+  __CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE: { H: unknown };
+}).__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+const dispatcherSlot: DispatcherSlot = {
+  get current() { return reactInternals.H; },
+  set current(value) { reactInternals.H = value; },
+};
 
 interface RefSlot {
   kind: 'ref';
@@ -73,21 +54,12 @@ function depsChanged(
 }
 
 interface HookHost<P, R> {
-  /** One commit: render, then run the changed effects. Returns what the hook returned. */
   render(props: P): R;
-  /** Real unmount: every effect's cleanup, in declaration order. */
   unmount(): void;
+  hide(): void;
 }
 
-/**
- * Renders `hook` on demand. Only the four hooks these two components use are
- * implemented — anything else throws (a missing dispatcher method is not a
- * function), which is the behaviour we want if a hook is added later.
- *
- * `useState`'s setter records the value but schedules no re-render: nothing
- * here asserts on rendered state, and a synchronous re-render from inside a
- * commit would be a worse lie than no re-render at all.
- */
+/** Implements only the hooks these components use; `useState`'s setter never re-renders. */
 function renderHook<P, R>(hook: (props: P) => R): HookHost<P, R> {
   const slots: Slot[] = [];
   let index = 0;
@@ -157,9 +129,7 @@ function renderHook<P, R>(hook: (props: P) => R): HookHost<P, R> {
   };
 
   function commit(): void {
-    // React 18's passive phase: ALL cleanups for the fiber, then all setups.
-    // The hooks rely on that split — `useAgUiSession` declares its unmount
-    // teardown before the effects whose cleanup it must precede.
+    // React's passive phase: every cleanup for the fiber runs before any setup.
     const dirty = slots.filter(
       (slot): slot is EffectSlot => slot.kind === 'effect' && slot.pending !== null,
     );
@@ -193,6 +163,15 @@ function renderHook<P, R>(hook: (props: P) => R): HookHost<P, R> {
       commit();
       return result;
     },
+    hide(): void {
+      for (const slot of slots) {
+        if (slot.kind === 'effect') {
+          slot.destroy?.();
+          slot.destroy = undefined;
+          slot.armed = false;
+        }
+      }
+    },
     unmount(): void {
       unmounted = true;
       for (const slot of slots) {
@@ -205,15 +184,10 @@ function renderHook<P, R>(hook: (props: P) => R): HookHost<P, R> {
   };
 }
 
-/** Two timer turns: enough for a deferred settle and a deferred unmount. */
 async function macrotasks(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
 
 type DeltaCb = (messageId: string, delta: string) => void;
 type EndCb = (messageId: string) => void;
@@ -265,7 +239,6 @@ class FakeEvents implements TextMessageEvents {
   }
 }
 
-/** Manual stand-in for the frame scheduler: fires only when told to. */
 function manualFrame() {
   let next: (() => void) | null = null;
   const scheduler: BufferScheduler = (flush) => {
@@ -302,8 +275,6 @@ const wholeParagraphEngine: Engine = {
   },
 };
 
-// ---------------------------------------------------------------------------
-
 describe('useAgUiSession lifecycle', () => {
   const mountSession = () => {
     const events = new FakeEvents();
@@ -326,13 +297,7 @@ describe('useAgUiSession lifecycle', () => {
     frame.fire();
     expect(m1.snapshot().phase).toBe('streaming');
 
-    // Two commits with no timer turn between them — what a parent setState
-    // inside a passive effect, or a flushSync, produces. The cleanup for m1
-    // queues a settle, the cleanup for m2 queues another, and the setup for
-    // m1 must cancel the FIRST one: with a single pending slot its cancel
-    // handle is overwritten and the still-bound session settles under the
-    // component (streaming chrome drops, the tail repair reparses away, a
-    // held-back tail is dumped).
+    // Two commits in one macrotask (a setState in a passive effect, or flushSync): m1's setup must cancel the first pending settle.
     const away = host.render('m2');
     const back = host.render('m1');
     expect(back).toBe(m1);
@@ -342,7 +307,6 @@ describe('useAgUiSession lifecycle', () => {
     events.emitDelta('m1', 'the rest.');
     frame.fire();
     expect(m1.snapshot().document.source).toBe('half a sentence and the rest.');
-    // The one genuinely left behind still settles.
     expect(away.snapshot().phase).toBe('settled');
 
     host.unmount();
@@ -378,8 +342,6 @@ describe('useAgUiSession lifecycle', () => {
     first.emitDelta('m1', 'live ');
     frame.fire();
 
-    // A host building its event object inline re-renders with a new
-    // identity every time; the session is the same one, so nothing settles.
     const second = new FakeEvents();
     expect(host.render(second)).toBe(session);
     await macrotasks();
@@ -411,10 +373,6 @@ describe('useAgUiSession delta routing', () => {
     first.emitDelta('m1', 'A');
     expect(session.snapshot().document.source).toBe('A');
 
-    // A new inline events object rebinds — every render, for the host shape
-    // this package endorses — and this one carries a flipped switch. The
-    // routing is latched with the session, so the message already streaming
-    // keeps appending synchronously.
     const second = new FakeEvents();
     expect(host.render({ events: second, coalesce: true })).toBe(session);
     second.emitDelta('m1', 'B');
@@ -440,14 +398,11 @@ describe('useAgUiSession delta routing', () => {
 
     const first = new FakeEvents();
     const session = host.render({ events: first, coalesce: true });
-    first.emitDelta('m1', 'Hello world, a long tail'); // 24 units
+    first.emitDelta('m1', 'Hello world, a long tail');
     frame.fire();
     expect(session.snapshot().document.source).toBe('Hell');
     expect(session.pendingLength).toBe(20);
 
-    // The direction that would be visibly lossy: re-routing to `append`
-    // here would drain the smoother's 20 withheld characters into one
-    // commit mid-message.
     const second = new FakeEvents();
     host.render({ events: second, coalesce: false });
     second.emitDelta('m1', '!');
@@ -488,15 +443,72 @@ describe('useAgUiRunSessions session init', () => {
     events.emitDelta('m1', 'abcdefgh');
     frame.fire();
 
-    // holdBackChars withheld the last four, which arms the idle drain on
-    // the injected scheduler with the injected wait...
-    expect(idleWaits.length).toBeGreaterThan(0);
-    expect(idleWaits.every((ms) => ms === 999)).toBe(true);
-    // ...and the smoother the factory made reads the injected clock.
-    expect(smootherClock.length).toBeGreaterThan(0);
-    expect(smootherClock.every((now) => now === 4242)).toBe(true);
+    // The tail holdBackChars withholds is what arms the idle drain.
+    expect(idleWaits).toEqual([999]);
+    expect(smootherClock).toEqual([4242]);
     expect(api.sessionFor('m1').snapshot().document.source).toBe('abcd');
 
+    host.unmount();
+  });
+});
+
+
+describe('effect disconnection', () => {
+  it('preserves a message and buffered input across hide and reveal', async () => {
+    const events = new FakeEvents();
+    const frame = manualFrame();
+    const host = renderHook(() => useAgUiSession(events, 'm1', {
+      engine: wholeParagraphEngine, bufferScheduler: frame.scheduler,
+      idleScheduler: () => () => {},
+    }));
+    const session = host.render(undefined);
+    events.emitDelta('m1', 'first ');
+    frame.fire();
+    events.emitDelta('m1', 'pending ');
+    host.hide();
+    await macrotasks();
+    frame.fire();
+    expect(session.snapshot().document.source).toBe('first ');
+    expect(session.pendingLength).toBe(8);
+    expect(host.render(undefined)).toBe(session);
+    events.emitDelta('m1', 'last');
+    frame.fire();
+    expect(session.snapshot().document.source).toBe('first pending last');
+    host.unmount();
+  });
+
+  it('retains completed run rows across hide and reveal', async () => {
+    const events = new FakeEvents();
+    const host = renderHook(() => useAgUiRunSessions(events, { engine: wholeParagraphEngine }));
+    const first = host.render(undefined).sessionFor('m1');
+    first.append('finished');
+    first.finalize();
+    host.hide();
+    await macrotasks();
+    const revealed = host.render(undefined).sessionFor('m1');
+    expect(revealed).toBe(first);
+    expect(revealed.snapshot().document.source).toBe('finished');
+    events.emitDelta('m1', ' more');
+    expect(revealed.snapshot().document.source).toBe('finished more');
+    host.unmount();
+  });
+
+  it('disposes rows evicted by the run policy', () => {
+    const events = new FakeEvents();
+    const host = renderHook(() => useAgUiRunSessions(events, {
+      engine: wholeParagraphEngine, policy: { evictOnRunStart: () => true },
+    }));
+    const api = host.render(undefined);
+    const session = api.sessionFor('old');
+    session.append('before');
+    events.emitRunStarted(['old']);
+    session.append(' after');
+    expect(session.snapshot().document.source).toBe('before');
+    const fresh = api.sessionFor('old');
+    expect(fresh).not.toBe(session);
+    expect(fresh.snapshot().document.source).toBe('');
+    fresh.append('again');
+    expect(fresh.snapshot().document.source).toBe('again');
     host.unmount();
   });
 });

@@ -17,28 +17,8 @@ import {
   selectionActionTitle,
 } from './selectionActions';
 
-/*
- * The selection menu's WIRE FORMAT and its title/id split.
- *
- * `selectionActions` is one ordered `std::vector<std::string>` on both hosts
- * — scripts/check-codegen.mjs pins that type and says why it cannot become an
- * array of objects — so a menu item's title travels inside the same string as
- * its identifier, separated by U+001F. Both native hosts implement that split
- * (SelectableRunHostView.swift `parseSelectionAction`,
- * SelectableRunHostView.kt `parseSelectionAction`), and neither is reachable
- * from jest. What IS reachable is the encoder they decode and the decoder
- * that mirrors them, so this file pins the format itself: get it wrong here
- * and a title arrives as part of an identifier, which shows up as a menu item
- * that silently vanishes on both platforms.
- *
- * The second half is the id round-trip: an action a consumer defined must
- * reach `onSelectionCopy` as ITSELF, while an id no menu offered must still
- * normalize to 'copy-markdown' (version skew — an older binary's only custom
- * item predates the `action` field). The offered list is the only thing that
- * tells those two apart, which is why `ctx.actions` exists.
- */
+// Pins the U+001F split both hosts' `parseSelectionAction` implements, which jest cannot reach.
 
-/** Parses `source` and returns the document plus its single run. */
 function docWithRun(source: string): { doc: ParsedDocument; run: RunSegment } {
   const doc = parseDocument(source);
   const runs = segmentRuns(doc);
@@ -50,8 +30,7 @@ linkNativeEngineAsDefault();
 
 describe('selectionActions wire format', () => {
   test('a bare id encodes to itself, which is the pre-title wire format', () => {
-    // The whole backward-compatibility story rests on this: the default menu
-    // must reach an older native binary byte-for-byte as it always did.
+    // Older native binaries must get the default menu byte-for-byte.
     expect(encodeSelectionActions(DEFAULT_SELECTION_ACTIONS)).toEqual([
       'copy-text',
       'copy-markdown',
@@ -75,8 +54,6 @@ describe('selectionActions wire format', () => {
   });
 
   test('an empty title is the same as no title: take the host default', () => {
-    // Not a special case in the hosts either — both treat an empty tail as
-    // "no title sent" and fall back to their own string.
     expect(encodeSelectionActions([{ id: 'copy-text', title: '' }])).toEqual([
       'copy-text',
     ]);
@@ -97,11 +74,6 @@ describe('selectionActions wire format', () => {
   });
 
   test('an entry that could never round-trip is dropped, not truncated', () => {
-    // An empty id has nothing to report back; an id containing the separator
-    // would arrive at the host split in the wrong place, so the item would
-    // render under a bogus title and emit a bogus identifier. Both are
-    // dropped here rather than sent — and dropping one must not disturb the
-    // items around it.
     expect(
       encodeSelectionActions([
         'copy-text',
@@ -114,8 +86,6 @@ describe('selectionActions wire format', () => {
   });
 
   test('decode is the exact inverse, splitting at the FIRST separator', () => {
-    // The hosts split at the first occurrence, so a title containing the
-    // separator survives intact rather than being cut short.
     expect(decodeSelectionAction('copy-text')).toEqual({ id: 'copy-text' });
     expect(
       decodeSelectionAction(`share${SELECTION_ACTION_SEPARATOR}Share this`),
@@ -128,8 +98,6 @@ describe('selectionActions wire format', () => {
       id: 'share',
       title: `a${SELECTION_ACTION_SEPARATOR}b`,
     });
-    // A trailing separator with nothing after it is "no title", matching the
-    // empty-title encode above.
     expect(
       decodeSelectionAction(`copy-text${SELECTION_ACTION_SEPARATOR}`),
     ).toEqual({ id: 'copy-text' });
@@ -165,9 +133,6 @@ describe('selectionActions wire format', () => {
   });
 
   test('only the two ids the hosts can title on their own are built in', () => {
-    // This predicate is what decides whether an untitled entry is a mistake
-    // worth a DEV warning or the documented way to take the host's own
-    // localised string.
     expect(isBuiltInSelectionAction('copy-text')).toBe(true);
     expect(isBuiltInSelectionAction('copy-markdown')).toBe(true);
     expect(isBuiltInSelectionAction('share-quote')).toBe(false);
@@ -185,10 +150,6 @@ describeNative('handleSelectionAction action identity', () => {
       { actions: [{ id: 'share-quote', title: 'Share' }] },
     );
     expect(payload?.action).toBe('share-quote');
-    // The mapping work is identical for every menu item — that is the point
-    // of routing consumer actions through here rather than past it. Both
-    // halves are exactly what 'copy-markdown' would have produced for the
-    // same sweep, emphasis syntax and all (the span is construct-aware).
     expect(payload?.plain).toBe('bold');
     expect(payload?.markdown).toBe('**bold**');
   });
@@ -205,12 +166,6 @@ describeNative('handleSelectionAction action identity', () => {
   });
 
   test('an id the menu did not offer is reported unchanged, not renamed', () => {
-    // This used to normalize to 'copy-markdown' whenever `ctx.actions` did not
-    // account for the id — including when it was not threaded at all, which is
-    // the ordinary shape for a caller driving `RunHost` itself. That silently
-    // handed a consumer's own action to their copy-markdown branch. The id is
-    // now passed through; the offered list is a DEV cross-check (it warns,
-    // once per id, that the menu and the binary disagree).
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const { doc, run } = docWithRun('Hello world.');
@@ -234,8 +189,7 @@ describeNative('handleSelectionAction action identity', () => {
       expect(offeredSomethingElse?.action).toBe('share-quote');
       expect(offeredNothing?.action).toBe('share-quote');
       expect(noContext?.action).toBe('share-quote');
-      // Only the two calls that said what the menu offered can warn, and the
-      // warning is once per id for the whole runtime.
+      // Only the calls passing `actions` can warn, and only once per id.
       expect(warn).toHaveBeenCalledTimes(1);
     } finally {
       warn.mockRestore();
@@ -243,9 +197,6 @@ describeNative('handleSelectionAction action identity', () => {
   });
 
   test('an event carrying NO action is the one case that resolves', () => {
-    // Version skew, and the only shape of it left: a binary older than the
-    // `action` field emits nothing there, and its sole custom item was "Copy
-    // Markdown".
     const { doc, run } = docWithRun('Hello world.');
     expect(
       handleSelectionAction(doc, run, { start: 0, end: 5 })?.action,

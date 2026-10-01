@@ -40,45 +40,23 @@ import type { NativeHostBinding } from './index';
 import { PROTOCOL_VERSION } from './protocol';
 
 /**
- * What the platform module reports back from `install()`.
- *
- *  - `installed`   — the binding is on the global now.
- *  - `unavailable` — TRANSIENT. No JS runtime was reachable yet (the bridge
- *                    is still starting, or a reload is in flight). Worth
- *                    asking again.
- *  - `refused`     — PERMANENT for this binary and this JS context. The
- *                    runtime cannot back an ArrayBuffer with a
- *                    jsi::MutableBuffer (JavaScriptCore), the .so did not
- *                    load, or its JNI symbol did not match. Asking again
- *                    cannot change the answer, and each ask logs natively.
- *
- * The strings are spelled identically in
- * platform/ios/SelectableMarkdownModule.mm and
- * android/.../SelectableMarkdownModule.kt (`OUTCOME_*` there). They are the
- * whole contract: nothing else distinguishes the two refusals from JS.
+ * Spelled identically in SelectableMarkdownModule.mm and .kt (`OUTCOME_*`):
+ * `unavailable` is transient, `refused` is permanent for this JS context.
  */
 type InstallOutcome = 'installed' | 'unavailable' | 'refused';
 
 /** The one method platform/{ios,android} export. */
 interface SelectableMarkdownNativeModule {
   /**
-   * Returns an `InstallOutcome`. Typed as `unknown` because a native binary
-   * older than this bundle returns a bare boolean — see `readOutcome`.
+   * An `InstallOutcome`, typed `unknown` because an older native binary
+   * returns a bare boolean.
    */
   install?: () => unknown;
 }
 
 /**
- * Read the platform's answer, tolerating a native binary older than this
- * bundle.
- *
- * `install()` returned a plain boolean before the three outcomes existed, and
- * a JS bundle can meet either binary (that is the whole reason `parse` has a
- * protocol version). An unrecognised value — the old `false`, `undefined`
- * from a module that has the method but returns nothing, anything a future
- * binary invents — reads as `unavailable`, which is the safe direction: a
- * transient refusal is retried, so the worst case is the behaviour this
- * package had before, never a binding given up on that was actually there.
+ * An unrecognised value reads as `unavailable`, the safe direction: it is
+ * retried rather than given up on.
  */
 function readOutcome(value: unknown): InstallOutcome {
   if (value === 'installed' || value === 'unavailable' || value === 'refused') {
@@ -122,34 +100,15 @@ function protocolMatches(binding: NativeHostBinding): boolean {
   return binding.protocolVersion === PROTOCOL_VERSION;
 }
 
-/* Memoized success. A TRANSIENT refusal is never cached, because its reasons
- * really are transient ("the runtime is being torn down", "the bridge has not
- * finished starting") and a caller that gave up on the first miss would never
- * see the binding that arrives a tick later.
+/* Memoized success; a transient refusal is never cached.
  *
  * Module state is per-JS-context, which is the right scope: a dev reload
  * re-evaluates this module against the fresh runtime that needs installing
  * again. */
 let installed = false;
 
-/* Memoized PERMANENT refusal — the other half of the same pair, and the
- * reason callers may poll `isNativeEngineAvailable()` without paying for it.
- *
- * Retrying a permanent refusal is not merely wasted work: `install()` is a
- * blocking synchronous call, and each attempt writes another warning from the
- * platform side (RCTLogWarn / Log.w). A component that asked once per render
- * turned a diagnostic into a flood. The platform modules are the only place
- * that can tell the two apart — a null runtime pointer is "not yet", a
- * JavaScriptCore runtime or a module that will not load is "not ever" — so
- * they now say which (`InstallOutcome`), and this is where the answer is
- * kept.
- *
- * Same scope as `installed`, and for the same reason: a dev reload
- * re-evaluates this module, so the fresh runtime is asked afresh rather than
- * inheriting a refusal that belonged to the one before it.
- *
- * A protocol mismatch is not in this set: the binding IS on the global, so
- * that refusal is decided below without asking the platform anything. */
+/* Memoized permanent refusal: each `install()` blocks synchronously and logs
+ * natively, so it is never retried. Same per-context scope as `installed`. */
 let permanentlyRefused = false;
 
 /* One warning per JS context, not one per call — an app that retries in a
@@ -176,15 +135,11 @@ let warnedAboutProtocol = false;
  * runner, benches, web) where the absence is expected and understood by the
  * caller, and the loud report belongs at the parse, not at startup.
  *
- * CHEAP TO CALL AGAIN, IN BOTH FINAL STATES. A success is memoized, and so is
- * a refusal the platform reported as permanent (`InstallOutcome`), so neither
- * crosses the bridge twice. What is retried — and only what should be — is a
- * platform that is not ready yet, and a host with no native module at all,
- * which costs one cached `require` and an optional-chained miss.
+ * Success and a permanent refusal are memoized, so neither crosses the bridge
+ * twice; a platform not ready yet, or one with no native module, is retried.
  */
 export function installNativeEngine(): boolean {
   if (installed) return true;
-  /* The platform already said "not ever". Nothing crosses, nothing logs. */
   if (permanentlyRefused) return false;
 
   try {
@@ -206,9 +161,8 @@ export function installNativeEngine(): boolean {
       );
       /* The global, not the return value, decides whether we are installed:
        * that is the thing every caller downstream actually consumes, so it is
-       * the only honest answer to "is it installed?". The outcome is read for
-       * one purpose only — telling a refusal worth retrying from one that is
-       * not. */
+       * the only honest answer. The outcome only separates a retryable
+       * refusal from a permanent one. */
       binding = hostBinding();
       if (binding === null && outcome === 'refused') permanentlyRefused = true;
     }
@@ -260,19 +214,9 @@ export function isNativeEngineInstalled(): boolean {
 }
 
 /**
- * True when the platform has said its refusal is PERMANENT for this JS
- * context — JavaScriptCore, or a native module that will not load — so
- * `installNativeEngine()` has stopped asking it.
- *
- * A pure read of memoized state, and false in the ordinary "no native module
- * here at all" case (Expo Go, web, plain Node): that is a module which never
- * answers, not one that refuses, so nothing is memoized and nothing is being
- * retried across the bridge either.
- *
- * Exported for diagnostics — an app that wants to tell "still starting up"
- * from "this build cannot parse markdown, stop waiting" — not as a second
- * availability test. `isNativeEngineAvailable()` in ./index remains the
- * question to ask.
+ * True once the platform reported a permanent refusal (JavaScriptCore, a
+ * module that will not load); false when there is no native module at all.
+ * For diagnostics: `isNativeEngineAvailable()` is the availability check.
  */
 export function isNativeEnginePermanentlyRefused(): boolean {
   return permanentlyRefused;

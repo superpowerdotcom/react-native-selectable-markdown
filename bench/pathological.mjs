@@ -12,64 +12,13 @@
 // absolute numbers depend on the machine and a bare `npm run bench:*` should
 // not fail on a busy laptop.
 //
-// ONE BUDGET IS THE WRONG SHAPE FOR FOUR STAGES that differ by four orders of
-// magnitude. `segment` is tens of microseconds on these inputs and `parse` is
-// tens of milliseconds, so a single number loose enough for the parse (CI ran
-// 1000 ms) is ~20000x the segment's real cost: that stage could get a hundred
-// times slower and still pass. `--budget-<stage>` overrides the global for one
-// stage, so each is gated near its own scale and the workflows pass four
-// numbers instead of one. The global remains the default for any stage with no
-// override, and passing only overrides gates only those stages.
+// `--budget-<stage>` overrides --budget for that stage; passing only overrides
+// gates only those stages.
 //
-// --require-engine turns "the addon did not resolve" from an exit-0 report
-// into a failure. A gate that exits 0 having measured nothing is worse than no
-// gate, and the likeliest cause here is not a missing compiler but a
-// protocol-version drift between the built addon and dist/. Workflows pass it;
-// a laptop with no toolchain should not.
+// --require-engine fails, instead of exiting 0, when the addon does not resolve.
 //
-// WHY THIS TIMES FOUR STAGES AND NOT JUST THE PARSE
-// -------------------------------------------------
-// md4c is linear on every shape below — that is the whole reason it was
-// picked, and it means a parse-only gate is a gate on the one stage that was
-// never going to fail. Everything a consumer runs *after* the parse is
-// TypeScript over the decoded tree, and none of it is obviously linear:
-//
-//   parse    md4c + the FlatBuffer decode. The linear one.
-//   repair   `repairTail` over the whole input, which is what a stream that
-//            never anchors actually hands it (a list, a giant paragraph, an
-//            unclosed fence — see docs/BENCHMARKS.md). Its scanners walk the
-//            tail per construct, so this is where an adversarial run of
-//            emphasis openers costs far more than parsing them.
-//   segment  `segmentRuns` over every block: the per-snapshot cost the view
-//            pays before anything renders.
-//   project  `projectRun` over every run: the per-run cost that produces the
-//            text the native hosts actually measure and select. It walks the
-//            block tree, so deep nesting is priced here rather than in the
-//            parse.
-//
-// A throw anywhere in the four is a CRASH for that case, and --budget fails on
-// it: a `RangeError: Maximum call stack size exceeded` on 3 kB of `> ` is a
-// denial of service whatever its runtime, and reporting it as a fast case
-// would be the worst possible reading of these numbers.
-//
-// Streaming is deliberately NOT a stage here. `bench:streaming` owns that
-// question and gates it: it replays the pinned never-anchoring transcript
-// (conformance/fixtures/transcript-giant-list.json) — the adversarial
-// *streaming* shape, in the same way these four are the adversarial *document*
-// shapes — and takes the same `--budget`/`--require-engine` flags, so ci.yml
-// and release.yml run it in the step next to this one. Until it did, the
-// sentence here pointed at a report and called it coverage.
-//
-// AND WHY THERE IS A SECOND, SCALING SECTION
-// ------------------------------------------
-// The four cases above are each ONE size, so they price a shape but cannot
-// tell a slow linear pass from a fast quadratic one — and a quadratic pass is
-// exactly what the repair's unmatched-bracket strip loop used to be. The
-// `repair scaling` section below therefore runs one shape at five sizes and
-// reports each against a linear control of the same length, because the ratio
-// between them is machine-independent in a way wall-clock milliseconds are
-// not: a flat ratio column is linear, a doubling one is quadratic, and that
-// reading holds on a busy laptop and in CI alike.
+// md4c is linear; the TypeScript stages after it are the ones worth gating.
+// Streaming is gated by bench:streaming, not here.
 
 import {
   deepBlockquoteSource,
@@ -96,13 +45,17 @@ if (!engine) exitWithoutEngine('[bench:pathological]');
 
 const scale = (full, small) => (quick ? small : full);
 
-// The seed `repairTail` gets from a StreamSession whose anchor sits at a clean
-// boundary — no open fence, not inside math. Identical to `CLEAN_SEED` in
-// src/stream/StreamSession.ts, and the only seed reachable there, because an
-// anchor is accepted only with a clean fence/math scan state.
+// Mirrors CLEAN_SEED in src/stream/StreamSession.ts, the only seed a clean anchor yields.
 const CLEAN_SEED = { openFence: null, inMath: false };
 
 const cases = [
+  { name: 'decoded entities in one paragraph', input: '中' + '&hellip;'.repeat(scale(65_536, 4096)), options: presets.commonmark },
+  { name: 'smart quotes in one paragraph', input: '中' + '"a" '.repeat(scale(131_072, 8192)), options: { ...presets.commonmark, smartPunctuation: true } },
+  {
+    name: 'less-than prose without a closer',
+    input: 'a < '.repeat(scale(12_000, 1_200)),
+    options: presets.commonmark,
+  },
   {
     name: 'nested brackets',
     input: '['.repeat(scale(10_000, 1_000)) + 'core' + ']'.repeat(scale(10_000, 1_000)),
@@ -125,14 +78,7 @@ const cases = [
   },
 ];
 
-/**
- * The pipeline, split at the seams a consumer actually crosses.
- *
- * Each stage is timed on its own so a regression names the stage it is in;
- * timing the four together would only say "slower". `run` receives the
- * carry-over from the stages before it (the parsed document, then the runs),
- * because re-parsing per stage would price the parse four times.
- */
+/** Timed one by one; each `run` reads the state earlier stages left, so order matters. */
 const STAGES = [
   {
     name: 'parse',
@@ -160,14 +106,6 @@ const STAGES = [
   },
 ];
 
-/**
- * The budget each stage is gated at: `--budget-<stage>` when given, otherwise
- * the global `--budget`, otherwise none (report only).
- *
- * Resolved once, up front, so the header line can print exactly what is being
- * gated — a gate whose thresholds are only visible by reading the source is
- * one nobody re-tunes when the numbers move.
- */
 const budgets = new Map(
   STAGES.map((stage) => [stage.name, numberFlag(`budget-${stage.name}`, budgetMs)]),
 );
@@ -175,10 +113,6 @@ const gating = [...budgets.values()].some((ms) => ms !== undefined);
 
 let anyOver = false;
 let anyCrash = false;
-// A gate that produced no samples at all (`--runs 0`) is vacuous, which is the
-// same failure as `--require-engine` catching an unresolvable addon: green,
-// and over nothing. Tracked separately from `anyOver` so the message can say
-// which of the two happened.
 let anyVacuous = false;
 
 const budgetSummary = gating
@@ -199,8 +133,7 @@ for (const c of cases) {
   // Deliberately no warmup: these inputs are about worst-case cold behaviour,
   // and a warmed-up JIT is not what a DoS attempt meets. The first throw ends
   // the case — the remaining runs would only reproduce it, and the timings
-  // collected before it are not comparable to a case that completed. The
-  // stage it threw in is kept, because "which stage" is most of the answer.
+  // collected before it are not comparable to a case that completed.
   for (let i = 0; i < runs && !crash; i += 1) {
     const state = { resolved: resolveOptions(c.options), doc: null, runs: [] };
     for (const stage of STAGES) {
@@ -217,9 +150,7 @@ for (const c of cases) {
 
   for (const stage of STAGES) {
     const samples = times.get(stage.name);
-    // A stage that threw is a CRASH even when an earlier run of it completed:
-    // one input, one throw, and averaging that away is how a gate stops
-    // gating.
+    // A throw outranks samples from earlier runs.
     if (crash && crash.stage === stage.name) {
       anyCrash = true;
       console.log(
@@ -228,10 +159,6 @@ for (const c of cases) {
       continue;
     }
     if (samples.length === 0) {
-      // Two ways to get here, and `crash` is null in one of them: a stage
-      // after the throw was never reached, or `--runs 0` asked for no runs at
-      // all. Dereferencing `crash.stage` unconditionally is what made
-      // `--runs 0` die with a TypeError instead of reporting.
       if (crash) {
         console.log(`    ${'n/a'.padEnd(5)} ${stage.name.padEnd(8)} not reached — \`${crash.stage}\` threw`);
       } else {
@@ -254,53 +181,15 @@ for (const c of cases) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// repair scaling: unmatched brackets against a linear control
-// ---------------------------------------------------------------------------
-
-/*
- * `'x [ '` repeated is the shape that used to make `repairTail` quadratic: every
- * `[` opens a link candidate that never closes, so the repair ends up with a
- * stack of openers to strip, and stripping them one at a time — each strip
- * rescanning the rest of the tail — is O(brackets * tail). Nothing above would
- * have caught it. `nested brackets` is 10 000 `[` in a row followed by 10 000
- * `]`, which is a different (matched, deeply nested) shape, and it is measured
- * at one size, so a quadratic pass there just reads as "repair is slow on
- * brackets".
- *
- * `'x y '` is the control: identical length, identical word/space rhythm, no
- * construct characters at all. Dividing by it cancels the per-character cost of
- * simply walking the tail, so what is left is the price of the brackets — and
- * that price must not grow with n.
- *
- * HOW TO READ IT. The `xctl` column is how much the brackets cost over the bare
- * walk — tens of times the control, and roughly FLAT across the five sizes when
- * the pass is linear, climbing with each doubling of n when it is not. It is
- * coarse, because the control is microseconds and the clock is not much finer,
- * so the gated number below it divides the bracket cost by n instead. The
- * milliseconds are for scale only: ~1-2 ms at n = 8000 after the fix, ~17 ms
- * before it.
- */
+// Repair scaling: `'x [ '` (unclosed link openers, once quadratic in `repairTail`)
+// against `'x y '`, a same-length control, so the ratio isolates the bracket cost.
 
 const REPAIR_SCALE_NS = quick ? [500, 1_000, 2_000] : [500, 1_000, 2_000, 4_000, 8_000];
 const REPAIR_SCALE_OPTIONS = resolveOptions(presets.commonmark);
 
 /**
- * Median cost of one `repairTail` over the whole tail, in ms.
- *
- * THE WARMUP IS THE ONE PLACE THIS FILE WANTS ONE, and it is not a
- * contradiction of the no-warmup rule above. The four cases up there each
- * report an absolute cost at one size, where cold is the honest number. This
- * section reports a SHAPE across five sizes, and a cold first sample lands
- * entirely on the smallest n — the one every later size is compared against —
- * so an unwarmed run reads as the smallest input being the slowest and says
- * nothing at all about growth.
- *
- * `batch` repeats the call inside the timed region and divides, which is only
- * for the control: at these sizes one pass over 2 kB of `'x y '` costs about as
- * much as `performance.now()` can resolve, and a quantised denominator makes
- * the ratio column wobble by 2x for no reason. The bracket side is milliseconds
- * on its own and is timed one call at a time.
+ * Warmed, unlike the cases above: a cold first sample would skew the smallest n.
+ * `batch` averages calls in one timed region for the microsecond-scale control.
  */
 const REPAIR_SCALE_SAMPLES = Math.max(runs, 5);
 
@@ -317,7 +206,6 @@ function medianRepairMs(input, batch = 1) {
   return percentile(samples, 50);
 }
 
-/** Repeats of the control per timed region — see `medianRepairMs`. */
 const CONTROL_BATCH = 32;
 
 console.log('');
@@ -332,38 +220,21 @@ for (const n of REPAIR_SCALE_NS) {
   const control = 'x y '.repeat(n);
   const bracketMs = medianRepairMs(brackets);
   const controlMs = medianRepairMs(control, CONTROL_BATCH);
-  // A control fast enough to round to zero would make the ratio meaningless
-  // rather than large; report it as unavailable instead of dividing by it.
   const ratio = controlMs > 0 ? bracketMs / controlMs : null;
   perBracket.push({ n, msPerBracket: bracketMs / n });
-  // The repair stage's budget, not the global one: this section times
-  // `repairTail` and nothing else.
   const repairBudget = budgets.get('repair');
   const over = repairBudget !== undefined && bracketMs > repairBudget;
   if (over) anyOver = true;
   console.log(
     `  ${(over ? 'OVER' : 'ok').padEnd(5)} n=${String(n).padStart(5)} ` +
       `${fmtBytes(Buffer.byteLength(brackets, 'utf8')).padStart(9)}  ` +
-      // The control is microseconds at these sizes; `fmtMs` would print
-      // every row as `0.00 ms`.
+      // Microseconds: `fmtMs` would print every control as `0.00 ms`.
       `brackets ${fmtMs(bracketMs)}  control ${(controlMs * 1000).toFixed(0).padStart(4)} us  ` +
       `xctl ${ratio === null ? '   n/a' : ratio.toFixed(1).padStart(6)}`,
   );
 }
 
-// The linearity read, made explicit so nobody has to eyeball the column.
-//
-// It divides the BRACKET cost by n rather than dividing the ratio column by
-// itself, and the difference matters: the control is the smallest quantity on
-// the line, so a drift computed from `xctl` inherits all of the control's
-// timer noise on top of the signal. Cost per bracket is flat when the pass is
-// linear (a constant amount of work per `[`) and grows with n when it is not,
-// and it is read off the one column that is comfortably above the clock's
-// resolution.
-//
-// 2.0 is the threshold, against a 16x growth in input from the first size to
-// the last: generous enough that JIT warmth and a busy laptop cannot trip it,
-// far below the ~16x a restored quadratic loop would show.
+// Per-bracket cost, not `xctl`: the control's timer noise would swamp the drift.
 const GROWTH_LIMIT = 2;
 if (perBracket.length >= 2) {
   const first = perBracket[0];

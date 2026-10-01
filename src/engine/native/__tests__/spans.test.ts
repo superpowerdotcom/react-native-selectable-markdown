@@ -22,11 +22,8 @@
  * Plus an exact statement of how a text node's `value` may differ from its
  * source slice — the one place the model deliberately allows divergence.
  *
- * EVERY SWEEP ASSERTS THE EXACT VIOLATION LIST, AND IT IS EMPTY. Asserting
- * the list (rather than "at most N") means both a regression and a fix change
- * the result, so neither can pass unnoticed — a defect that has to be lived
- * with for a while would appear here as a named entry with its cause rather
- * than as a loosened bound.
+ * Every sweep asserts the exact (empty) violation list, so a regression and a
+ * fix both change the result.
  */
 
 import * as fs from 'node:fs';
@@ -144,31 +141,9 @@ function sweepFixtures(
 }
 
 /**
- * Shapes the spec corpus and the fixtures both happen to miss.
- *
- * The corpus is enormous but it is not adversarial: CommonMark's examples are
- * written to isolate one construct, so the *seams between* two constructs are
- * thin on the ground. Every entry below is a seam that produced a real span
- * defect, kept here because the sweeps above already assert exactly the
- * invariant that catches it — the corpus simply never contained the shape.
- *
- * The first five are the same seam: a fenced code block followed by a
- * construct that reaches the decoder with no offsets of its own. The decoder
- * places those from a cursor over everything consumed so far, and the cursor
- * used to be advanced from the frame's *content* range, which for a fenced
- * block stops before the closing fence. So the empty heading resolved to the
- * ``` line and got a span inside the code block — and, when the unanchored
- * node was a list's first item, the whole list started there, so copying it
- * returned the previous block's fence.
- *
- * The last three are the mirror image, and they survived that fix: the
- * unanchored construct is itself an EMPTY FENCE. Placement puts it on its own
- * fence line, correctly, and then `widenCodeBlock` walked UP from there
- * looking for an opening fence — a scan that is right for a block with code
- * in it (md4c reports the code, one line below the fence) and wrong here,
- * because the line above holds the PREVIOUS block's closing fence.
- * `` ```js\nx\n```\n```\n `` came back as `codeBlock[8,15]`, slice
- * `"```\n```"`, overlapping the block before it.
+ * Seams the corpus misses: a closed fence followed by an offset-less construct,
+ * which the cursor must place past the closing fence, and an empty fence
+ * after a closed one, which must not take that closing fence as its opener.
  */
 const SEAM_CASES: readonly string[] = [
   '```js\nx\n```\n\n##\n\nAfter text here.\n',
@@ -182,28 +157,8 @@ const SEAM_CASES: readonly string[] = [
 ];
 
 /**
- * Empty ATX headings, and what used to follow one.
- *
- * `widenHeading` probes for a setext underline whenever it finds no `#` run
- * *before* the content it was handed. An empty heading has no content, so the
- * span starts on the hashes themselves, the backward scan finds nothing, and
- * the probe fired: `##\n-\n` widened the heading over the `-` on the next
- * line. That is wrong twice — the heading's slice held a line it does not
- * contain, and the next construct (empty itself, so placed from the cursor)
- * was pushed past it onto whatever came after, so an empty list ended up
- * spanning the FOLLOWING paragraph. Every case below is a real span violation
- * the corpus does not contain; the spec's ATX examples are all followed by a
- * blank line.
- *
- * The marker-prefixed cases are the ones a line-anchored guard missed. An
- * empty heading inside a blockquote or a list item is located at its OWN
- * line, markers and all, so a check for "this line is nothing but hashes"
- * reads `> ##` and says no. The heading then swallowed the line below the
- * container — `> ##\n-\n` gave the heading, and the blockquote around it, a
- * `-` belonging to a list OUTSIDE the quote, which left that list with no
- * offsets at all. The decoder now tells the widener whether the heading had
- * any content instead of inferring it from the source, which no marker can
- * defeat.
+ * An empty ATX heading must not take the next line as a setext underline,
+ * including behind a container marker.
  */
 const EMPTY_HEADING_CASES: readonly string[] = [
   '##\n-\n',
@@ -213,11 +168,9 @@ const EMPTY_HEADING_CASES: readonly string[] = [
   '   ##\n-\n',
   '##\n-\n\npara text\n\n- [x] done\n\npara text\n\n',
   '#####\n---\n',
-  // Seven hashes is NOT a heading, so this really is a setext heading and
-  // the guard above must not claim it.
+  // Seven hashes is not ATX, so this is a real setext heading.
   '#######\n===\n',
-  // Empty, and inside a container: the marker sits between the line start
-  // and the heading.
+  // The container marker sits between the line start and the heading.
   '> ##\n-\n',
   '- ##\n  -\n',
   '* ##\n  ===\n',
@@ -245,21 +198,6 @@ function sweepSeams(options: EngineOptions): string[] {
 }
 
 describeNative('span invariants over the CommonMark spec corpus', () => {
-  test('the corpus is the real one', () => {
-    // A truncated or missing spec.json would make every sweep below vacuous.
-    expect(SPEC.length).toBe(652);
-    expect(FIXTURES.length).toBeGreaterThanOrEqual(6);
-  });
-
-  test('no example throws', () => {
-    const engine = requireNativeEngine();
-    for (const example of SPEC) {
-      // Both HTML policies, because they take different decoder paths.
-      expect(() => parseDocument(example.markdown, SPEC_STRIP, engine)).not.toThrow();
-      expect(() => parseDocument(example.markdown, SPEC_RAW, engine)).not.toThrow();
-    }
-  });
-
   /**
    * Bounds, containment and sibling disjointness over all 652 examples, in
    * both HTML policies. The list is asserted empty rather than "small": the
@@ -275,6 +213,8 @@ describeNative('span invariants over the CommonMark spec corpus', () => {
    * with no offsets at all.
    */
   test('every span holds, under the default html policy', () => {
+    // A truncated or missing spec.json would make every sweep vacuous.
+    expect(SPEC).toHaveLength(652);
     expect(sweepSpec(SPEC_STRIP)).toEqual([]);
   });
 
@@ -283,6 +223,7 @@ describeNative('span invariants over the CommonMark spec corpus', () => {
   });
 
   test('every span holds over the streaming fixtures', () => {
+    expect(FIXTURES.length).toBeGreaterThanOrEqual(6);
     expect(sweepFixtures(presets.llmChat)).toEqual([]);
     expect(sweepFixtures(EVERYTHING)).toEqual([]);
   });
@@ -293,10 +234,8 @@ describeNative('span invariants over the CommonMark spec corpus', () => {
   });
 
   /**
-   * The seam sweep's own guard: the shapes must actually reach the decoder as
-   * an empty construct after a closed fence. If md4c ever stopped emitting an
-   * offset-less node for `##`, the sweep would keep passing while covering
-   * nothing.
+   * Guards the seam sweep: if md4c stopped emitting an offset-less node for
+   * `##`, the sweep would pass while covering nothing.
    */
   test('every span holds after an empty ATX heading', () => {
     expect(sweepEmptyHeadings(presets.llmChat)).toEqual([]);
@@ -304,10 +243,8 @@ describeNative('span invariants over the CommonMark spec corpus', () => {
   });
 
   /**
-   * The empty-heading sweep's own guard. `##\n-\n` has to reach the decoder
-   * as an empty heading followed by a separate construct; if md4c ever
-   * folded the two together the sweep would keep passing while covering
-   * nothing.
+   * Guards the empty-heading sweep: if md4c folded `##\n-\n` into one
+   * construct, the sweep would pass while covering nothing.
    */
   test('an empty ATX heading ends at its own line', () => {
     const engine = requireNativeEngine();
@@ -330,13 +267,8 @@ describeNative('span invariants over the CommonMark spec corpus', () => {
   });
 
   /**
-   * The same guard for an empty heading behind a container marker, which the
-   * sweep would otherwise cover only as "no violation". The list here is
-   * OUTSIDE the quote, and what makes the case worth pinning is that it used
-   * to end up with no offsets at all: the heading took the `-` into the
-   * blockquote, so nothing was left for the list's own placement to find, and
-   * an unanchored span is what the streaming splice rebases into a plausible
-   * wrong offset.
+   * The list outside the quote must keep its offsets: the splice rebases an
+   * unanchored span to a plausible wrong offset.
    */
   test('an empty ATX heading inside a container ends at its own line', () => {
     const engine = requireNativeEngine();
@@ -349,13 +281,12 @@ describeNative('span invariants over the CommonMark spec corpus', () => {
     const under = parseDocument('> ##\n===\n', presets.llmChat, engine);
     expect(under.blocks.map((b) => b.kind)).toEqual(['blockquote', 'paragraph']);
     expect(under.blocks[0].span).toEqual({ start: 0, end: 4 });
-    // Inside a list item the underline candidate is indented INTO the item,
-    // so the empty heading and the construct below it are siblings there.
+    // Inside a list item the candidate underline is indented into the item, so
+    // the empty heading and the construct below it are siblings.
     const item = parseDocument('- ##\n  -\n', presets.llmChat, engine);
     const [listItem] = childrenOf(item.blocks[0]);
     expect([...childrenOf(listItem)].map((c) => c.kind)).toEqual(['heading', 'list']);
-    // A setext heading inside a container still widens down over its
-    // underline — the guard is about emptiness, not about the marker.
+    // The guard is about emptiness, not the marker: setext still widens here.
     const setext = parseDocument('- Title\n  ===\n', presets.llmChat, engine);
     const [setextItem] = childrenOf(setext.blocks[0]);
     const [inner] = childrenOf(setextItem);
@@ -373,11 +304,8 @@ describeNative('span invariants over the CommonMark spec corpus', () => {
   });
 
   /**
-   * The empty-fence half of the seam sweep, pinned by slice rather than by
-   * "no violation": the second block has to be the trailing fence itself, and
-   * it has to report `closed: false` — it is an unterminated block, and the
-   * streaming renderer keeps such a block open instead of flashing literal
-   * backticks. Reading the fence above as its opener made it look closed.
+   * The trailing fence is its own unterminated block, so it must report
+   * `closed: false`.
    */
   test('an empty unclosed fence starts on its own line, not the fence above', () => {
     const engine = requireNativeEngine();
@@ -387,8 +315,7 @@ describeNative('span invariants over the CommonMark spec corpus', () => {
     expect(doc.blocks[0].span).toEqual({ start: 0, end: 11 });
     expect(doc.blocks[1].span).toEqual({ start: 12, end: 15 });
     expect(doc.blocks[1]).toMatchObject({ fenced: true, closed: false, literal: '' });
-    // A fence with code in it still widens UP to its opening fence, which is
-    // the scan the flag above has to leave alone.
+    // A fence with code still widens up to its opening fence.
     const closed = parseDocument('````\n```\n````\n', presets.llmChat, engine);
     expect(closed.blocks[0].span).toEqual({ start: 0, end: 13 });
     expect(closed.blocks[0]).toMatchObject({ closed: true });
@@ -423,13 +350,15 @@ describeNative('span invariants over the CommonMark spec corpus', () => {
     const source = fs
       .readFileSync(path.join(FIXTURE_DIR, FIXTURES[0]), 'utf8')
       .replace(/\n/g, '\r\n');
-    let breaks = 0;
+    const breaks: string[] = [];
     const walk = (node: AnyNode): void => {
-      if (node.kind === 'softBreak' || node.kind === 'hardBreak') breaks += 1;
+      if (node.kind === 'softBreak' || node.kind === 'hardBreak') {
+        breaks.push(`${node.kind} ${JSON.stringify(source.slice(node.span.start, node.span.end))}`);
+      }
       for (const child of childrenOf(node)) walk(child);
     };
     for (const block of parseDocument(source, EVERYTHING, engine).blocks) walk(block);
-    expect(breaks).toBeGreaterThan(0);
+    expect(breaks).toEqual(['softBreak "\\r\\n"', 'softBreak "\\r\\n"', 'softBreak "\\r\\n"']);
   });
 });
 
@@ -438,33 +367,18 @@ describeNative('span invariants over the CommonMark spec corpus', () => {
 // ---------------------------------------------------------------------------
 
 /**
- * With smart punctuation off, only three *character-level* rewrites can make a
- * text node's value differ from its raw slice: a backslash escape, an entity
- * reference, and a NUL byte (rendered U+FFFD). So a slice holding no `\` and
- * no `&` must equal its value verbatim — the corpus contains no raw NUL, which
- * the spec writes as `&#0;` and the fixtures do not use at all, so the third
- * case is pinned by its own test below rather than by this rule.
- *
- * There is a fourth, whole-construct rewrite this pattern cannot express: a
- * link or image whose destination the URL policy rejects degrades to a text
- * node whose value is the flattened label or alt while its span still covers
- * the entire construct. `[ab](ftp://e.com)` holds neither a `\` nor an `&`,
- * so the rule below would call it a violation. Those nodes are identified
- * exactly — see `degradedConstructSpans` — rather than pattern-matched away.
+ * With smart punctuation off, only an escape, an entity or a NUL (pinned by its
+ * own test; the corpus has none) makes a value differ from its slice, so a
+ * slice with no `\` or `&` equals its value. Blocked links and images are
+ * exempted exactly, by `degradedConstructSpans`.
  */
 const REWRITABLE_OFF = /[\\&]/;
 /** With smart punctuation on, add the characters cmark --smart rewrites. */
 const REWRITABLE_ON = /[\\&"'.\-]/;
 
 /**
- * A source whose every destination is outside the default allowlist, so each
- * construct in it reaches the decoder blocked.
- *
- * The spec sweep cannot cover this: it opens the allowlist (`OPEN`) precisely
- * so blocked links stay out of the span measurements, and the streaming
- * fixtures only ever use `https://example.com/...`. Without this entry the
- * value rule below has never once been shown a degraded construct, and the
- * assertion is vacuously true for the largest divergence the decoder has.
+ * Every destination is outside the default allowlist. The spec sweep opens the
+ * allowlist, so this is the only degraded-construct coverage.
  */
 const BLOCKED_URLS = [
   '[ab](ftp://e.com) then [c d](javascript:x)',
@@ -495,14 +409,8 @@ interface CorpusItem {
 }
 
 /**
- * The spans of the constructs the URL policy turned into text nodes.
- *
- * The oracle is the same source parsed with the allowlist open: anything that
- * is a link, autolink or image *there* and a text node *here* is a
- * degradation, and its value is the flattened label rather than its slice.
- * Deriving the set this way keeps the value rule honest — it exempts nodes
- * because the parser proved they were links, not because their slice happens
- * to start with a bracket.
+ * A link, autolink or image under an open allowlist that is a text node here
+ * was degraded by the URL policy: proven by the parser, not pattern-matched.
  */
 function degradedConstructSpans(item: CorpusItem): Set<string> {
   const out = new Set<string>();
@@ -549,9 +457,8 @@ describeNative('text nodes carry their source', () => {
   test('a value is never longer than the source it came from', () => {
     // Every rewrite the decoder performs shrinks or preserves length: an
     // entity is at least as long as what it decodes to, an escape drops its
-    // backslash, `...` becomes one character, `--` becomes one, and a blocked
-    // link keeps only its label. A value that grew would mean text was
-    // invented, which selection cannot map back.
+    // backslash, `...` and `--` become one character, and a blocked link keeps
+    // only its label.
     const engine = requireNativeEngine();
     const failures: string[] = [];
     for (const item of corpus()) {
@@ -594,17 +501,13 @@ describeNative('text nodes carry their source', () => {
     expect(failures).toEqual([]);
     // Non-vacuousness: the vast majority of text nodes take this path.
     expect(compared).toBeGreaterThan(1000);
-    // And the exemption is not vacuous either — if the corpus stopped
-    // containing a blocked destination, the rule above would go back to
-    // never having been challenged by one.
+    // Non-vacuous: the corpus must still contain a blocked destination.
     expect(degraded).toBeGreaterThanOrEqual(8);
   });
 
   /**
-   * The fifth divergence, stated as a value rule rather than a span rule (the
-   * span half is pinned under "widening recovers the exact construct source").
-   * A blocked destination is the one case where a node's value is shorter than
-   * its slice by an unbounded amount with nothing rewritable anywhere in it.
+   * A blocked destination shortens a value by an unbounded amount with nothing
+   * rewritable in it.
    */
   test('a blocked destination degrades the value but never the span', () => {
     const engine = requireNativeEngine();
@@ -987,18 +890,20 @@ describeNative('widening defects that had to be fixed', () => {
     //   row too;
     //   "| a | b |\n| --- | --- |\n| 1 |\n"   -> the padding cell for the
     //   missing column spans [28,29), the row's closing "|".
-    for (const source of [
-      '| a | b |\n| --- | --- |\n| | 2 |\n',
-      '| a | b |\n| --- | --- |\n| 1 |\n',
-    ]) {
-      const doc = parse(source);
-      for (const row of (nodeOf(doc, 'table', 0) as { rows: AnyNode[] }).rows) {
-        for (const cell of (row as { cells: AnyNode[] }).cells) {
-          expect(doc.source.slice(cell.span.start, cell.span.end)).not.toMatch(/[|\n]/);
-        }
-        expect(doc.source.slice(row.span.start, row.span.end)).not.toContain('\n');
-      }
-    }
+    // Each row as [row span, ...cell spans]: the empty cell is a zero-width
+    // span between its pipes, the padding cell a zero-width span at the
+    // row's end.
+    const rowSpans = (source: string): AnyNode['span'][][] =>
+      (nodeOf(parse(source), 'table', 0) as { rows: AnyNode[] }).rows.map((row) => [
+        row.span,
+        ...(row as { cells: AnyNode[] }).cells.map((cell) => cell.span),
+      ]);
+    expect(rowSpans('| a | b |\n| --- | --- |\n| | 2 |\n')).toEqual([
+      [{ start: 24, end: 31 }, { start: 26, end: 26 }, { start: 28, end: 29 }],
+    ]);
+    expect(rowSpans('| a | b |\n| --- | --- |\n| 1 |\n')).toEqual([
+      [{ start: 24, end: 29 }, { start: 26, end: 27 }, { start: 29, end: 29 }],
+    ]);
   });
 
   test('no node ever escapes with an unanchored span', () => {
@@ -1015,5 +920,12 @@ describeNative('widening defects that had to be fixed', () => {
     const doc = parse(source);
     const negative = flatten(doc).filter((n) => n.span.start < 0 || n.span.end < 0);
     expect(negative).toEqual([]);
+    // The padding cell is anchored at the end of the source, after `S`.
+    const [row] = (nodeOf(doc, 'table', 0) as { rows: AnyNode[] }).rows;
+    expect([row.span, ...(row as { cells: AnyNode[] }).cells.map((c) => c.span)]).toEqual([
+      { start: 20, end: 23 },
+      { start: 22, end: 23 },
+      { start: 23, end: 23 },
+    ]);
   });
 });

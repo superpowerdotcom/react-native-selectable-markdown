@@ -233,17 +233,8 @@ describeNative('lazy container continuation', () => {
 
 describeNative("html: 'strip' keeps <br> as a line break", () => {
   /**
-   * Stripping removes markup, and for every HTML construct but one that also
-   * removes whatever the construct carried — an inline `<span>` loses its
-   * tags, an HTML *block* takes its entire text content with it. `<br>` is
-   * the exception, because dropping it does not remove a construct, it joins
-   * two words: `line one<br>line two` would render as `line oneline two`,
-   * with no separator anywhere and no way for the reader to tell. Models
-   * write `<br>` constantly, and inside a GFM table cell it is the only line
-   * break the syntax has, so this is not a corner.
-   *
-   * The replacement is a `hardBreak` spanning exactly the tag, so a selection
-   * across it still copies back `<br>` character for character.
+   * Stripping `<br>` would join two words, so it becomes a `hardBreak` spanning
+   * exactly the tag.
    */
   test('an inline <br> becomes a hardBreak over the tag, not a hole', () => {
     const doc = parse('line one<br>line two\n', CM);
@@ -267,11 +258,8 @@ describeNative("html: 'strip' keeps <br> as a line break", () => {
   test.each(['<brand>', '<br-thing>', '<br-separator/>', '<brx />'])(
     '%s merely starts with "br" and is still stripped',
     (tag) => {
-      // Not a prefix test: the matcher requires the tag name to END at
-      // whitespace, `/` or `>`. A hyphen is a legal tag-name character, so
-      // `<br-thing>` is an ordinary custom element — the `\b` this matcher
-      // used to rely on matched between `r` and `-` and turned every
-      // `<br-*>` element into a line break.
+      // `<br-thing>` is a custom element: the tag name must end at whitespace,
+      // `/` or `>`.
       const doc = parse(`a${tag}b\n`, CM);
       expect(firstParagraph(doc).map((n) => n.kind)).toEqual(['text', 'text']);
     },
@@ -284,8 +272,6 @@ describeNative("html: 'strip' keeps <br> as a line break", () => {
   });
 
   test("under html: 'raw' it stays an htmlSpan, unchanged", () => {
-    // The rewrite belongs to stripping. A consumer who asked for raw HTML
-    // gets the tag as a node and decides for itself.
     const doc = parse('a<br>b\n', RAW);
     const inlines = firstParagraph(doc);
     expect(inlines.map((n) => n.kind)).toEqual(['text', 'htmlSpan', 'text']);
@@ -293,9 +279,8 @@ describeNative("html: 'strip' keeps <br> as a line break", () => {
   });
 
   test('a <br> inside a GFM table cell breaks the cell line', () => {
-    // The case with no alternative syntax: GFM cells cannot contain a
-    // markdown hard break, so a stripped `<br>` used to concatenate the two
-    // halves of every multi-line cell a model emitted.
+    // GFM cells cannot contain a markdown hard break, so `<br>` is the only
+    // one.
     const doc = parse('| h |\n| - |\n| x<br>y |\n', LLM);
     const table = doc.blocks[0] as { rows: { cells: { children: Inline[] }[] }[] };
     const cell = table.rows[0].cells[0];
@@ -304,10 +289,13 @@ describeNative("html: 'strip' keeps <br> as a line break", () => {
   });
 
   test('an HTML block still takes its content with it', () => {
-    // Deliberate and documented: stripping a block removes the construct,
-    // and a `<div>` wrapper is the construct. Only `<br>` is special-cased,
-    // because only `<br>` stands for something the reader can see.
-    expect(parse('<div>\nhello **world**\n</div>\n', CM).blocks).toEqual([]);
+    // Stripping a block removes the construct; only `<br>` stands for something
+    // the reader can see.
+    const source = '<div>\nhello **world**\n</div>\n';
+    expect(parse(source, CM).blocks).toEqual([]);
+    expect(parse(source, RAW).blocks).toEqual([
+      { kind: 'htmlBlock', span: { start: 0, end: 28 }, literal: '<div>\nhello **world**\n</div>' },
+    ]);
   });
 });
 
@@ -367,11 +355,8 @@ describeNative('permissive autolinks', () => {
   });
 
   test('a bare email address autolinks to a mailto: destination', () => {
-    // GFM's autolink extension is three forms, not two — `https://`, `www.`
-    // and a bare `user@host.tld` — and `extensions.autolinks` advertises the
-    // extension, so all three are on. The href gets the `mailto:` md4c
-    // supplies; the span still covers only what the author typed, which is
-    // what keeps a copy of the selection free of the invented scheme.
+    // The href gets md4c's `mailto:`; the span covers only what the author
+    // typed, so a copy omits the invented scheme.
     const doc = parse('mail foo@e.com now\n');
     const [, link] = firstParagraph(doc);
     expect(link).toMatchObject({ kind: 'autolink', href: 'mailto:foo@e.com' });
@@ -379,9 +364,8 @@ describeNative('permissive autolinks', () => {
   });
 
   test('an address with no host dot is not an autolink', () => {
-    // md4c requires at least two dot-delimited host components, so
-    // `foo@localhost` stays prose. Pinned because it is the boundary a
-    // streaming renderer crosses one character at a time.
+    // md4c requires two dot-delimited host components, so `foo@localhost`
+    // stays prose.
     const doc = parse('mail foo@localhost now\n');
     expect(firstParagraph(doc).map((n) => n.kind)).toEqual(['text']);
   });
@@ -392,20 +376,10 @@ describeNative('permissive autolinks', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Attribute strings
-// ---------------------------------------------------------------------------
-
 describeNative('hrefs, titles and info strings are decoded exactly once', () => {
   /**
-   * A link destination, a title and a fence info string are string VALUES,
-   * not source ranges, and md4c decodes them while it builds the attribute:
-   * backslash escapes drop out there, and `internAttribute`
-   * (platform/cpp/OffsetParser.cpp) resolves the entity substrings against
-   * md4c's full HTML5 table. The decoder used to run a JS decoder over the
-   * result as well, which is invisible on ordinary input — decoding `/f&ouml;&ouml;`
-   * twice gives the same answer — and wrong on anything the author escaped on
-   * purpose. Every case below is one where the two passes differ.
+   * md4c already decodes destinations, titles and info strings; each case is
+   * one where a second JS decoding pass would differ.
    */
   test('a doubly-encoded entity in a destination keeps its second layer', () => {
     const doc = parse('[a](https://e.com/?x=1&amp;amp;y=2)\n');
@@ -441,9 +415,8 @@ describeNative('hrefs, titles and info strings are decoded exactly once', () => 
   });
 
   test('an autolink URI keeps its backslash, and its entity is still decoded', () => {
-    // The autolink half of the same contract: md4c builds an autolink's
-    // destination with MD_BUILD_ATTR_NO_ESCAPES, so `\*` survives, while the
-    // entity substrings are resolved as everywhere else.
+    // md4c builds an autolink's destination with MD_BUILD_ATTR_NO_ESCAPES, so
+    // `\*` survives while entities still resolve.
     const doc = parse('<https://e.com/?find=\\*&amp;lt;x>\n');
     const [link] = firstParagraph(doc);
     expect(link).toMatchObject({ kind: 'autolink', href: 'https://e.com/?find=\\*&lt;x' });
@@ -539,5 +512,32 @@ describeNative('a document using every supported construct', () => {
     const [text] = (last as { children: Inline[] }).children;
     expect((text as { value: string }).value).toBe('Last & final *literal* line.');
     expect(sliceOf(doc, text)).toBe('Last &amp; final \\*literal\\* line.');
+  });
+});
+
+describeNative('HTML line-break whitespace', () => {
+  test.each(['\n', '\r\n', '\r'])('consumes the source line ending after a stripped br: %j', (ending) => {
+    const doc = parse(`foo<br>${ending}bar`);
+    expect(firstParagraph(doc).map(node => node.kind)).toEqual(['text', 'hardBreak', 'text']);
+    expect(firstParagraph(doc)[1].span).toEqual({ start: 3, end: 7 + ending.length });
+  });
+
+  test('keeps separately requested breaks', () => {
+    expect(firstParagraph(parse('foo<br><br>bar')).map(node => node.kind))
+      .toEqual(['text', 'hardBreak', 'hardBreak', 'text']);
+  });
+});
+
+describeNative('empty container children', () => {
+  test.each(['```\n\n```\n', '```\n  \n```\n', '> ```\n>\n> ```\n'])('a blank-only fence is closed: %j', source => {
+    const doc = parse(source);
+    const block = doc.blocks[0].kind === 'blockquote' ? doc.blocks[0].children[0] : doc.blocks[0];
+    expect(block).toMatchObject({ kind: 'codeBlock', closed: true });
+    expect(source.slice(block.span.start, block.span.start + 3)).toBe('```');
+    expect(block.span.end).toBe(source.length - 1);
+  });
+  test('an empty heading excludes its quote marker', () => {
+    const block = parse('> ##').blocks[0];
+    expect(block.kind === 'blockquote' && block.children[0].span).toEqual({ start: 2, end: 4 });
   });
 });

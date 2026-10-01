@@ -3,6 +3,7 @@ package com.selectablemarkdown
 import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.res.Configuration
+import android.graphics.Typeface
 import android.text.Spannable
 import com.facebook.react.uimanager.DisplayMetricsHolder
 import com.facebook.yoga.YogaMeasureMode
@@ -16,11 +17,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * returns byte-for-byte what a rebuild would have; the agreement doctrine in
  * `RunTextMeasure` is untouched, this just stops paying for it repeatedly.
  *
- * WHY IT EXISTS. The C++ shadow node re-measures on every commit and
- * `SelectableRunHostView.commitProps` builds the same styled string again on
- * the UI thread. A streamed message recommits its settled runs many times per
- * second with nothing about them changed, so the same Spannable and the same
- * StaticLayout were being rebuilt from identical inputs on two threads. React Native's own
+ * WHY IT EXISTS. A streamed message recommits its settled runs many times per
+ * second unchanged, and both measure and `commitProps` rebuild. React Native's own
  * text stack solves this identically (TextLayoutManager's spannable cache plus
  * a TextMeasureCache keyed on the full layout constraints, capped at 1024).
  *
@@ -34,8 +32,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  - the window display metrics (`density`, `scaledDensity`), because build
  *    bakes them into the spans: every `AbsoluteSizeSpan` and every attribute
  *    `RunLineHeightSpan` goes through `PixelUtil.toPixelFromSP` (reads
- *    `scaledDensity`), and every margin, tab stop and embed reservation —
- *    box and line height alike — through `toPixelFromDIP` (reads `density`),
+ *    `scaledDensity`), and every margin, tab stop and embed size through
+ *    `toPixelFromDIP` (reads `density`),
  *    both off `DisplayMetricsHolder.getWindowDisplayMetrics()`.
  *    A FONT-SCALE CHANGE MUST MISS THE CACHE: without the metrics in the key,
  *    every run after an accessibility font-size change would keep rendering
@@ -50,9 +48,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * onTrimMemory, is memory reclamation, not invalidation: every entry is pure
  * derived data, so dropping all of them costs rebuilds and nothing else.)
  *
- * THREADING. `RunTextMeasure.measure` runs on whatever thread Fabric calls
- * the JNI measure from — the background layout thread, or the UI thread for a
- * synchronous commit; `commitProps` runs on the UI thread.
+ * THREADING. `RunTextMeasure.measure` runs on the layout thread, or the UI
+ * thread for a synchronous commit; `commitProps` runs on the UI thread.
  * Every map access is synchronized on the map — including gets, because with
  * `accessOrder = true` a get reorders the map. The lock is also what safely
  * publishes a built Spannable across threads; after `build` returns, nothing
@@ -112,6 +109,7 @@ internal object RunLayoutCache {
         val density: Float,
         val scaledDensity: Float,
         val localeTag: String,
+        val typefaces: List<Typeface>,
     )
 
     /**
@@ -236,12 +234,13 @@ internal object RunLayoutCache {
         val metrics = DisplayMetricsHolder.getWindowDisplayMetrics()
         return Key(
             text,
-            attributes.attributes,
+            attributes.layoutAttributes,
             decorations.decorations,
             embeds.embeds,
             metrics.density,
             metrics.scaledDensity,
             Locale.getDefault().toLanguageTag(),
+            resolvedTypefaces(attributes.layoutAttributes),
         )
     }
 
@@ -259,8 +258,14 @@ internal object RunLayoutCache {
         val metrics = DisplayMetricsHolder.getWindowDisplayMetrics()
         return key.density == metrics.density &&
             key.scaledDensity == metrics.scaledDensity &&
-            key.localeTag == Locale.getDefault().toLanguageTag()
+            key.localeTag == Locale.getDefault().toLanguageTag() &&
+            key.typefaces == resolvedTypefaces(key.attributes)
     }
+
+    private fun resolvedTypefaces(attributes: List<RunAttributedText.Attribute>): List<Typeface> =
+        attributes.mapNotNull { attribute ->
+            attribute.fontFamily?.let { RunTypefaces.resolve(it, attribute.fontWeight ?: 400, attribute.italic) }
+        }
 
     /**
      * The styled string for a key: cached, or built by the one builder and

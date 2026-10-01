@@ -1,3 +1,4 @@
+import { IS_DEV } from '../dev';
 import { Fragment, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Image, Linking, Text, View } from 'react-native';
@@ -16,6 +17,9 @@ import { isUrlAllowed, sanitizeUrl } from '../engine/urlPolicy';
 import type { MarkdownTheme } from './theme';
 import { headingFontSize } from './theme';
 
+// Native Image forwards View props, although ImageProps omits pointerEvents.
+const NONINTERACTIVE_IMAGE_PROPS = { pointerEvents: 'none' as const };
+
 export interface RenderContext {
   theme: MarkdownTheme;
   renderers: RendererMap;
@@ -23,56 +27,16 @@ export interface RenderContext {
   source: string;
   /** Nesting depth of the list currently being rendered (0 = top level). */
   listDepth: number;
-  /**
-   * How many nodes deep in the DOCUMENT this render is — every node kind,
-   * not just lists — maintained by {@link renderNode} and compared against
-   * {@link MAX_RENDER_DEPTH}. Absent means 0, so a `RenderContext` built by
-   * hand starts at the top; a consumer never sets this.
-   */
+  /** Document depth, maintained by {@link renderNode}; absent means 0. Consumers never set it. */
   depth?: number;
   /**
-   * Whether the blocks rendered with this context may be selected — the
-   * platform tail policy, resolved by the view and applied by every renderer
-   * that sets `selectable` on a `<Text>`.
-   *
-   * `false` means the text under these renderers is still changing: this is
-   * the STANDALONE half of the policy `RunHost` applies to flowing runs
-   * (`segmentRuns` emits an unsettled run with `selectable: false`, and the
-   * view decides what each platform does with it). Android's ActionMode
-   * misbehaves — and on some OEM builds crashes — when the text under an
-   * active selection is swapped, which is what a standalone block in the
-   * streaming tail does on every delta.
-   *
-   * A consumer's own renderer should pass it through to any `selectable`
-   * text it renders, for the same reason.
-   *
-   * OPTIONAL, AND ABSENT MEANS SELECTABLE. The view always sets it; a
-   * `RenderContext` built by hand to call the exported `renderNode` /
-   * `renderBlocks` need not, and the default is the answer a hand-built
-   * context wants — nothing outside a stream has text that is still moving.
-   * Every built-in renderer reads it as `ctx.selectable ?? true`, so an
-   * omitted field can never quietly turn the library's headline feature off.
+   * `false` while these blocks are still streaming, since Android's ActionMode breaks when text under
+   * a selection is swapped. A custom renderer passes it to any `selectable` text. Absent means selectable.
    */
   selectable?: boolean;
   /**
-   * The link prefixes `urlPolicy.linkPrefixes` allows, re-checked HERE, at
-   * the moment of navigation, by `openUrl`.
-   *
-   * The allowlist's own doc comment says the check "has to run where the node
-   * is built ... so there is no unsafe `href` to forget" — which is true of
-   * `nativeEngine` and of nothing else. `parseDocument` runs no policy pass
-   * over a substituted engine's output (`Engine.ts`: whatever the engine
-   * returns IS the document), and honouring the flags is explicitly optional
-   * for an engine author, so a `javascript:` href from a custom parser used
-   * to reach `Linking.openURL` through this renderer with nothing in between.
-   * `SelectableMarkdown` fills this in from the options the document was
-   * parsed with, so the same list decides twice.
-   *
-   * Absent falls back to `DEFAULT_LINK_PREFIXES` rather than to "allow
-   * anything": a context built by hand (a consumer driving `renderBlocks`
-   * itself) gets the shipped policy, and a custom scheme it means to open
-   * has to say so — the safe direction for a value that ends up at
-   * `openURL`.
+   * The allowlist `openUrl` re-checks at navigation, since a custom engine's hrefs are unchecked.
+   * Absent means `DEFAULT_LINK_PREFIXES`.
    */
   linkPrefixes?: readonly string[];
   /** Set while rendering a table's cells. */
@@ -95,7 +59,7 @@ export type RendererOverrides = {
   [K in NodeKind]?: (node: NodeOfKind<K>, ctx: RenderContext) => ReactNode;
 };
 
-const IS_DEV = typeof __DEV__ === 'boolean' ? __DEV__ : true;
+
 
 function bodyTextStyle(theme: MarkdownTheme): TextStyle {
   return {
@@ -130,13 +94,7 @@ function renderListMarker(marker: string, ctx: RenderContext): ReactNode {
 
 /**
  * Best-effort plain text of a node: decoded values, else children, else raw
- * source.
- *
- * Walked with an explicit stack rather than recursively, because this is the
- * fallback the depth cap in {@link renderNode} lands on: it is called with
- * exactly the subtrees that were too deep to render, so a recursive version
- * would overflow on the input the cap exists to survive. (`childrenOf` is
- * itself flat, and `visit` is an explicit stack for the same reason.)
+ * source. Iterative, because the depth cap calls it on subtrees too deep to recurse.
  */
 export function textContentOf(node: AnyNode, source: string): string {
   const parts: string[] = [];
@@ -182,22 +140,9 @@ export function textContentOf(node: AnyNode, source: string): string {
  * linked — the exact class of disagreement this module's renderers are kept
  * in step with `runAttributes.ts` to avoid.
  *
- * AND IT IS WHERE THE URL ALLOWLIST IS ENFORCED FOR EVERY ENGINE. The policy
- * runs inside the md4c decoder, one node at a time, which is what makes
- * `nativeEngine` incapable of returning a rejected `href`. It is not a
- * property of `parseDocument`: a substituted engine (`engine` prop) may
- * treat `options.urlPolicy` as the optional flag the `Engine` contract says
- * it is, and nothing between it and this call re-checked the string. So the
- * navigation boundary checks too — the same `sanitizeUrl` + `isUrlAllowed`
- * pair, against the same resolved `linkPrefixes` — and a href that fails is
- * a no-op instead of an `openURL`.
- *
- * `allowedPrefixes` omitted means `DEFAULT_LINK_PREFIXES`, not "allow
- * anything": the caller that knows the document's policy (`SelectableMarkdown`,
- * and any `RenderContext` it builds) passes it, and a caller that does not
- * gets the shipped one. The sanitized string is what opens, so the URL the
- * allowlist judged is the URL that navigates — the discipline the decoder
- * already applies when it stores the href on the node.
+ * It also enforces the URL allowlist for every engine, since a substituted
+ * engine's hrefs are unchecked. Omitted `allowedPrefixes` means
+ * `DEFAULT_LINK_PREFIXES`, and the sanitized string is what opens.
  */
 export function openUrl(
   href: string,
@@ -213,25 +158,13 @@ export function openUrl(
   });
 }
 
-/** Schemes already named in a refusal warning; same warn-once discipline as
- * the unknown-renderer warning below, keyed on the scheme so one bad custom
- * scheme in a transcript does not warn per link. */
 const warnedSchemes = new Set<string>();
 
-/**
- * A refused navigation is silent to the user — the tap does nothing — so in
- * DEV it says why. It is worth a line because the shape that produces it is
- * a consumer misconfiguration, not an attack: a custom engine (or a custom
- * `RenderContext`) plus a scheme the app forgot to add to
- * `urlPolicy.linkPrefixes`.
- */
 function warnRefusedUrl(url: string): void {
   if (!IS_DEV) {
     return;
   }
-  // The scheme and nothing else: the rest of a URL is content, and a warning
-  // is not the place to print it. A string with no scheme at all (a bare
-  // '#anchor' from a custom engine) is named as such rather than sliced.
+  // Only the scheme: the rest of a URL is content.
   const colon = url.indexOf(':');
   const scheme = colon === -1 ? '(no scheme)' : url.slice(0, colon + 1).toLowerCase();
   if (warnedSchemes.has(scheme)) {
@@ -277,41 +210,13 @@ function SpoilerSpan(props: { node: SpoilerNode; ctx: RenderContext }): ReactNod
 const typedDefaults: RendererMap = {
   // -- Blocks ---------------------------------------------------------------
 
-  // WHY `paragraph`, `heading`, `blockquote`, `list`, `htmlBlock`, `codeBlock`
-  // AND `tableCell` SET `selectable`, AND WHY IT COMES FROM `ctx`. It is about
-  // where they run, not about how they look.
+  // These set `selectable` because a standalone block renders outside any host,
+  // and take it from `ctx` because the standalone tail has its own policy.
   //
-  // Inside a prose run none of them runs AT ALL. `RunHost` mounts one childless
-  // native host built from `text` plus `attributes`, and `renderBlocks` is
-  // reached only through `RunView`'s `run.standalone` branch, so no renderer
-  // ever sits inside a host to argue with it about selection. The case this
-  // prop is for is that *standalone* one — `segmentRuns` makes a block
-  // standalone when it carries a spoiler, an unclaimed image (`images:
-  // 'standalone'`, or one the embed box cannot reserve for), or a node
-  // `classifyBlock` claimed, and a standalone block renders outside any
-  // host. Without the prop, a paragraph containing an image was not selectable
-  // at all: not by a custom menu item, not even by the system Copy that every
-  // other standalone block already offered, in a library whose headline feature
-  // is selection. (`listItem` is deliberately not among them: it is only ever
-  // rendered nested inside `list`.)
-  //
-  // Setting it on renderers that end up NESTED inside another renderer's
-  // `<Text>` — a paragraph inside `blockquote`, or one inside a `list`'s items
-  // — is inert rather than contradictory: a nested <Text> renders as
+  // On a nested `<Text>` it is inert: a nested <Text> renders as
   // RCTVirtualText, and `selectable` is not in that component's
   // `validAttributes` (Libraries/Text/TextNativeComponent.js:63-69), so React
-  // drops it before it reaches any diff. The outermost `<Text>` of the
-  // standalone block is the one that decides.
-  //
-  // `ctx.selectable` and not a hardcoded `true` because the standalone path
-  // has a tail policy of its own. This comment used to say the Android policy
-  // — no selection over text that is still changing, because
-  // `TextView#setText` drops the selection and the ActionMode — "cannot be
-  // undone from in here", and that was exactly the bug: `segmentRuns` computed
-  // `selectable: false` for an unsettled standalone block, the standalone
-  // branch of `RunView` never read it, and a paragraph whose image had arrived
-  // while its text kept growing sat selectable over moving text. The view now
-  // resolves the policy once and puts the answer here.
+  // drops it and the outermost `<Text>` decides.
 
   paragraph: (node, ctx) => (
     <Text selectable={ctx.selectable ?? true} style={bodyTextStyle(ctx.theme)}>
@@ -372,10 +277,7 @@ const typedDefaults: RendererMap = {
         style={{
           backgroundColor: quote.background,
           borderRadius: quote.borderRadius,
-          // `paddingStart`, not `paddingLeft`: the bar sits at the quote's
-          // LEADING edge, which is the right edge under an RTL layout
-          // direction. The pair with `start: 0` on the capsule below is what
-          // keeps the two together when the direction flips.
+          // `paddingStart` with `start: 0` below keeps the bar on the leading edge under RTL.
           paddingStart: quote.barWidth + quote.indent,
           paddingVertical: quote.paddingVertical,
         }}
@@ -394,8 +296,6 @@ const typedDefaults: RendererMap = {
             backgroundColor: quote.barColor,
             borderRadius: quote.barWidth / 2,
             bottom: 0,
-            // Logical, like the padding above: `start` is the left edge in an
-            // LTR layout and the right edge in an RTL one.
             start: 0,
             position: 'absolute',
             top: 0,
@@ -533,13 +433,7 @@ const typedDefaults: RendererMap = {
           style={{
             ...bodyTextStyle(theme),
             fontWeight: ctx.tableHeader ? theme.table.headerWeight : 'normal',
-            // `'auto'` — React Native's own default — and not `'left'` for a
-            // column the table declares no alignment for. A physical 'left'
-            // pins an unaligned cell to the left of the screen even when the
-            // paragraph runs right-to-left, which is the one case where the
-            // absent declaration means "whichever way this text reads". A
-            // column that DOES declare left/center/right keeps it: those are
-            // the author's physical alignment, as GFM defines them.
+            // `'auto'`, not `'left'`: an undeclared column follows the text direction.
             textAlign: align ?? 'auto',
           }}
         >
@@ -622,26 +516,8 @@ const typedDefaults: RendererMap = {
   ),
 
   link: (node, ctx) => {
-    // `blocked` means the href failed the URL policy and survived as a node
-    // because `urlPolicy.blockedLinks: 'node'` was set. Until a renderer
-    // claims it, it draws like the text node it replaces: its label and no
-    // press — coloured with `colors.blockedLink` when that token is set (the
-    // same rule `styleForMark` applies on the native path, and like there
-    // with no underline: the policy refused this href as a destination),
-    // otherwise unstyled so the surrounding text tree keeps supplying the
-    // style.
-    //
-    // WHICH BLOCKED LINKS EVER REACH THIS RENDERER: only the ones in a
-    // STANDALONE block. Prose flows into a native run, and a run has no
-    // renderers in it at all — a blocked link there is a `blockedLink` mark
-    // over projected text, reachable through `attributeForMark` (styling),
-    // `onLinkPress` (taps, and the only channel that hears about blocked
-    // ranges) and `embed` (a real element inside the sweep), or through
-    // `classifyBlock` returning 'standalone', which is what puts the block
-    // back on this path. An override here that expects to draw citation
-    // pills in ordinary paragraphs draws nothing at all; see the `renderers`
-    // prop in `SelectableMarkdown`, which warns about exactly that pairing
-    // in DEV.
+    // Only a standalone block reaches here; in a run a blocked link is a `blockedLink` mark.
+    // Drawn as its label with no press, coloured like `styleForMark` does when the token is set.
     if (node.blocked) {
       const blockedColor = ctx.theme.colors.blockedLink;
       return blockedColor ? (
@@ -682,7 +558,10 @@ const typedDefaults: RendererMap = {
 
   image: (node, ctx) => (
     <Image
+      {...NONINTERACTIVE_IMAGE_PROPS}
       accessibilityLabel={node.alt}
+      accessible={node.alt.length > 0}
+      accessibilityRole="image"
       resizeMode="contain"
       source={{ uri: node.src }}
       style={{ height: ctx.theme.spacing.imageHeight, width: '100%' }}
@@ -743,81 +622,17 @@ export function resolveRenderers(overrides?: RendererOverrides): RendererMap {
 const warnedKinds = new Set<string>();
 
 /**
- * How many nodes deep a standalone block may be rendered before the tree is
- * flattened to text.
- *
- * WHY THERE IS A CAP AT ALL. Markdown nesting is unbounded and model output
- * is untrusted: 3 kB of `'> '` is a 1500-level blockquote, and every level of
- * it would otherwise become a `<View>` (plus its bar, plus a `<Text>`) around
- * the next one. Nothing in JavaScript overflows on that. React's render loop
- * is iterative, and so is every walk this library puts a document through on
- * the way here: the flat-buffer decode drains an explicit frame stack and
- * flattens inline subtrees with a second one (`plainText`, for a blocked
- * link's fallback text and an image's alt), and the spoiler transform, the
- * streaming span shift, the placeholder trim, segmentation and projection each
- * drain one of their own. (The streaming repair never descends a tree at all —
- * it scans lines.) `renderNode` is not on that list either: it walks nothing,
- * it renders ONE node and hands the descent back to React, and what it carries
- * down the context is a depth counter — which is what lets this cap be applied
- * in the single place every nested render passes through.
- *
- * WHAT DOES NOT SURVIVE THE DEPTH IS THE ELEMENT TREE. It becomes a shadow
- * tree of the same depth, and Yoga lays that out with a recursive C++ walk on
- * both platforms. Blowing a native stack is not an exception a
- * JavaScript `try` can catch, and short of that it is thousands of shadow
- * nodes and view mounts for a construct nobody can read anyway. The cap makes
- * the depth a property of this library instead of a property of the input.
- *
- * WHAT HAPPENS AT THE CAP. The node is rendered FLAT: one `<Text>` holding
- * `textContentOf` of the whole subtree, so every character the document
- * carries is still displayed and still selectable — what is lost is the
- * per-level chrome (quote bars, list markers, code backgrounds) below the
- * cap, and inline styling inside it. Nothing is dropped, nothing throws.
- *
- * 64 is far past anything a human writes — six levels of nested list is
- * `list`/`listItem`/`paragraph` eighteen deep, plus a few inline wrappers —
- * and far below where the native side starts to hurt. It is also only
- * reachable for STANDALONE blocks: prose flows into a native run, where
- * nesting is a flat list of marks and this path never runs at all.
+ * Depth past which a standalone block renders flat, as one selectable `<Text>`
+ * of its text, so untrusted nesting cannot drive Yoga's recursive layout.
  */
 export const MAX_RENDER_DEPTH = 64;
 
-/** Warn-once for the cap, the same discipline as `warnedKinds`. */
 let warnedDepth = false;
 
 /**
- * One node, rendered through its renderer AS A COMPONENT.
- *
- * WHY THE WRAPPER EXISTS. `renderNode` used to call `renderer(node, ctx)`
- * directly, which is a function call and not element position: whatever the
- * renderer did ran inside whichever component was rendering the tree — for a
- * standalone block, `RunView`. A hook in a consumer's renderer therefore
- * joined RUNVIEW's hook list, so two renderers' `useState`s shared one list,
- * their order depended on how many nodes happened to be above them, and any
- * conditional render ("only draw the chip once the image has loaded") changed
- * the hook count between renders — React's "Rendered more hooks than during
- * the previous render". The library itself already followed the rule the API
- * did not offer: the built-in spoiler wraps its `useState` in a real
- * `<SpoilerSpan>` component (see it above).
- *
- * With element position each node's renderer gets its own instance, so hooks
- * work the way a consumer would expect them to, state is per node position,
- * and a renderer that returns nothing for a node simply unmounts.
- *
- * ONE WRAPPER TYPE PER RENDERER FUNCTION, which is the other half of the same
- * rule. A single shared wrapper type made every renderer look like the same
- * component to React, so swapping the renderer at a stable position —
- * `renderers={editing ? draftRenderers : readRenderers}`, or an embed claim
- * that starts returning a different `render` for the same span — reconciled IN
- * PLACE and handed the new function the old function's hook list: the narrower
- * version of the very mismatch this wrapper exists to prevent. Keying the
- * wrapper on the renderer's identity makes a different function a different
- * component type, which is what tells React to unmount and remount.
- *
- * The cost is the ordinary React one, and the `renderers` prop says so: a
- * renderer whose identity changes on every render (an arrow written inline in
- * JSX) now remounts on every render, exactly as an inline component does.
- * Declare renderers at module scope or memoize them.
+ * Each renderer function gets its own wrapper component type, so its hooks get
+ * their own instance and swapping the renderer remounts. An inline arrow
+ * renderer therefore remounts every render.
  */
 type RenderedNodeProps = {
   render: NodeRenderer;
@@ -829,8 +644,6 @@ type RenderedNodeType = ((props: RenderedNodeProps) => ReactNode) & {
   displayName?: string;
 };
 
-/** The wrapper component built for each renderer function, kept weakly so a
- * renderer that goes away takes its wrapper with it. */
 const nodeWrappers = new WeakMap<NodeRenderer, RenderedNodeType>();
 
 function wrapperFor(render: NodeRenderer): RenderedNodeType {
@@ -841,26 +654,12 @@ function wrapperFor(render: NodeRenderer): RenderedNodeType {
   function RenderedNode(props: RenderedNodeProps): ReactNode {
     return props.render(props.node, props.ctx);
   }
-  // Named for the React devtools tree, where a document is otherwise a wall of
-  // identically-named wrappers.
   RenderedNode.displayName = `RenderedNode(${render.name || 'anonymous'})`;
   nodeWrappers.set(render, RenderedNode);
   return RenderedNode;
 }
 
-/**
- * The context one level deeper than this one, cached on the context it came
- * from.
- *
- * The depth is a property of the PARENT context and not of the node, so every
- * sibling at one level derives the identical object. Building a fresh
- * `{ ...ctx, depth }` per node per render instead — which this used to do —
- * gave every child a context that was `===` to nothing, so a consumer renderer
- * that memoizes on it (`React.memo`, a `useMemo` keyed on `ctx`) re-rendered
- * on every commit no matter what. Cached on the parent, the derived context
- * lives exactly as long as the parent does — which for the view's own context
- * is its `useMemo`, so it survives renders and the memo actually holds.
- */
+// Cached on the parent so siblings share one context and a memo keyed on `ctx` holds.
 const deeperContexts = new WeakMap<RenderContext, RenderContext>();
 
 function contextOneDeeper(ctx: RenderContext): RenderContext {
@@ -877,21 +676,12 @@ function contextOneDeeper(ctx: RenderContext): RenderContext {
  * Renders one node through the per-kind map. Unknown kinds render their text
  * content (DEV warn-once) — this function never throws for missing renderers.
  *
- * The renderer is placed as an element, not called, and the element's type is
- * the wrapper built for that particular renderer function: see `wrapperFor`.
- *
- * It is also the one funnel every nested render passes through — a renderer
- * reaches its children through `renderInlines`, `joinBlockChildren` or
- * `renderBlocks`, and all three come back here — which is what lets the
- * depth counter live in the context and the {@link MAX_RENDER_DEPTH} cap be
- * applied in exactly one place.
+ * Every nested render funnels back through here, which is where the
+ * {@link MAX_RENDER_DEPTH} cap applies.
  */
 export function renderNode(node: AnyNode, ctx: RenderContext): ReactNode {
   const depth = (ctx.depth ?? 0) + 1;
   if (depth > MAX_RENDER_DEPTH) {
-    // Past the cap the subtree is flattened to its text rather than nested
-    // any further. `selectable` is passed through so the flattened text is
-    // still selectable and copyable, exactly like the block it came from.
     if (IS_DEV && !warnedDepth) {
       warnedDepth = true;
       console.warn(
@@ -914,10 +704,6 @@ export function renderNode(node: AnyNode, ctx: RenderContext): ReactNode {
         `[react-native-selectable-markdown] No renderer for node kind "${node.kind}"; rendering its text content.`,
       );
     }
-    // `selectable` like every other fallback, including the depth cap three
-    // lines up: an unknown kind is text the document still has to show, and
-    // leaving the prop off made it the one construct in a standalone block
-    // that could never be selected.
     return (
       <Text
         selectable={ctx.selectable ?? true}
@@ -927,12 +713,7 @@ export function renderNode(node: AnyNode, ctx: RenderContext): ReactNode {
       </Text>
     );
   }
-  // A deeper context so the depth the renderer's own children see is one
-  // below this one — the counter cannot be a module-level variable because
-  // the renderer runs later, inside React, not during this call. It is shared
-  // by every node at this level rather than rebuilt per node (see
-  // `contextOneDeeper`), and the element's TYPE is this renderer's own
-  // wrapper, so replacing the renderer remounts instead of reusing hooks.
+  // Depth rides the context because the renderer runs later, inside React.
   const Rendered = wrapperFor(renderer);
   return (
     <Rendered ctx={contextOneDeeper(ctx)} node={node} render={renderer} />

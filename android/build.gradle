@@ -57,13 +57,8 @@ apply plugin: 'org.jetbrains.kotlin.android'
 //
 // WHAT APPLYING IT BUYS. ReactPlugin.kt:91-93 runs configureCodegen(isLibrary
 // = true) for every com.android.library that applies it, and the onlyIf guards
-// on both codegen tasks (:177, :201) pass for every library. So the generated
-// SelectableRunHostManagerInterface is on the classpath in any app that can
-// build this module, which is what lets SelectableRunHostViewManager implement
-// it unconditionally — the single compile-time link between
-// src/view/SelectableRunHostNativeComponent.ts and the Kotlin setters. Rename
-// a prop in the spec without renaming the setter and this module stops
-// compiling, instead of shipping a prop that silently never arrives.
+// on both codegen tasks (:177, :201) pass for every library, so the generated
+// SelectableRunHostManagerInterface makes a spec prop rename a Kotlin compile error.
 apply plugin: 'com.facebook.react'
 
 def safeExtGet(prop, fallback) {
@@ -110,11 +105,11 @@ def reactNativeArchitectures() {
 
 android {
     namespace 'com.selectablemarkdown'
-    compileSdk safeExtGet('compileSdkVersion', 34)
+    compileSdk safeExtGet('compileSdkVersion', 36)
 
     defaultConfig {
-        minSdkVersion safeExtGet('minSdkVersion', 23)
-        targetSdkVersion safeExtGet('targetSdkVersion', 34)
+        minSdkVersion safeExtGet('minSdkVersion', 24)
+        targetSdkVersion safeExtGet('targetSdkVersion', 36)
 
         externalNativeBuild {
             cmake {
@@ -196,17 +191,6 @@ repositories {
 dependencies {
     // Version is resolved by the host app's React Native gradle plugin.
     implementation 'com.facebook.react:react-android'
-    // `androidx.customview.widget.ExploreByTouchHelper`, the virtual-view
-    // provider RunAccessibility.kt puts over a run's links and headings.
-    //
-    // IT ALREADY ARRIVES TRANSITIVELY, and is named anyway. React Native's
-    // own artifact publishes appcompat as an `api` dependency, and
-    // appcompat -> drawerlayout -> customview, which is the only reason
-    // React Native's `ReactAccessibilityDelegate` can extend the same class
-    // without declaring it either. Relying on a two-hop transitive for a
-    // type this module imports directly is how a library breaks on somebody
-    // else's dependency upgrade, so the coordinate is stated here. The
-    // version is a floor, not a pin: Gradle resolves the highest across the
-    // graph, and 1.1.0 has been the current stable since 2020.
+    // Also transitive through appcompat; named because RunAccessibility.kt imports it directly.
     implementation 'androidx.customview:customview:1.1.0'
 }

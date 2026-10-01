@@ -18,6 +18,7 @@ import { makeDoc, plainParagraph, spanOf, textNode } from './fixtures';
 describe('segmentRuns', () => {
   it('returns no runs for an empty document', () => {
     expect(segmentRuns(makeDoc('', []))).toEqual([]);
+    expect(segmentRuns(makeDoc('a', [plainParagraph('a', 'a')]))).toHaveLength(1);
   });
 
   it('merges adjacent prose blocks into a single run', () => {
@@ -148,16 +149,6 @@ describe('segmentRuns', () => {
     expect(runs[0].blocks).toEqual([above, rule, below]);
   });
 
-  // A BLOCK THAT PROJECTS NO TEXT FLOWS ONLY IN COMPANY. Alone it projects
-  // the empty string — no text of its own, and separators exist only between
-  // blocks — and the native hosts measure empty text to a 0×0 box and skip
-  // decoration drawing, so such a run would silently vanish.
-  //
-  // The rule is not about thematic breaks, and the cases are not
-  // pathological: '```', '```py\n' and '> ' are all ordinary STREAMING
-  // PREFIXES, so a message that opens with a code fence or a quote used to
-  // draw a 0×0 host until its first character of content arrived. These pin
-  // the standalone fallback that keeps every one of them visible.
   describe('blocks that project no text', () => {
     it('makes a document that is only a rule a standalone run', () => {
       const source = '---\n';
@@ -239,11 +230,6 @@ describe('segmentRuns', () => {
     });
 
     it('makes an unfinished code fence standalone', () => {
-      // '```py\n' arriving from a stream: the fence is open and not one
-      // character of code has landed, so the projection is the empty string
-      // — and worse than the rule's case, an empty `codeBlock` mark is
-      // dropped when it closes, so there is not even a zero-length mark for
-      // the view layer to draw a box around.
       const source = '```py\n';
       const code: CodeBlockNode = {
         kind: 'codeBlock',
@@ -261,8 +247,6 @@ describe('segmentRuns', () => {
     });
 
     it('makes a blockquote holding nothing but a rule standalone', () => {
-      // The emptiness is two levels down, which is why the test is a walk
-      // and not a `kind === 'thematicBreak'` check on the top-level block.
       const source = '> ***\n';
       const rule: ThematicBreakNode = {
         kind: 'thematicBreak',
@@ -314,11 +298,6 @@ describe('segmentRuns', () => {
     });
 
     it('keeps an empty code fence flowing when a neighbour carries the text', () => {
-      // THE DEMOTION IS ABOUT THE WHOLE GROUP, NOT THE BLOCK. One paragraph
-      // is text enough for the host to lay out, so breaking the run here
-      // would cost the sweep and buy nothing — the empty block still draws no
-      // box (an empty range leaves no mark to decorate), but it is no longer
-      // a hole where the run should be.
       const source = 'Intro.\n\n```\n```';
       const intro = plainParagraph(source, 'Intro.');
       const code: CodeBlockNode = {
@@ -336,8 +315,6 @@ describe('segmentRuns', () => {
     });
 
     it('keeps a code fence with one character of content flowing', () => {
-      // The frame after the fence prefix: as soon as the stream delivers a
-      // character, the block projects text again and rejoins the sweep.
       const source = '```py\nx';
       const code: CodeBlockNode = {
         kind: 'codeBlock',
@@ -354,8 +331,6 @@ describe('segmentRuns', () => {
     });
 
     it('keeps a list of empty items flowing: the markers are text', () => {
-      // Every item projects its bullet glyph, so the run has characters to
-      // lay out even when no item has content of its own.
       const source = '-\n-';
       const list: ListNode = {
         kind: 'list',
@@ -860,9 +835,6 @@ describe('segmentRuns', () => {
     it('rejects every size that is not positive and finite', () => {
       // Each of these is inert as a claim, so the standalone `classifyBlock`
       // claim on the same link decides and the document stays three runs.
-      // Infinity is here because it is the one that used to get through:
-      // `Infinity > 0` is true, so an infinite reservation reached the hosts
-      // and saturated a CGRect / a ReplacementSpan width.
       const sizes: { width: number; height: number }[] = [
         { width: 0, height: 80 },
         { width: -10, height: 80 },
@@ -885,7 +857,14 @@ describe('segmentRuns', () => {
 
     it('behaves byte-identically to today when nothing is claimed', () => {
       const withLookup = segmentRuns(doc, { embed: () => undefined });
-      expect(withLookup).toEqual(segmentRuns(doc));
+      expect(withLookup).toEqual([
+        {
+          span: { start: 0, end: source.length },
+          blocks: [answer, card, followUp],
+          selectable: true,
+          standalone: false,
+        },
+      ]);
     });
 
     it('still splits at the settled boundary', () => {
@@ -921,9 +900,6 @@ describe('segmentRuns', () => {
     });
 
     it('does not demote an embedded empty code fence to standalone', () => {
-      // The exemption is not special-cased per kind: it lives in the
-      // projects-text test, which counts an embed's U+FFFC placeholder as
-      // the character it is.
       const fenceSource = '```\n```';
       const code: CodeBlockNode = {
         kind: 'codeBlock',
@@ -934,9 +910,7 @@ describe('segmentRuns', () => {
       };
       const fenceDoc = makeDoc(fenceSource, [code]);
 
-      // Unclaimed, an empty fence demotes (an empty run cannot draw)…
       expect(segmentRuns(fenceDoc)[0].standalone).toBe(true);
-      // …embedded, it projects a placeholder character, so it may flow.
       const runs = segmentRuns(fenceDoc, {
         embed: (node) =>
           node.kind === 'codeBlock' ? { width: 300, height: 40 } : undefined,
@@ -997,21 +971,11 @@ describe('segmentRuns', () => {
   });
 });
 
-/**
- * NESTING DEPTH IS UNTRUSTED INPUT, and segmentation is the first walk that
- * sees it: `classifyTopLevelBlock` asks whether a prose block holds anything
- * that cannot live in a run's text tree, and answering means descending the whole
- * subtree. Five kilobytes of `'> '` is 2500 levels, which used to overflow
- * the JS stack right here — before any of the document reached the screen.
- * The tree is hand-built, so the test needs no parser.
- */
 describe('unbounded nesting depth', () => {
   const DEPTH = 20_000;
 
   it('walks to the bottom of a 20000-deep block without overflowing', () => {
-    // An image at the very bottom is the worst case: it is a view kind, so
-    // the walk cannot stop early — it has to reach the last level to find the
-    // thing that makes the whole stack standalone.
+    // An image at the bottom forces the walk to reach the last level.
     const source = '> '.repeat(DEPTH) + '![alt](img.png)';
     const span = { start: DEPTH * 2, end: source.length };
     const image: ImageNode = { kind: 'image', src: 'img.png', alt: 'alt', span };
@@ -1055,18 +1019,11 @@ describe('unbounded nesting depth', () => {
 
     expect(runs).toHaveLength(1);
     expect(runs[0].standalone).toBe(false);
-    // The top-level block, every nested blockquote, the paragraph and its
-    // text node — the same nodes the recursive walk visited.
+    // The top-level block, every nested blockquote, the paragraph and its text node.
     expect(seen).toBe(DEPTH + 2);
   });
 });
 
-/**
- * A document of `count` paragraphs, each `width` characters wide, separated by
- * blank lines. Spans are computed rather than searched, so the paragraphs need
- * not be unique and a 200-block document costs nothing to build — `plainParagraph`
- * locates its span with `indexOf`, which cannot express repeated prose.
- */
 function proseDocument(count: number, width: number): ParsedDocument {
   let source = '';
   const blocks: Block[] = [];
@@ -1086,19 +1043,7 @@ function proseDocument(count: number, width: number): ParsedDocument {
   return makeDoc(source, blocks);
 }
 
-/**
- * THE COST OF SEGMENTING A DOCUMENT THAT MOSTLY DID NOT CHANGE.
- *
- * `segmentRuns` runs on every streamed snapshot (the view's memo keys on the
- * snapshot's document object, which is new per delta) and classifying a prose
- * block descends its whole subtree. Unmemoized that is an O(document nodes)
- * walk per token — quadratic over a message, and measured at the same order as
- * the entire parse+decode+append path it sits behind. Settled blocks are the
- * SAME OBJECTS on every later snapshot, which is what makes the memo in
- * `classifyTopLevelBlock` both possible and exact.
- */
 describe('classification memo', () => {
-  /** A `ClassifyBlock` that claims nothing and counts what it was offered. */
   function counting(): { classify: ClassifyBlock; visits: () => number } {
     let seen = 0;
     return {
@@ -1127,8 +1072,6 @@ describe('classification memo', () => {
     const { classify, visits } = counting();
     const perDelta: number[] = [];
 
-    // One "delta" per block: the document grows by one block, every earlier
-    // block is the same object, and only the new one may be walked.
     for (let count = 1; count <= doc.blocks.length; count += 1) {
       const before = visits();
       segmentRuns(makeDoc(doc.source, doc.blocks.slice(0, count)), {
@@ -1138,13 +1081,8 @@ describe('classification memo', () => {
       perDelta.push(visits() - before);
     }
 
-    // Flat, not merely sublinear: a paragraph is offered as itself, its text
-    // node, and nothing else, however long the document in front of it is.
-    expect(new Set(perDelta.slice(1)).size).toBe(1);
-    expect(perDelta[perDelta.length - 1]).toBe(perDelta[1]);
-    expect(perDelta.reduce((a, b) => a + b, 0)).toBeLessThan(
-      doc.blocks.length * 4,
-    );
+    // Each new paragraph is offered as itself and its text node, and nothing else.
+    expect(perDelta).toEqual(new Array(doc.blocks.length).fill(2));
   });
 
   it('re-walks when the classifyBlock identity changes', () => {
@@ -1155,7 +1093,9 @@ describe('classification memo', () => {
     segmentRuns(doc, { classifyBlock: first.classify });
     segmentRuns(doc, { classifyBlock: second.classify });
 
-    expect(second.visits()).toBe(first.visits());
+    // Ten paragraphs, each offered as itself and its text node.
+    expect(first.visits()).toBe(20);
+    expect(second.visits()).toBe(20);
   });
 
   it('re-walks when the embed identity changes, and can change the answer', () => {
@@ -1174,10 +1114,7 @@ describe('classification memo', () => {
     };
     const doc = makeDoc(source, [intro, block]);
 
-    // An image makes its paragraph standalone…
     expect(segmentRuns(doc)).toHaveLength(2);
-    // …unless a lookup claims it, and the memo must not answer for the first
-    // call when the second passes a different lookup.
     const claim: EmbedLookup = (node) =>
       node.kind === 'image' ? { width: 40, height: 40 } : undefined;
     expect(segmentRuns(doc, { embed: claim })).toHaveLength(1);
@@ -1185,19 +1122,6 @@ describe('classification memo', () => {
   });
 });
 
-/**
- * THE RUN-SIZE BUDGET. A run is one native text host, and the host re-measures
- * everything it holds each time the run grows — so with no cap a message is one
- * run and settling costs O(message) native layout per settle. The cap trades a
- * selection boundary (a sweep cannot cross hosts) for a bound on that, which is
- * why the default sits far above the length of anything anyone sweeps across.
- *
- * The property that matters as much as the cap itself is STABILITY: the packing
- * is greedy from the start of the document and depends only on blocks already
- * placed, so a boundary, once chosen, never moves. A boundary that moved would
- * change a run's `run:${span.start}` key mid-stream — a remount under a live
- * selection — and invalidate the incremental projection filed under it.
- */
 describe('run-size budget', () => {
   it('splits a long flowing sequence into several runs', () => {
     const doc = proseDocument(40, 100);
@@ -1208,7 +1132,6 @@ describe('run-size budget', () => {
       expect(run.standalone).toBe(false);
       expect(run.span.end - run.span.start).toBeLessThanOrEqual(500);
     }
-    // Every block still lands in exactly one run, in order.
     expect(runs.flatMap((run) => run.blocks)).toEqual(doc.blocks);
   });
 
@@ -1222,8 +1145,6 @@ describe('run-size budget', () => {
         settledUntil: doc.blocks[count - 1].span.end,
       }).map((run) => run.span.start);
 
-      // The previous tick's boundaries are still boundaries: the last run may
-      // have grown, and a new one may have opened, but nothing moved.
       expect(starts.slice(0, previous.length)).toEqual(previous);
       previous = starts;
     }
@@ -1251,8 +1172,7 @@ describe('run-size budget', () => {
   });
 
   it('keeps an ordinary message in one run under the default budget', () => {
-    // ~4 kB, longer than the shipped transcript fixtures and still half the
-    // default cap: nothing about a normal answer's selection changes.
+    // ~4 kB: longer than the shipped transcript fixtures, half the default cap.
     const doc = proseDocument(40, 100);
 
     expect(segmentRuns(doc)).toHaveLength(1);
@@ -1262,8 +1182,6 @@ describe('run-size budget', () => {
     const doc = proseDocument(400, 100);
 
     expect(segmentRuns(doc, { maxRunChars: Infinity })).toHaveLength(1);
-    // 0, negatives and NaN fall back to the default rather than producing one
-    // run per block.
     const zero = segmentRuns(doc, { maxRunChars: 0 });
     expect(zero).toEqual(segmentRuns(doc));
     expect(zero.length).toBeGreaterThan(1);
@@ -1271,18 +1189,6 @@ describe('run-size budget', () => {
   });
 });
 
-/**
- * THE LIVE TAIL, which is a run-boundary rule and not a settledness one.
- *
- * A stream settles at completed blank lines, so a chunk that ends on one
- * leaves nothing unsettled — every block frozen, `settledUntil` at the end of
- * the source — for as long as the next chunk takes to arrive. The settled/tail
- * break has nothing to break at, so the document collapses to one run and the
- * view's tail host (holding whatever the reader had selected in the last
- * paragraph) is unmounted and recycled. `liveTail` keeps the last block in a
- * run of its own across that window, so the boundary stays exactly where the
- * previous frame put it.
- */
 describe('live tail', () => {
   it('keeps the last block in its own run when everything has settled', () => {
     const doc = proseDocument(5, 100);
@@ -1298,18 +1204,12 @@ describe('live tail', () => {
     expect(kept).toHaveLength(2);
     expect(kept[0].blocks).toEqual(doc.blocks.slice(0, 4));
     expect(kept[1].blocks).toEqual([doc.blocks[4]]);
-    // Both halves are settled, because they are: this is a boundary, not a
-    // claim that the text is still being repaired. Marking the tail unsettled
-    // would make the last paragraph unselectable on Android for the whole
-    // window.
+    // An unsettled tail would make the last paragraph unselectable on Android.
     expect(kept.map((run) => run.selectable)).toEqual([true, true]);
     expect(kept.flatMap((run) => run.blocks)).toEqual(doc.blocks);
   });
 
   it('puts the boundary exactly where the unsettled frame had it', () => {
-    // The frame before the collapse and the collapse frame must segment the
-    // same way, or a host is handed different text (or destroyed) for a change
-    // the reader never made.
     const doc = proseDocument(5, 100);
     const beforeCollapse = segmentRuns(doc, {
       settledUntil: doc.blocks[3].span.end,
@@ -1327,23 +1227,34 @@ describe('live tail', () => {
 
   it('changes nothing while the tail is genuinely unsettled', () => {
     const doc = proseDocument(5, 100);
-    for (const settledUntil of doc.blocks.slice(0, -1).map((b) => b.span.end)) {
-      expect(segmentRuns(doc, { settledUntil, liveTail: true })).toEqual(
-        segmentRuns(doc, { settledUntil }),
-      );
+    for (let settled = 1; settled < doc.blocks.length; settled += 1) {
+      const settledUntil = doc.blocks[settled - 1].span.end;
+      const runs = segmentRuns(doc, { settledUntil, liveTail: true });
+      expect(runs.map((run) => [run.blocks.length, run.selectable])).toEqual([
+        [settled, true],
+        [doc.blocks.length - settled, false],
+      ]);
+      expect(runs.map((run) => run.span)).toEqual([
+        { start: 0, end: settledUntil },
+        { start: doc.blocks[settled].span.start, end: doc.source.length },
+      ]);
+      expect(runs).toEqual(segmentRuns(doc, { settledUntil }));
     }
   });
 
   it('leaves a one-block document, and a standalone last run, alone', () => {
-    // Nothing to peel: a single block cannot be both the settled prefix and
-    // the tail, and the first split is deliberately the one place the settled
-    // host wins (see `runKey`).
     const single = proseDocument(1, 100);
     expect(
       segmentRuns(single, { settledUntil: single.source.length, liveTail: true }),
-    ).toEqual(segmentRuns(single, { settledUntil: single.source.length }));
+    ).toEqual([
+      {
+        span: { start: 0, end: 100 },
+        blocks: single.blocks,
+        selectable: true,
+        standalone: false,
+      },
+    ]);
 
-    // A standalone block at the end is already its own run.
     const standalone = classifiedDocument();
     expect(
       segmentRuns(standalone, {
@@ -1351,16 +1262,43 @@ describe('live tail', () => {
         liveTail: true,
         classifyBlock: (node) => (node === standalone.blocks[2] ? 'standalone' : undefined),
       }),
-    ).toEqual(
-      segmentRuns(standalone, {
-        settledUntil: standalone.source.length,
-        classifyBlock: (node) => (node === standalone.blocks[2] ? 'standalone' : undefined),
-      }),
-    );
+    ).toEqual([
+      {
+        span: { start: 0, end: 82 },
+        blocks: standalone.blocks.slice(0, 2),
+        selectable: true,
+        standalone: false,
+      },
+      {
+        span: { start: 84, end: 124 },
+        blocks: [standalone.blocks[2]],
+        selectable: true,
+        standalone: true,
+      },
+    ]);
   });
 });
 
-/** Three paragraphs, so a test can claim the last one standalone. */
 function classifiedDocument(): ParsedDocument {
   return proseDocument(3, 40);
 }
+
+test('growing an unsettled paragraph preserves its run boundary', () => {
+  for (const source of ['one\n\ntwo', 'one\n\ntwo long']) {
+    const second = source.slice(5);
+    const doc = makeDoc(source, [plainParagraph(source, 'one'), plainParagraph(source, second)]);
+    expect(segmentRuns(doc, { settledUntil: 0, maxRunChars: 10 })).toHaveLength(1);
+  }
+});
+
+test('independent classifier identities retain their own cached results', () => {
+  const block = plainParagraph('one', 'one');
+  const first = jest.fn(() => 'flowing' as const);
+  const second = jest.fn(() => 'standalone' as const);
+  for (let i = 0; i < 3; i++) {
+    expect(classifyTopLevelBlock(block, first)).toBe('flowing');
+    expect(classifyTopLevelBlock(block, second)).toBe('standalone');
+  }
+  expect(first).toHaveBeenCalledTimes(1);
+  expect(second).toHaveBeenCalledTimes(1);
+});

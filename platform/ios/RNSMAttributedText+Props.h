@@ -55,25 +55,8 @@ NS_ASSUME_NONNULL_BEGIN
  * result is both what gets measured and — carried through Fabric State — what
  * gets drawn.
  *
- * `fontSizeMultiplier` is `LayoutContext::fontSizeMultiplier`, which React
- * Native fills from `RCTFontSizeMultiplier()` — the content size category
- * mapped to a scalar — and refreshes on
- * `UIContentSizeCategoryDidChangeNotification`
- * (React/Fabric/Surface/RCTFabricSurface.mm), which re-runs layout for the
- * whole surface. Every font size and line height in the string below is
- * multiplied by it, and nothing else is: paddings, insets and an embed's
- * declared reservation are points a consumer or the theme chose, exactly like
- * the paddings on a React Native `<View>`, and they do not scale.
- *
- * IT IS A PARAMETER RATHER THAN A READ OF THE CURRENT CATEGORY, and that is
- * what makes scaling safe here. This runs on the layout thread, and the
- * string it returns is both measured and (through Fabric State) drawn, so the
- * two cannot disagree about the size. Reading `RCTFontSizeMultiplier()` in
- * here instead would sample the main thread's idea of the category at an
- * arbitrary point in a layout pass, which is the measure/draw disagreement
- * docs/FABRIC-PLAN.md §4 exists to make impossible. RNSMRunHostShadowNode
- * memoises the prepared content on this exact scalar, so a category change
- * rebuilds the string and a commit that changes nothing else does not.
+ * `fontSizeMultiplier` is LayoutContext::fontSizeMultiplier, never a fresh
+ * RCTFontSizeMultiplier() read; it scales font sizes and line heights only.
  */
 + (NSAttributedString *)attributedStringWithProps:
     (const facebook::react::SelectableRunHostProps &)props

@@ -1,32 +1,11 @@
 #!/usr/bin/env node
 // Refuses to release a BREAKING change under a version that is already tagged.
 //
-// WHY THIS EXISTS. Release notes come from CHANGELOG.md's section for the tag
-// (scripts/changelog-section.mjs), and the workflow already refuses to publish
-// a tag with no section. Nothing looked at the OTHER half: an `## [Unreleased]`
-// section that says BREAKING while `package.json` still carries the version the
-// latest `v*` tag already names. That pair is one publish away from shipping a
-// breaking change inside a release whose notes never mention it — the audit
-// that prompted this guard left exactly that state behind (an `exports` map
-// that dropped ten names from the package root, a renamed export and a
-// deep path that stopped resolving, all under an unbumped 0.11.0).
-//
-// WHAT IT CHECKS, in one sentence: if CHANGELOG.md's Unreleased section
-// mentions BREAKING and package.json's version equals the version of the latest
-// `v*` tag, fail and say what to bump. Everything else passes.
-//
-// It is deliberately NOT a check that the bump is the right SIZE. Semver
-// arithmetic over a changelog is guesswork; "this version was already
-// released" is a fact, and it is the fact that decides whether the next publish
-// can carry the break at all.
+// Fails when CHANGELOG.md's Unreleased section mentions BREAKING and package.json's
+// version equals the latest `v*` tag. It does not judge the size of the bump.
 //
 // Usage: node scripts/check-unreleased-breaking.mjs [--tag vX.Y.Z]...
 //                [--changelog PATH] [--manifest PATH] [--no-git]
-//
-// The workflow passes `--tag "$GITHUB_REF_NAME"` so the tag being pushed counts
-// even in a shallow checkout that fetched no others. `--changelog`, `--manifest`
-// and `--no-git` exist so the guard can be exercised against fixtures;
-// `npm run release` and release.yml pass none of the three.
 
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -58,14 +37,7 @@ const fail = (message) => {
   process.exit(1);
 };
 
-/**
- * The `## [Unreleased]` section's body, or null when the file has none.
- *
- * Same section grammar as scripts/changelog-section.mjs — a `## ` heading whose
- * bracketed name is the one wanted, ending at the next `## ` — so the two agree
- * on where a section starts and stops. The name is matched case-insensitively
- * because the heading is prose, not an identifier.
- */
+/** Same section grammar as scripts/changelog-section.mjs; keep the two in step. */
 const unreleasedSection = (text) => {
   const lines = text.split('\n');
   const start = lines.findIndex(
@@ -82,7 +54,6 @@ const unreleasedSection = (text) => {
   return lines.slice(start + 1, end);
 };
 
-/** `vX.Y.Z[-pre]` → comparable parts, or null for a tag that is not one. */
 const parseVersion = (raw) => {
   const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(raw.trim());
   if (!match) return null;
@@ -93,14 +64,7 @@ const parseVersion = (raw) => {
   };
 };
 
-/**
- * Newest of two parsed versions.
- *
- * Numeric fields first, then the one semver rule that matters here: a release
- * outranks a prerelease of the same numbers. Two prereleases are compared as
- * strings, which is not the full semver ordering — it is enough to pick a
- * latest tag, and no publish decision rests on the order of two prereleases.
- */
+/** Prereleases compare as strings, not full semver: enough to pick a latest tag. */
 const newer = (a, b) => {
   for (let i = 0; i < 3; i += 1) {
     if (a.parts[i] !== b.parts[i]) return a.parts[i] > b.parts[i] ? a : b;
@@ -126,7 +90,7 @@ if (!fs.existsSync(manifestPath)) {
 }
 
 const section = unreleasedSection(fs.readFileSync(changelogPath, 'utf8'));
-const breaking = (section ?? []).filter((line) => line.includes('BREAKING'));
+const breaking = (section ?? []).filter((line) => /^\s*[-*]\s+(?:\*\*)?BREAKING\b/i.test(line));
 
 if (breaking.length === 0) {
   console.log(
@@ -143,10 +107,6 @@ if (!declared) {
   fail(`package.json version ${JSON.stringify(manifest.version)} is not an x.y.z version.`);
 }
 
-// The tag being pushed counts alongside the ones already in the repository:
-// release.yml passes it because `actions/checkout` may have fetched no other,
-// and because a tag that names this very version is exactly the case the guard
-// is about.
 const candidates = [...flagValues('tag'), ...gitTags()]
   .map(parseVersion)
   .filter((parsed) => parsed !== null);
@@ -170,9 +130,7 @@ if (latest.version !== declared.version) {
 }
 
 const [major, minor] = declared.parts;
-// Pre-1.0 this repository lands breaking changes in a MINOR (CHANGELOG.md's
-// header says so); from 1.0 on they are a major. Printing the number saves the
-// reader deciding which rule applies while they are mid-release.
+// Pre-1.0 a break bumps the minor, per CHANGELOG.md's header.
 const suggested = major === 0 ? `0.${minor + 1}.0` : `${major + 1}.0.0`;
 
 fail(

@@ -117,25 +117,8 @@ inline uint8_t packDetailFlags(const NodeEvent& event) {
   return flags;
 }
 
-/* detailA is one u32 whose meaning is disjoint per node type (Protocol.h).
- * The value is read straight off the event, never off the event kind. The
- * parser builds Leave events with default detail fields, so a Leave encodes
- * that node type's NodeEvent default — 0 for heading level and fence char,
- * 1 for orderedStart. That mirrors detailFlags, which already goes out as 0
- * on a Leave whose Enter carried kDetailListTight, and it is unobservable: a
- * decoder reads detail when it opens a node, not when it closes one.
- * Branching on the kind instead would add a rule that can only ever disagree
- * with the event being encoded.
- *
- * Three meanings, not five. A ListItem used to send the task mark's offset
- * and a Table its column count, and no decoder ever read either: the mark's
- * offset is already the item's own byteStart (enterBlockCallback folds it
- * into the range precisely so an empty task item has one), and the column
- * count is re-derived from the cell events. Encoding a second copy of a fact
- * the wire already carries buys nothing and creates something that can
- * disagree with it, so both are gone; those node types now send 0 like every
- * other type without a detailA meaning. The layout is untouched — same field,
- * same 24-byte record — so neither side's protocol version moves. */
+/* A Leave encodes its node type's NodeEvent default rather than branching on
+ * the kind; decoders read detail only on Enter. */
 inline uint32_t packDetailA(const NodeEvent& event) {
   switch (event.node) {
     case NodeType::Heading:
@@ -291,9 +274,7 @@ std::vector<uint8_t> encodeUnchecked(const ParseResult& result) {
   }
 
   /* UTF-8 bytes, concatenated, not NUL-terminated. Source text never appears
-   * here (Protocol.h invariant 2) — only hrefs, titles, info strings, decoded
-   * entities and the literals md4c synthesizes, that last class being the
-   * largest of them rather than a rare one (invariant 2 says why). */
+   * here (Protocol.h invariant 2). */
   for (const std::string& value : result.strings) {
     out.insert(out.end(), value.begin(), value.end());
   }

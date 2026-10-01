@@ -1,16 +1,8 @@
 #!/usr/bin/env node
-// Full-document parse throughput, WARM: parse a concatenated markdown corpus
-// N times after 3 untimed warmup passes (1 with --quick) and report MB/s.
-// Corpus = every CommonMark spec example's markdown plus the conformance
-// fixtures, replicated to a workload-sized document.
+// Warm full-document parse throughput in MB/s over every CommonMark spec example
+// plus the conformance fixtures, replicated to a workload-sized document.
 //
-// Warm, not cold, and the distinction is not pedantry: `bench:pathological` is
-// the no-warmup bench ("cold" everywhere in docs/BENCHMARKS.md means exactly
-// that), and on this repo's own numbers the two readings of the same input
-// differ by ~7×. Quoting an MB/s from here against another engine's genuinely
-// cold figure compares the wrong things. Steady state is the right question
-// for a whole-corpus parse — it is what a sustained workload sees — which is
-// why the warmup is here at all.
+// Warm on purpose: bench:pathological is the cold one, and the two differ ~7x.
 //
 // Usage: node bench/throughput.mjs [--quick] [--iterations N] [--replicas R]
 //
@@ -62,9 +54,6 @@ const s = stats(samples);
 const mbPerSecMean = bytes / 1e6 / (s.mean / 1000);
 const mbPerSecBest = bytes / 1e6 / (s.min / 1000);
 
-// "warm" in the heading rather than only in the `+N warmup` line below: this
-// heading is the line that gets copied into a doc, and the row it labels was
-// mislabelled "Cold parse" for exactly that long.
 console.log('parse throughput, warm (preset: llmChat)');
 console.log(`  corpus:     ${fmtBytes(bytes)} (${corpus.length} UTF-16 units)`);
 console.log(`  iterations: ${iterations} (+${warmup} warmup)${quick ? ' [quick]' : ''}`);

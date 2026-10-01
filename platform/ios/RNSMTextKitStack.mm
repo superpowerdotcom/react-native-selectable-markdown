@@ -93,7 +93,6 @@ static NSLayoutManager *RNSMMakeLayoutManager(void)
 
 + (CGSize)measureAttributedString:(NSAttributedString *)string
                             width:(CGFloat)width
-                 pointScaleFactor:(CGFloat)pointScaleFactor
 {
   // Yoga measures with an infinite maximum width whenever the parent does not
   // constrain it (the intrinsic-size pass). CGFLOAT_MAX is TextKit's own
@@ -129,17 +128,7 @@ static NSLayoutManager *RNSMMakeLayoutManager(void)
   // would have added to the height. Adding it here would make the run taller
   // than what is drawn in it.
 
-  // Round up to whole device pixels. A fractional height gets rounded
-  // somewhere further down the pipeline anyway, and a value rounded down by
-  // half a pixel per run is a clipped last line. This is RCTCeilPixelValue
-  // (React/Base/RCTUtils.m) with the scale passed in instead of read off the
-  // main screen — see the header for why that distinction is not cosmetic.
-  //
-  // The guard is not defensive dressing: a zero or negative scale would make
-  // this NaN, NaN survives every arithmetic operation between here and Yoga,
-  // and a NaN height lays the run out at zero with nothing logged anywhere.
-  CGFloat scale = pointScaleFactor > 0.0 ? pointScaleFactor : 1.0;
-  return CGSizeMake(ceil(size.width * scale) / scale, ceil(size.height * scale) / scale);
+  return size;
 }
 
 @end

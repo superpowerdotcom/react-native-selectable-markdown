@@ -105,8 +105,7 @@ reproduced before it was fixed.
 | §8: "released behind an explicitly experimental flag in the README" | The README still described a pre-Fabric library in three places, never mentioned the new architecture, and never stated the 0.75 Fabric floor. | README states the floor, marks the Fabric path experimental, splits the status table by architecture, and records the `use_frameworks! :linkage => :dynamic` limitation (0.75-era codegen wraps third-party registration in `#ifndef RCT_DYNAMIC_FRAMEWORKS`; at the current `>= 0.82` floor the generated provider is an `NSClassFromString` dictionary built from `codegenConfig.ios.componentProvider`, with no such guard — §2.2). |
 | CI ran the gates | `check:fabric-cpp` and its self-test ran nowhere automated; the port's C++ was compiled by one person on one Mac. `release.yml` ran fewer checks than `ci.yml` while being the last step before `npm publish`. | `ci.yml` gains a `fabric-cpp` job (ubuntu + `libboost-dev`) and a `swift` job (macos, `RNSM_REQUIRE_SWIFT=1` so a skip is a failure). `release.yml` runs typecheck, check:codegen and both C++ gates before packing. Both have grown since: `fabric-cpp` is a two-runner matrix (ubuntu and macOS, because only an Apple SDK can see the iOS header set) and compiles `platform/cpp` as well, and `release.yml` is three jobs — see §8. |
 
-One stale path also shipped: `src/engine/native/install.ts` still named
-`platform/android/.../SelectableMarkdownModule.kt`, a directory §2.3 moved.
+The historical stale path in `src/engine/native/install.ts` is corrected to `android/.../SelectableMarkdownModule.kt`.
 
 ---
 
@@ -566,8 +565,7 @@ TextKit-1 factory, used by both sides.
 + (NSLayoutManager *)makeLayoutManager;                       // usesFontLeading = NO
 + (NSTextContainer *)makeTextContainerWithSize:(CGSize)size;  // lineFragmentPadding = 0
 + (CGSize)measureAttributedString:(NSAttributedString *)string
-                            width:(CGFloat)width
-                 pointScaleFactor:(CGFloat)pointScaleFactor;
+                            width:(CGFloat)width;
 @end
 ```
 
@@ -681,7 +679,7 @@ importantly, implements the clean-clone constructor (§4.4).
 
 | | Test | Where it can run |
 | --- | --- | --- |
-| iOS | XCTest: for a matrix of (font family × size × weight × width × string: ASCII, CJK, emoji/ZWJ, mixed), assert `[RNSMTextKitStack measureAttributedString:width:pointScaleFactor:]` equals `[UITextView sizeThatFits:]` on a view built from the same factory, within half a point. | needs a simulator, not available here |
+| iOS | XCTest: for a matrix of (font family × size × weight × width × string: ASCII, CJK, emoji/ZWJ, mixed), assert `[RNSMTextKitStack measureAttributedString:width:]` equals `[UITextView sizeThatFits:]` on a view built from the same factory, within half a point. | needs a simulator, not available here |
 | Android | Robolectric/instrumented: assert `RunTextMeasure.measure(...)` height equals the `TextView`'s `measuredHeight` after `measure()` for the same `(text, spec, width)`. | needs the Android SDK, not available here |
 | Both | Snapshot the styled-string builders: assert `RNSMAttributedText` and `RunAttributedText.build` produce identical attribute runs for the same `(text, attributes)` input, so paper and Fabric cannot drift. | needs a device toolchain, not available here |
 
@@ -713,35 +711,13 @@ Because our content derives purely from props (Paragraph's comes from
 children), the same guard lets the prepared `Content` handle carry forward
 across a clone.
 
-> **Correction: one line became two mechanisms.** The peer range now spans an
-> API break, and exactly one of them compiles to anything on a given header
-> set. The 0.75-era half is the call above, moved behind a detection template
-> because `cleanLayout()` was deleted from `LayoutableShadowNode` by 0.86 and
-> an inline call is `use of undeclared identifier` there. The 0.86-era half is
-> the hook the base consults from `completeClone`, which §0.1 once recorded as
-> a silent regression and which is now deliberate — it carries no `override`
-> because the base virtual does not exist at 0.75, and matches the 0.86
-> signature exactly so it overrides implicitly where it does. The
-> `static_assert` is the tripwire: losing both mechanisms is a performance
-> regression no compiler can see, so "neither is reachable" is made a compile
-> error instead.
->
-> ```cpp
-> // in the clone constructor, after the content carry-over
-> keepLayoutCleanAcrossClone(*this, source, fragment);   // 0.75-era half
-> static_assert(
->     cloneGuardIsLive<RNSMRunHostShadowNode, YogaLayoutableShadowNode>(),
->     "Neither cleanLayout() nor shouldNewRevisionDirtyMeasurement() is ...");
->
-> // and, out of line — no `override`, deliberately
-> bool RNSMRunHostShadowNode::shouldNewRevisionDirtyMeasurement(
->     const ShadowNode&, const ShadowNodeFragment& fragment) const {
->   return fragment.props != nullptr;
-> }
-> ```
->
-> `ParagraphShadowNode` answers the same way at 0.86.
-> `RNSMRunHostShadowNode.h` carries the full note.
+The original implementation supported two clone-cleaning mechanisms. The
+current peer floor, React Native 0.82, provides
+`shouldNewRevisionDirtyMeasurement`; its declaration now uses `override` so
+signature drift fails compilation. The older `cleanLayout()` path remains
+behind a detection template. A `static_assert` rejects headers with neither
+mechanism. Like `ParagraphShadowNode`, the measurement hook returns
+`fragment.props != nullptr`.
 
 Two more behaviours copied from Paragraph:
 
@@ -890,7 +866,7 @@ every preset but `everything`.
 - `src/index.ts` exports `./view/runAttributes`, so
   `RunHostProps.attributes`'s element type is nameable from the package entry.
 - `processColor` is memoised per colour string in a module-level `Map` in
-  `RunHost.tsx`. `.map(toNativeAttribute)` measured at 3.5× the cost of
+  `src/view/processedColors.ts`. `.map(toNativeAttribute)` measured at 3.5× the cost of
   `resolveRunAttributes`, re-normalising the same theme strings every
   snapshot. Eight lines.
 
@@ -1085,13 +1061,14 @@ did not prove what was claimed, §0.1 names the replacement.
 | Check | Command | Proves |
 | --- | --- | --- |
 | Codegen produces the expected C++ | `npm run check:codegen` | The spec compiles to the `Props.h` in §3.1 (sparse `fromRawValue`, `SharedColor` sentinels, `std::vector<std::string>` for `selectionActions`, no undeclared enum), and the babel preset turns the spec into a static view config while a tsc-transpiled copy silently does not (a negative control run every invocation). Also asserts every generated reference to the three shadowed headers is the exact `#include <react/renderer/components/<spec>/X.h>` form (§0.1). A regression gate, because codegen output changes across RN versions. |
-| Fabric C++ compiles | `npm run check:fabric-cpp` | Real `-c` compiles against the genuine RN 0.75.4 headers plus upstream folly/glog/fmt/double-conversion, on both platform header sets. Templates are instantiated, so `ConcreteComponentDescriptor<RNSMRunHostShadowNode>` is proven constructible. Covers `platform/fabric/*.cpp`, `android/src/main/jni/*.cpp`, codegen's five generated sources, and on the android pass the include-order substitution the CMake seam depends on. Every native source it does not compile is named, with its reason. |
-| The checker can still fail | `npm run check:fabric-cpp:selftest` | Five deliberately broken translation units are each rejected, for the stated reason, and two mutations of the real `platform/fabric` source pin the clone guard's tripwire (§4.4): the `static_assert` fires when both base mechanisms are renamed away, and the deliberately absent `override` is rejected against the 0.75 headers. A mutation that matched nothing fails before it compiles. |
+| Fabric C++ compiles | `npm run check:fabric-cpp` | Real `-c` compiles against the genuine RN 0.82.1 headers plus upstream folly/glog/fmt/double-conversion, on both platform header sets. Templates are instantiated, so `ConcreteComponentDescriptor<RNSMRunHostShadowNode>` is proven constructible. Covers `platform/fabric/*.cpp`, `android/src/main/jni/*.cpp`, codegen's five generated sources, and on the android pass the include-order substitution the CMake seam depends on. Every native source it does not compile is named, with its reason. |
+| The checker can still fail | `npm run check:fabric-cpp:selftest` | Five deliberately broken translation units are each rejected, for the stated reason, and two mutations of the real `platform/fabric` source pin the clone guard's tripwire (§4.4): the `static_assert` fires when both base mechanisms are renamed away, and an incompatible measurement override signature is rejected against the supported headers. A mutation that matched nothing fails before it compiles. |
 | Swift compiles | `npm run check:swift` | `platform/ios/*.swift` type-checks against RN's real `UIView (React)` category, `RCTViewManager`, `RCTUIManager` and the iOS SDK, at the podspec's deployment target and Swift version, through a bridging header derived from the podspec's header split. This gate did not exist while the port was written; the Swift shipped with five compile errors — the four Objective-C import defects of §0.1 plus the overload ambiguity found after them. |
 | That checker can fail too | `npm run check:swift:selftest` | Three selector-import mutations of the same class as the historical defects, reverted one at a time into today's `SelectableRunHostView.swift`, are each rejected with the expected diagnostic: an Objective-C selector piece kept where Swift omits it (`makeTextStack`), one dropped where Swift keeps it (`textContainer(ofStack:)`), and a trailing piece dropped from a UIKit import (`glyphRange(forCharacterRange:actualCharacterRange:)`). The historical four have no call sites left; a mutation that matched nothing fails the self-test before it type-checks. |
 | The engine survives C++20 | `npm run check:fabric-cpp -- --syntax-only --platform <ios\|android> $(find platform/cpp -path platform/cpp/vendor -prune -o -name '*.cpp' -print)`, or `-- --syntax-only platform/cpp/*.cpp` as local shorthand | The `c++17` → `c++20` change (§2.2) does not break `OffsetParser.cpp`, `FlatBuffer.cpp`, `SelectableMarkdownJsi.cpp`. No longer only local: `ci.yml`'s `fabric-cpp` job runs it on both runners and `release.yml` on both legs, each passing the `--platform` that matches the runner, because an explicit file list narrows the script to one pass. Both build that list with `find platform/cpp -path platform/cpp/vendor -prune -o -name '*.cpp' -print \| sort` rather than the glob, and fail the step when it comes back empty: the glob is non-recursive and expanded by the runner's shell, so a source added in a subdirectory of `platform/cpp` would have fallen outside the gate with nothing going red. The glob is still the right thing to type locally, and the script's own per-file skip message now prints the workflow spelling rather than the bare glob, so the only in-repo message telling a developer how to run this check matches the gate. Until then `platform/cpp` compiled in no automated job on any standard — including `SelectableMarkdownJsi.cpp`, the installer that publishes `__selectableMarkdown`, which `android/CMakeLists.txt` ships into `libselectable-markdown.so` and the podspec ships into the pod. |
-| JS behaviour | `npm test`, 1561 tests in 46 suites | The projection change (§6.1a), `lineHeight`, `VIEW_KINDS`, run segmentation, every selection/copy round-trip. The count dropped when the JavaScript parser was deleted, and again in 0.10.0 with the embed suites; it has grown well past both since, with the embed, decoration, pressable, image-embed and streaming-repair suites. Suites that parse markdown need the Node addon (`node scripts/build-node-addon.mjs`); without it they report as skipped, visibly. CI, the release workflow and `npm run release` build it as a hard gate. |
+| JS behaviour | `npm test`, 1636 tests in 47 suites | The projection change (§6.1a), `lineHeight`, `VIEW_KINDS`, run segmentation, every selection/copy round-trip. The count dropped when the JavaScript parser was deleted, and again in 0.10.0 with the embed suites; it has grown well past both since, with the embed, decoration, pressable, image-embed and streaming-repair suites. Suites that parse markdown need the Node addon (`node scripts/build-node-addon.mjs`); without it they report as skipped, visibly. CI, the release workflow and `npm run release` build it as a hard gate. |
 | The projection and selection contract, over a real corpus | `npm test` → `conformance/selection/projection-oracle.test.ts` | The full CommonMark 0.31.2 suite plus every fixture, under `presets.llmChat` and `presets.everything`: pieces tile the projected text, every mapped selection is an in-bounds ordered span, `buildCopyPayload().markdown` is exactly the source slice, every `softBreak` projects a space. The check §8 used to attribute to `npm run conformance` (§0.1). |
+| Streaming budgets | `npm run bench:streaming -- --require-engine --transcript conformance/fixtures/transcript-giant-list.json --repeat 1 --budget-chunk 20 --budget-finalize 50` | CI gates chunk and finalization latency on the never-anchoring list. |
 | Types | `npm run typecheck` | Including the spec file, which `tsc` sees though it is excluded from emit. |
 | The published tarball | `npm run verify:pack` | The spec ships untranspiled with `codegenNativeComponent<` intact (§0); every native directory a consumer compiles is present and non-empty; every path the podspec and `react-native.config.js` name resolves; every relative `require` reachable from `main` resolves (§0.1). |
 | Conformance | `npm run conformance` | 651/652 (99.85%), 0 examples threw, every section clean except HTML blocks at 43/44 (spec example 174, an unclosed HTML block inside a blockquote). Report at `conformance/report-native.json`. A score, not a gate: the runner exits 0 regardless. Says nothing about projection or selection. `--engine` is refused. |
@@ -1129,7 +1106,7 @@ no Android SDK, no example app, no `Pods/`. Reviewed, not verified:
 - **The Android selection gap of §0.1.** Reproducible in Node; what a dropped
   `ActionMode` looks like to a user needs a device.
 
-**The gating prerequisite is an example app**: a minimal RN 0.75 app with
+**The gating prerequisite is an example app**: a minimal RN 0.82 app with
 `newArchEnabled` toggleable, plus `xcodebuild` and `./gradlew assembleDebug`
 smoke targets in CI. Until then the Fabric path is reviewed, not exercised.
 

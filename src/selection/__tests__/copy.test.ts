@@ -213,17 +213,7 @@ describeNative('buildCopyPayload through the package default engine', () => {
   });
 });
 
-/**
- * THE EMBED HALF OF THE CONTEXT, and why it has to exist.
- *
- * An embed claim replaces a node's whole projection with one placeholder
- * character, so a `plain` computed without the lookup shows the claimed
- * node's own text where the screen shows the card's stand-in — the same
- * mismatch `SelectionActionContext.embed` warns hand-rolled callers about one
- * layer up. `buildCopyPayload` reparses the slice, so the lookup is offered
- * nodes from that reparse rather than the ones on screen: these claims key on
- * node kind, which is what makes them match either way.
- */
+/** The lookup sees nodes from the reparsed slice, so these claims key on node kind. */
 describeNative('buildCopyPayload with an embed lookup', () => {
   const source = 'Chart: `series` here.';
   const doc = makeDoc(source, [plainParagraph(source, source)]);
@@ -250,23 +240,10 @@ describeNative('buildCopyPayload with an embed lookup', () => {
   });
 
   it('projects the node in full when no lookup is given', () => {
-    // The pre-existing behaviour, unchanged: without a claim there is no
-    // placeholder and the code span contributes its own text.
     expect(buildCopyPayload(doc, whole).plain).toBe('Chart: series here.');
   });
 });
 
-/**
- * THE `classifyBlock` HALF OF THE CONTEXT.
- *
- * `plain` is computed by reparsing the slice and re-segmenting it, so the
- * callbacks that shape segmentation belong in `CopyContext` next to `embed`
- * and `glyphs`. Two properties matter and they are different in kind: the
- * callback must REACH `segmentRuns` (the seam exists), and a copy must not
- * disturb the segmentation the live document depends on (the classification
- * memo is keyed on block identity AND on both callbacks, so a caller that
- * disagrees about them rewrites entries the other one is using).
- */
 describeNative('buildCopyPayload with classifyBlock', () => {
   const source = 'One para.\n\nTwo para.\n\nThree para.\n';
 
@@ -284,22 +261,12 @@ describeNative('buildCopyPayload with classifyBlock', () => {
       },
     );
 
-    expect(seen).toContain('paragraph');
-    // Grouping alone does not change the text: runs are joined with a blank
-    // line and a run's own blocks are separated by one, so the same blocks
-    // regrouped project the same characters. The seam is here for the
-    // callbacks to agree, not because `plain` moves today.
-    expect(payload.plain).toBe(
-      buildCopyPayload(doc, { start: 0, end: source.length }).plain,
-    );
+    expect(seen).toEqual(['paragraph', 'text', 'paragraph', 'text', 'paragraph', 'text']);
+    expect(payload.plain).toBe('One para.\n\nTwo para.\n\nThree para.');
   });
 
   it('does not disturb the classification the live document is memoized on', () => {
-    // The regression this guards: `segmentRuns` memoizes each block's class on
-    // the pair of callbacks it was computed with. If copy segmented the LIVE
-    // document with a different pair, every block's entry would be rewritten
-    // and the next streamed delta would pay a full document re-walk. It
-    // reparses instead, so the blocks it classifies are fresh objects.
+    // Copy reparses, so it never rewrites the live blocks' memo entries.
     const doc = parseDocument(source, presets.llmChat);
     let calls = 0;
     const classifyBlock = (): undefined => {
@@ -316,5 +283,87 @@ describeNative('buildCopyPayload with classifyBlock', () => {
     calls = 0;
     segmentRuns(doc, { classifyBlock });
     expect(calls).toBe(0);
+  });
+});
+
+describeNative('buildCopyPayload over character references', () => {
+  const cases: ReadonlyArray<readonly [string, string]> = [
+    ['&copy;cat', '©cat'],
+    ['&copy;copy', '©copy'],
+    ['&#169;c', '©c'],
+    ['&#xA9;c', '©c'],
+    ['&amp;amp', '&amp'],
+    ['ca&copy;t', 'ca©t'],
+    ['Tom &amp; Jerry', 'Tom & Jerry'],
+    ['a &alpha;alpha b', 'a αalpha b'],
+    ['\\*not\\* emphasis', '*not* emphasis'],
+    ['\\&copy; stays', '&copy; stays'],
+  ];
+
+  it.each(cases)('every selection of %j copies markdown that re-parses to it', (source, display) => {
+    const doc = parseDocument(source);
+    const projected = projectRun(segmentRuns(doc)[0], doc);
+    expect(projected.text).toBe(display);
+
+    for (let start = 0; start < display.length; start += 1) {
+      for (let end = start + 1; end <= display.length; end += 1) {
+        const selected = display.slice(start, end);
+        if (selected.trim() === '') continue;
+        const span = mapSelectionToSource(projected, { start, end });
+        expect(span).not.toBeNull();
+        const payload = buildCopyPayload(doc, span!);
+        expect({ start, end, plain: payload.plain }).toEqual({
+          start,
+          end,
+          plain: selected.trim(),
+        });
+      }
+    }
+  });
+
+  it('copies the whole entity for its character and nothing of it for the next', () => {
+    const source = '&copy;cat';
+    const doc = parseDocument(source);
+    const projected = projectRun(segmentRuns(doc)[0], doc);
+
+    expect(mapSelectionToSource(projected, { start: 0, end: 1 })).toEqual({ start: 0, end: 6 });
+    expect(mapSelectionToSource(projected, { start: 1, end: 2 })).toEqual({ start: 6, end: 7 });
+    expect(mapSelectionToSource(projected, { start: 2, end: 4 })).toEqual({ start: 7, end: 9 });
+    expect(buildCopyPayload(doc, { start: 6, end: 9 }).markdown).toBe('cat');
+  });
+
+  it('leaves a code span’s entity spelling linear, because it is not decoded there', () => {
+    const source = 'see `&copy;` here';
+    const doc = parseDocument(source);
+    const projected = projectRun(segmentRuns(doc)[0], doc);
+    const at = projected.text.indexOf('&copy;');
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(mapSelectionToSource(projected, { start: at + 1, end: at + 2 })).toEqual({
+      start: source.indexOf('&copy;') + 1,
+      end: source.indexOf('&copy;') + 2,
+    });
+  });
+});
+
+
+describeNative('blocked link selection', () => {
+  test.each(['plain', 'a &amp; b'])('copies the label without its blocked destination: %s', (label) => {
+    const source = `[${label}](unsafe:destination)`;
+    const doc = parseDocument(source);
+    const run = projectRun(segmentRuns(doc)[0], doc);
+    const span = mapSelectionToSource(run, { start: 0, end: run.text.length })!;
+    const markdown = doc.source.slice(span.start, span.end);
+    expect(markdown).toBe(label);
+  });
+
+  // Known bug: a blocked link flattens to one text node over `[...](...)`, so
+  // the inner strong has no extent and a full sweep copies `bold** label`.
+  test.failing('copies a formatted label that re-parses to what was displayed', () => {
+    const source = '[**bold** label](unsafe:destination)';
+    const doc = parseDocument(source);
+    const run = projectRun(segmentRuns(doc)[0], doc);
+    expect(run.text).toBe('bold label');
+    const span = mapSelectionToSource(run, { start: 0, end: run.text.length })!;
+    expect(buildCopyPayload(doc, span).plain).toBe('bold label');
   });
 });

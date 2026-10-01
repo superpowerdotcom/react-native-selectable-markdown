@@ -83,7 +83,9 @@ describeNative('handleSelectionAction', () => {
       end: display.length - 3,
       action: 'copy-markdown',
     });
-    expect(payload).not.toBeNull();
+    expect(payload?.plain).toBe('me styled text with co');
+    expect(payload?.markdown).toBe('me *styled* text with `co');
+    expect(payload?.span).toEqual({ start: 2, end: 27 });
     expect(payload!.markdown).toBe(
       doc.source.slice(payload!.span.start, payload!.span.end),
     );
@@ -102,12 +104,7 @@ describeNative('handleSelectionAction', () => {
 
     // What the user visually selected — bullets and item separator included.
     expect(payload?.plain).toBe('• one\n• two');
-    // The bullets are synthetic and carry no source, so the pieces under this
-    // selection reach only "one" through "two". The selection covers the
-    // whole list, though, so the list's own source span is unioned back in
-    // and the markdown re-parses as the list it came from — this used to copy
-    // `one\n- two`, which re-parses to a paragraph followed by a one-item
-    // list.
+    // Bullets carry no source, but covering the whole list unions its span back in.
     expect(payload?.markdown).toBe('- one\n- two');
     const reparsed = parseDocument(payload!.markdown);
     expect(displayText(reparsed, segmentRuns(reparsed)[0])).toBe('• one\n• two');
@@ -115,8 +112,7 @@ describeNative('handleSelectionAction', () => {
 
   test('selecting part of a list leaves the uncovered marker behind', () => {
     const { doc, run } = docWithRun('- one\n- two');
-    // '• one\n• t' — the first item whole, the second only started. Half a
-    // list is not a list, so only the covered item's marker comes back.
+    // '• one\n• t': the first item whole, the second only started.
     const payload = handleSelectionAction(doc, run, {
       start: 0,
       end: 9,
@@ -130,6 +126,11 @@ describeNative('handleSelectionAction', () => {
     expect(
       handleSelectionAction(doc, run, { start: 0, end: 2, action: 'copy-text' }),
     ).toBeNull();
+    // One character further reaches the item's text.
+    expect(
+      handleSelectionAction(doc, run, { start: 0, end: 3, action: 'copy-text' })
+        ?.markdown,
+    ).toBe('o');
   });
 
   test('cross-block selection in a merged run keeps the separator the user saw', () => {
@@ -144,10 +145,7 @@ describeNative('handleSelectionAction', () => {
     });
 
     expect(payload?.plain).toBe('Title\n\nBody text');
-    // The heading's "# " prefix is outside every projected piece, so the
-    // piece hull starts at the heading TEXT — but the selection covers the
-    // whole heading, so its own span is unioned back in and the marker
-    // survives the copy. Without that the slice re-parsed as body text.
+    // The '# ' is outside every piece; covering the whole heading unions its span back in.
     expect(payload?.markdown).toBe('# Title\n\nBody text');
   });
 
@@ -162,12 +160,7 @@ describeNative('handleSelectionAction', () => {
       action: 'copy-markdown',
     });
 
-    // The decoder hands the whole paragraph over as ONE text node whose
-    // display differs from its source, so this used to copy `a &hellip; b`
-    // for a one-character selection. The projection now covers the node
-    // piecewise: the prose on either side is linear and only the entity
-    // itself is indivisible, so the markdown is the entity that spells what
-    // was selected and re-parses to exactly it.
+    // One decoded text node, projected piecewise, so only the entity itself is indivisible.
     expect(payload?.plain).toBe('…');
     expect(payload?.markdown).toBe('&hellip;');
     expect(payload?.span).toEqual({ start: 2, end: 10 });
@@ -236,17 +229,13 @@ describeNative('handleSelectionAction', () => {
         handleSelectionAction(doc, run, { ...sel, action: 'copy-text' }),
       ).toBeNull();
     }
+    expect(
+      handleSelectionAction(doc, run, { start: 2, end: 3, action: 'copy-text' })
+        ?.plain,
+    ).toBe('o');
   });
 
   test("a MISSING action means 'copy-markdown'; a present one is never renamed", () => {
-    // The missing case is the whole of the version skew this absorbs: a native
-    // binary older than the `action` field emits nothing there and its one
-    // custom item was "Copy Markdown".
-    //
-    // The unknown case used to normalize too, and that was wrong. A non-empty
-    // id was put there by a menu item that exists, so renaming it can only
-    // hand a consumer's own action to their copy-markdown branch — silently,
-    // and whenever they had not threaded `ctx.actions`. It is passed through.
     const { doc, run } = docWithRun('compat check');
     const missing = handleSelectionAction(doc, run, { start: 0, end: 6 });
     const unknown = handleSelectionAction(doc, run, {
@@ -302,6 +291,8 @@ describeNative('handleSelectionAction', () => {
       action: 'copy-text',
     });
     expect(withCtx).toEqual(withoutCtx);
+    expect(withCtx?.plain).toBe('reuse the projection');
+    expect(withCtx?.markdown).toBe('reuse **the** projection');
   });
 
   test('task-list glyphs are visually selected but never enter the markdown slice boundaries', () => {
@@ -318,24 +309,20 @@ describeNative('handleSelectionAction', () => {
       action: 'copy-text',
     });
     expect(payload?.plain).toBe('☑ done\n☐ todo');
-    // The glyphs themselves never enter the slice — they are synthetic and
-    // map to no source at all. What bounds the slice is the list: the
-    // selection covers the whole of it, so the copy is the source list,
-    // checkboxes and all.
+    // Glyphs map to no source; the list the selection covers whole bounds the slice.
     expect(payload?.markdown).toBe(source);
   });
 });
 
 describeNative('DEFAULT_SELECTION_ACTIONS', () => {
-  test('offers plain text first, markdown second', () => {
+  test('is frozen — shared across renders as an immutable default', () => {
+    expect(() =>
+      (DEFAULT_SELECTION_ACTIONS as string[]).push('share-quote'),
+    ).toThrow(TypeError);
     expect([...DEFAULT_SELECTION_ACTIONS]).toEqual([
       'copy-text',
       'copy-markdown',
     ]);
-  });
-
-  test('is frozen — shared across renders as an immutable default', () => {
-    expect(Object.isFrozen(DEFAULT_SELECTION_ACTIONS)).toBe(true);
   });
 });
 
@@ -479,19 +466,11 @@ describeNative('handleSelectionAction with embeds', () => {
     );
 
     expect(withFallback).toEqual(withProjected);
+    expect(withFallback?.plain).toBe('e [1] her');
+    expect(withFallback?.markdown).toBe('e [one](https://cite.example/a) her');
   });
 });
 
-/*
- * `sameSelectionActionList` — the value comparison `runPropsEqual` uses to
- * decide whether a document's runs have to re-render because the menu changed.
- *
- * It has to be permissive enough that the documented inline form
- * (`selectionActions={[{ id: 'share', title: t('share') }]}`) is free, and
- * strict enough that anything which would change the wire entry is caught. It
- * used to compare `id` and `title` by name, which met the first requirement
- * and quietly failed the second for every field added afterwards.
- */
 describe('sameSelectionActionList', () => {
   test('a fresh array of fresh objects with the same values is unchanged', () => {
     expect(
@@ -512,9 +491,6 @@ describe('sameSelectionActionList', () => {
   });
 
   test('a field this comparison has never heard of still counts', () => {
-    // The regression the named pair could not catch: any field added to
-    // `SelectionActionSpec` later was invisible to the memo, so a menu that
-    // changed only in that field never reached the hosts.
     const before = [
       { id: 'delete-quote', title: 'Delete', destructive: false },
     ] as unknown as SelectionActionInput[];
@@ -555,14 +531,6 @@ describe('sameSelectionActionList', () => {
   });
 });
 
-/*
- * The untitled-consumer-id DEV warning, and its discipline.
- *
- * An id neither host can title is dropped from the menu with nothing on screen
- * to say so, which is why it warns at all. The warning is latched PER ID: it
- * used to be latched once for the whole JS runtime, so the first document with
- * a bad id silenced every later one — and a transcript is many documents.
- */
 describe('warnAboutUntitledSelectionActions', () => {
   let warn: jest.SpyInstance;
 
@@ -586,9 +554,6 @@ describe('warnAboutUntitledSelectionActions', () => {
   });
 
   test('a different id in a later document warns again', () => {
-    // The per-runtime latch: with it, this second document said nothing at
-    // all, so the second message in a transcript could not report its own
-    // mistake.
     warnAboutUntitledSelectionActions([{ id: 'untitled-beta' }]);
     warnAboutUntitledSelectionActions([{ id: 'untitled-gamma' }]);
 
@@ -606,5 +571,15 @@ describe('warnAboutUntitledSelectionActions', () => {
     ]);
 
     expect(warn).not.toHaveBeenCalled();
+
+    warnAboutUntitledSelectionActions([
+      'copy-text',
+      { id: 'untitled-delta', title: 'Delta' },
+      { id: 'untitled-epsilon' },
+    ]);
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain('untitled-epsilon');
+    expect(String(warn.mock.calls[0][0])).not.toContain('untitled-delta');
   });
 });

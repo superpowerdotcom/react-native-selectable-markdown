@@ -20,28 +20,17 @@
 // Those two requirements together produce a module that is referenced from
 // `dist/` and absent from `dist/`, and a static reference to a module that does
 // not exist is not a runtime fallback — it is a **build error in a stranger's
-// CI**. Metro takes the `react-native` condition in `exports` (or, before
-// Metro read `exports`, the `react-native` field) to `src/index.ts` and never
-// sees `dist/`, but webpack, Rollup, Vite, Parcel and Next resolve the default
-// condition to `main`, walk the CJS graph ahead of time, and stop with
+// CI**: webpack, Rollup, Vite, Parcel and Next resolve `main`, walk the CJS
+// graph ahead of time, and stop with
 //
 //     Module not found: Can't resolve './SelectableRunHostNativeComponent'
 //
-// naming our file, in their build. react-native-web under any of those
-// bundlers is exactly that case, and the error does not wait for anything to
-// render: it stops the bundle of an app that only ever calls the headless half
-// of this package. The `try/catch` around the require does not help either —
-// resolution happens before any code runs.
+// naming our file. The `try/catch` around the require cannot help: resolution
+// happens at build time.
 //
 // So the reference resolves, and resolves to nothing. `module.exports = {}`
 // leaves `spec.default` undefined, which is precisely the condition
-// `resolveNativeHost`'s last tier is written for: a bundle built from `main`
-// never loaded the real spec, so `RunHost` throws a message naming the missing
-// native registration instead of dangling on a module that is not there. The
-// `requireNativeComponent` tier that used to catch this case, and the
-// `<Text selectable>` fallback under it, both went with the old architecture
-// in 0.10.0 — under the package's `react-native >= 0.82` floor bridgeless is
-// the only mode, and neither tier can render there.
+// `resolveNativeHost` turns into an error naming the missing native registration.
 //
 // WHAT THIS FILE MUST NEVER BECOME
 // --------------------------------
@@ -54,21 +43,8 @@
 // check read "any file under dist/ whose name starts with the spec's" as proof
 // of a leak, which is also a perfect description of the shim.
 //
-// AND WHY THERE IS A .d.ts NEXT TO IT
-// -----------------------------------
-// package.json's `./dist/*` subpath export declares its types as
-// `./dist/*.d.ts`. Every other file under dist/ gets one from tsc; this one
-// cannot, for the same reason its .js cannot. Without it a TypeScript consumer
-// that deep-imports this path gets an unresolved-types error (not an implicit
-// any — the types condition names a file that is not there), and `tsc` on the
-// package's own `./dist/*` map has one hole in it.
-//
-// It declares the PROP CONTRACT by re-exporting it from the untranspiled spec
-// in src/, which ships in the same tarball, so there is one declaration and no
-// copy to drift. It declares NO runtime value, because the .js beside it
-// exports none: typing a `default` here would tell a bundle that resolved
-// `main` that the component exists, which is exactly the claim `RunHost`'s
-// throw exists to deny.
+// The .d.ts exists because `exports` declares `./dist/*.d.ts` for every path. It
+// re-exports the prop types from src/ and declares no value, like the empty .js.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -76,15 +52,8 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-// Read out of the tsconfigs rather than hardcoded, because the shim has to
-// land at the exact path tsc's rootDir/outDir mapping would have put the
-// transpiled spec at — in BOTH trees. A directory reorganisation that moved one
-// and not the other would restore the dangling require while every check still
-// passed.
-//
-// tsconfig files are JSON with comments, and tsconfig.build.json carries a long
-// one in the middle of `exclude`. Strip line comments before parsing; there are
-// no block comments and no string literals containing `//`.
+// Paths come from the tsconfigs so the shim lands where tsc would put the spec, in both trees.
+// Strips line comments only: the tsconfigs have no block comments or `//` in strings.
 const readTsconfig = (file) =>
   JSON.parse(fs.readFileSync(path.join(repoRoot, file), 'utf8').replace(/^\s*\/\/.*$/gm, ''));
 
@@ -92,8 +61,7 @@ const config = readTsconfig('tsconfig.build.json');
 const rootDir = config.compilerOptions?.rootDir;
 const outDir = config.compilerOptions?.outDir;
 const spec = (config.exclude ?? []).find((entry) => entry.endsWith('SelectableRunHostNativeComponent.ts'));
-// The ES module build inherits rootDir and the exclusion from that config and
-// overrides only outDir, so it needs a shim of its own at the mirrored path.
+// tsconfig.esm.json overrides only outDir, so the ESM tree needs its own shim.
 const esmOutDir = readTsconfig('tsconfig.esm.json').compilerOptions?.outDir;
 
 if (!rootDir || !outDir || !spec || !esmOutDir) {
@@ -106,18 +74,7 @@ if (!rootDir || !outDir || !spec || !esmOutDir) {
   process.exit(1);
 }
 
-/**
- * Where the shim and its declaration belong under one outDir, and how that
- * declaration has to spell the path back to the untranspiled spec: relative,
- * from the directory it lands in to src/. Derived rather than hardcoded for the
- * same reason the emit path is — rootDir/outDir move together or the reference
- * dangles.
- *
- * The ES module tree gets the `.js` extension on that reference and the
- * CommonJS tree does not, because TypeScript's `node16` resolution requires one
- * inside an ES module scope (dist/esm/package.json says `"type": "module"`) and
- * resolves `./x.js` to the `x.ts` that is really there.
- */
+/** The ESM tree's type reference needs `.js`: node16 requires it in a `"type": "module"` scope. */
 const targetsFor = (dir, { extensionOnTypeReference }) => {
   const emitted = path.join(repoRoot, dir, path.relative(rootDir, spec));
   const declaration = emitted.replace(/\.ts$/, '.d.ts');
@@ -175,13 +132,7 @@ export type { NativeProps } from '${specFrom}';
 
 const DECLARATION = declarationText(specFromDist);
 
-// The ES module tree's shim. Same contract as the CommonJS one — it exports
-// nothing, so `resolveNativeHost` takes the tier that names the missing native
-// registration — spelled as an ES module because dist/esm is a `"type":
-// "module"` scope. `require` does not exist in that scope at all, so the file
-// matters only for a pipeline that transforms these modules back to CommonJS
-// (babel, jest) and then resolves the require; where it stays ESM the call
-// throws a ReferenceError into the same `try`/`catch`.
+// `require` does not exist in an ES module scope; this matters only to pipelines that go back to CommonJS.
 const ESM_SHIM = `// Emitted by scripts/emit-dist-spec-shim.mjs. NOT a transpiled copy of
 // src/view/SelectableRunHostNativeComponent.ts — see the CommonJS shim beside
 // dist/view/RunHost.js for why that copy must never exist.

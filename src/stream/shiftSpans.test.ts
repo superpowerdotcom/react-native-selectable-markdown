@@ -52,34 +52,9 @@ describeNative('shiftSpans over a real parsed tree', () => {
     doc = parseDocument(FIXTURE, presets.llmChat);
   });
 
-  test('fixture exercises every child-container shape', () => {
-    const kinds = new Set<string>();
-    for (const block of doc.blocks) {
-      for (const node of collectNodes(block)) {
-        kinds.add(node.kind);
-      }
-    }
-    for (const expected of [
-      'heading',
-      'blockquote',
-      'list',
-      'listItem',
-      'table',
-      'tableRow',
-      'tableCell',
-      'paragraph',
-      'strong',
-      'emphasis',
-      'codeSpan',
-      'link',
-      'text',
-    ]) {
-      expect(kinds).toContain(expected);
-    }
-  });
-
   test('shifts every descendant span by exactly delta', () => {
     const delta = 137;
+    const kinds = new Set<string>();
     for (const block of doc.blocks) {
       const shifted = shiftSpans(block, delta);
       const before = collectNodes(block);
@@ -91,16 +66,32 @@ describeNative('shiftSpans over a real parsed tree', () => {
           start: before[i].span.start + delta,
           end: before[i].span.end + delta,
         });
+        kinds.add(after[i].kind);
       }
     }
+    expect([...kinds].sort()).toEqual([
+      'blockquote',
+      'codeSpan',
+      'emphasis',
+      'heading',
+      'link',
+      'list',
+      'listItem',
+      'paragraph',
+      'strong',
+      'table',
+      'tableCell',
+      'tableRow',
+      'text',
+    ]);
   });
 
   test('never mutates the input tree', () => {
     const snapshot = JSON.parse(JSON.stringify(doc.blocks));
-    for (const block of doc.blocks) {
-      shiftSpans(block, 999);
-    }
+    const shifted = doc.blocks.map((block) => shiftSpans(block, 999));
     expect(JSON.parse(JSON.stringify(doc.blocks))).toEqual(snapshot);
+    expect(doc.blocks[0].span).toEqual({ start: 0, end: 30 });
+    expect(shifted[0].span).toEqual({ start: 999, end: 1029 });
   });
 
   test('returns a fully independent deep clone', () => {
@@ -167,15 +158,6 @@ describe('shiftSpans over hand-built nodes', () => {
   });
 });
 
-/*
- * Nesting depth. Model output is untrusted and markdown nesting is unbounded,
- * so the two ways a deep document reaches `shiftSpans` are pinned here: the
- * hand-built tree (no parser, runs everywhere) proves the walk itself is
- * iterative, and the streamed 3 kB / 6 kB `'> '` prefix proves the real path
- * — `StreamSession.update` splicing an engine parse of the tail — survives
- * the depth that used to throw `RangeError: Maximum call stack size exceeded`
- * from inside `shiftSpans` (it overflowed somewhere between 2000 and 3000).
- */
 describe('shiftSpans at depth', () => {
   function nest(depth: number): Block {
     let node: Block = {
@@ -199,8 +181,7 @@ describe('shiftSpans at depth', () => {
     const deep = nest(20_000);
     const shifted = shiftSpans(deep, 7);
 
-    // Walk down iteratively — a recursive check would be the thing under
-    // test, failing for its own reasons.
+    // A recursive check would overflow on its own at this depth.
     let source: AnyNode = deep;
     let clone: AnyNode = shifted;
     let levels = 0;
@@ -230,9 +211,7 @@ describeNative('shiftSpans inside a streamed deep blockquote', () => {
     (levels) => {
       const source = '> '.repeat(levels) + 'echo\n';
       const session = new StreamSession();
-      // 64-char chunks: the shape the finding's repro used, and enough
-      // appends that the splice (repair -> parse -> shiftSpans) runs on a
-      // deep tree many times over rather than once at the end.
+      // Many appends, so the splice runs on a deep tree repeatedly, not once.
       for (let i = 0; i < source.length; i += 64) {
         session.append(source.slice(i, i + 64));
       }

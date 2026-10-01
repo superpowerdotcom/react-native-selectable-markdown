@@ -158,7 +158,7 @@ leaves the quote zero-width: `> ***` gives `blockquote[0,0]` wrapping
 
 ## Decoder hot paths
 
-The decoder is 40 to 50% of a parse ([BENCHMARKS.md](BENCHMARKS.md), measured
+The decoder is 38 to 51% of a parse ([BENCHMARKS.md](BENCHMARKS.md), measured
 by `npm run bench:crossing` on a laptop) and runs on Hermes, with no JIT. Four
 paths are written for that:
 

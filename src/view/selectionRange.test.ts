@@ -1,14 +1,3 @@
-/**
- * `mapSourceToRunRange` — the source → display direction of the projection,
- * which is what the imperative `setSelection(span)` runs on.
- *
- * The tests are paired with `mapSelectionToSource` throughout, because the
- * only useful statement about this function is how it relates to the one that
- * already exists: where it round-trips exactly, and where it cannot. Documents
- * are hand-built with the shared selection fixtures — no parser is involved,
- * so a failure here points at the mapping rather than at md4c.
- */
-
 import type {
   Block,
   HeadingNode,
@@ -47,8 +36,6 @@ describe('mapSourceToRunRange', () => {
       start: 6,
       end: 10,
     });
-    // The projection is the source verbatim here, so the display slice is the
-    // source slice — the property every other case is measured against.
     expect(projected.text.slice(6, 10)).toBe('beta');
   });
 
@@ -68,9 +55,6 @@ describe('mapSourceToRunRange', () => {
   });
 
   it('spans the hidden syntax between two pieces rather than returning two ranges', () => {
-    // A selection is one contiguous range in one text view, so a source span
-    // that skips over characters the projection does not show — a heading's
-    // '# ' and the blank line after it — has to come back as the hull.
     const source = '# Title\n\nBody text.';
     const heading: HeadingNode = {
       kind: 'heading',
@@ -93,10 +77,6 @@ describe('mapSourceToRunRange', () => {
   });
 
   it('returns null for a span that covers only unshown syntax', () => {
-    // The '# ' of a heading projects no character at all, so there is nothing
-    // to select. Returning an empty range at the nearest piece would be a
-    // plausible-looking lie; null is the honest answer, and it is what makes
-    // `SelectableMarkdownHandle.setSelection` able to report false.
     const source = '# Title';
     const heading: HeadingNode = {
       kind: 'heading',
@@ -107,6 +87,11 @@ describe('mapSourceToRunRange', () => {
     const projected = projectOnlyRun(makeDoc(source, [heading]));
 
     expect(mapSourceToRunRange(projected, { start: 0, end: 2 })).toBeNull();
+    // The heading's text right after it maps.
+    expect(mapSourceToRunRange(projected, { start: 0, end: 7 })).toEqual({
+      start: 0,
+      end: 5,
+    });
   });
 
   it('returns null for a span outside the run, and for an empty one', () => {
@@ -117,11 +102,13 @@ describe('mapSourceToRunRange', () => {
 
     expect(mapSourceToRunRange(projected, { start: 40, end: 50 })).toBeNull();
     expect(mapSourceToRunRange(projected, { start: 3, end: 3 })).toBeNull();
+    expect(mapSourceToRunRange(projected, { start: 3, end: 4 })).toEqual({
+      start: 3,
+      end: 4,
+    });
   });
 
   it('orders a reversed span and refuses a non-finite one', () => {
-    // Reachable from a consumer's imperative call with any two numbers in it,
-    // so neither may throw.
     const source = 'Alpha beta.';
     const projected = projectOnlyRun(
       makeDoc(source, [plainParagraph(source, source)]),
@@ -143,12 +130,6 @@ describe('mapSourceToRunRange', () => {
   });
 
   it('takes a whole indivisible piece when a span lands inside one', () => {
-    // '&hellip;' decodes to a character the source never spells, so the
-    // projector cannot align the two and the piece has no interior
-    // correspondence in either direction. The forward mapping already pins
-    // the whole piece; this is the same rule mirrored, and it is why
-    // `setSelection` documents that the resulting selection can be wider than
-    // the span asked for.
     const source = 'a &hellip; b';
     const paragraph: ParagraphNode = {
       kind: 'paragraph',
@@ -168,19 +149,14 @@ describe('mapSourceToRunRange', () => {
     expect(range).toEqual({ start: 2, end: 3 });
     expect(projected.text.slice(2, 3)).toBe('…');
 
-    // And the widening is idempotent: mapping the result back and forward
-    // again lands on the same range rather than growing each time.
+    // Idempotent: mapping back and forward again does not widen further.
     const back = mapSelectionToSource(projected, range!);
     expect(back).toEqual(spanOf(source, '&hellip;'));
     expect(mapSourceToRunRange(projected, back!)).toEqual(range);
   });
 
-  it('drops source that projects nothing, keeping only what is on screen', () => {
-    // The linear-alignment split means an escape or a spelled-out entity
-    // costs only itself: '&amp;' is projected as pieces that cover the '&'
-    // and skip 'amp;', so a span landing purely in those four characters has
-    // no display range at all — the same "null means unshowable" answer as a
-    // heading marker, one construct down.
+  it('maps source inside a character reference to the character it shows', () => {
+    // One indivisible piece, so the '&' on screen stands for all of '&amp;'.
     const source = 'Tom &amp; Jerry';
     const paragraph: ParagraphNode = {
       kind: 'paragraph',
@@ -194,10 +170,10 @@ describe('mapSourceToRunRange', () => {
     const projected = projectOnlyRun(makeDoc(source, [paragraph]));
     expect(projected.text).toBe('Tom & Jerry');
 
-    // 'amp;' alone: shown by nothing.
-    expect(mapSourceToRunRange(projected, { start: 5, end: 9 })).toBeNull();
-    // The whole entity plus the word after it: the hull covers the '&' and
-    // reaches into ' Jerry'.
+    // 'amp;' alone: shown by the '&' it belongs to.
+    expect(mapSourceToRunRange(projected, { start: 5, end: 9 })).toEqual({ start: 4, end: 5 });
+    expect(mapSelectionToSource(projected, { start: 4, end: 5 })).toEqual(spanOf(source, '&amp;'));
+    // The whole entity plus the word after it.
     expect(
       mapSourceToRunRange(projected, {
         start: spanOf(source, '&amp;').start,
@@ -208,10 +184,6 @@ describe('mapSourceToRunRange', () => {
   });
 
   it('sweeps up the synthetic glyphs between two list items', () => {
-    // A bullet is a piece with no source, so no span can ask for it — but the
-    // hull covers it whenever the span touches real text on both sides, which
-    // is what makes a programmatic selection across a list look like one
-    // selection rather than two.
     const source = '- one\n- two';
     const firstText = textNode(source, 'one');
     const secondText = textNode(source, 'two');
@@ -246,31 +218,21 @@ describe('mapSourceToRunRange', () => {
       ],
     };
     const projected = projectOnlyRun(makeDoc(source, [list as Block]));
+    const whole = mapSourceToRunRange(projected, { start: 0, end: source.length });
+    expect(whole).toEqual({ start: 0, end: projected.text.length });
+    expect(mapSelectionToSource(projected, whole!)).toEqual({ start: 0, end: source.length });
 
     const range = mapSourceToRunRange(projected, {
       start: firstText.span.start,
       end: secondText.span.end,
     });
     expect(range).not.toBeNull();
-    // The glyphs between the two items are inside the hull, so the display
-    // slice is contiguous and starts at 'one'.
     const sliced = projected.text.slice(range!.start, range!.end);
     expect(sliced.startsWith('one')).toBe(true);
     expect(sliced.endsWith('two')).toBe(true);
   });
 });
 
-/**
- * `selectSpanInRuns` — the walk behind `SelectableMarkdownHandle.setSelection`.
- *
- * The defect these pin: the walk used to return true the moment a run MAPPED
- * the span, without ever learning whether the host took it. Both native hosts
- * refuse the command on a non-selectable text view, and JS makes runs
- * non-selectable on purpose — the unsettled streaming tail on Android, and any
- * run a consumer rendered `selectable={false}` — so mid-stream on Android
- * `setSelection` over the live tail reported success for a selection nobody
- * made. A binary older than the selection commands did the same thing.
- */
 describe('selectSpanInRuns', () => {
   const source = 'Alpha beta gamma.\n\nDelta epsilon zeta.';
   const first = plainParagraph(source, 'Alpha beta gamma.');
@@ -310,8 +272,7 @@ describe('selectSpanInRuns', () => {
   });
 
   it('reports false when the run that shows the span refuses it', () => {
-    // Android, mid-stream, span inside the live tail: the host is mounted and
-    // the mapping succeeds, and nothing is selected.
+    // Android's live tail: mounted, mapped, and refused.
     const { candidates, asked } = runCandidates(() => false);
 
     expect(selectSpanInRuns(candidates, second.span)).toBe(false);
@@ -319,8 +280,7 @@ describe('selectSpanInRuns', () => {
   });
 
   it('keeps looking past a run that refuses', () => {
-    // Reachable under `maxRunChars`, where several runs can show overlapping
-    // source: a refusal must not end the search.
+    // Runs can show overlapping source under `maxRunChars`.
     const { candidates, asked } = runCandidates((index) => index === 1);
     const whole = { start: 0, end: source.length };
 
@@ -336,11 +296,12 @@ describe('selectSpanInRuns', () => {
     expect(selectSpanInRuns([standalone, uncommitted], second.span)).toBe(
       false,
     );
+    expect(selectSpanInRuns([standalone, candidates[1]], second.span)).toBe(
+      true,
+    );
   });
 
   it('asks in document order however the runs were registered', () => {
-    // A registry iterates in MOUNT order, and a run that remounted mid-stream
-    // sits at the end of it.
     const { candidates, asked } = runCandidates(() => false);
     const whole = { start: 0, end: source.length };
 
@@ -355,5 +316,7 @@ describe('selectSpanInRuns', () => {
       selectSpanInRuns(candidates, { start: Number.NaN, end: 4 }),
     ).toBe(false);
     expect(asked).toEqual([]);
+    expect(selectSpanInRuns(candidates, { start: 0, end: 4 })).toBe(true);
+    expect(asked).toEqual([[0, 0, 4]]);
   });
 });

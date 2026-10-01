@@ -1,21 +1,3 @@
-/**
- * The `processColor` memo: it must stay bounded, and it must not stop caching.
- *
- * The bound exists because `attributeForMark` is the documented channel for
- * PER-INSTANCE styling — a colour minted per href, per heading level, per
- * citation id — and this map is module scope, so an unbounded one grows for
- * the life of the process. What the bound must NOT do is freeze: filling the
- * cap and refusing every later insert hands the whole memo to whichever
- * strings arrived first, so a theme switch after that re-parses every token on
- * every streamed snapshot forever — the exact cost the memo was measured to
- * remove, made permanent.
- *
- * `react-native` is stubbed with a counting `processColor`, the way the other
- * view tests stub it: this module imports that one function and nothing else,
- * which is why it is a module of its own rather than a private helper in
- * `RunHost`.
- */
-
 const calls: string[] = [];
 
 jest.mock('react-native', () => ({
@@ -40,7 +22,8 @@ describe('memoizedProcessColor', () => {
     const first = memoizedProcessColor('#1f2328');
     const second = memoizedProcessColor('#1f2328');
 
-    expect(second).toBe(first);
+    expect(first).toBe(7);
+    expect(second).toBe(7);
     expect(calls).toEqual(['#1f2328']);
   });
 
@@ -59,12 +42,14 @@ describe('memoizedProcessColor', () => {
     expect(processedColorCacheSize()).toBeLessThanOrEqual(
       MAX_PROCESSED_COLORS,
     );
+    // The last minted colour is still a hit; the first was evicted.
+    calls.length = 0;
+    memoizedProcessColor(`hsl(${MAX_PROCESSED_COLORS * 4 - 1}, 50%, 50%)`);
+    memoizedProcessColor('hsl(0, 50%, 50%)');
+    expect(calls).toEqual(['hsl(0, 50%, 50%)']);
   });
 
   it('still caches a token minted after the cap is reached', () => {
-    // The theme-switch case. Fill the cache past the cap with per-instance
-    // colours, then introduce a token the way an appearance flip does: it has
-    // to be cached, or it re-parses on every snapshot from here on.
     for (let i = 0; i < MAX_PROCESSED_COLORS * 2; i += 1) {
       memoizedProcessColor(`hsl(${i}, 50%, 50%)`);
     }
@@ -81,13 +66,12 @@ describe('memoizedProcessColor', () => {
   });
 
   it('keeps converting correctly across an eviction', () => {
-    // Whatever the cache does, the answer is the converter's. A hit and a miss
-    // must be indistinguishable to the caller.
     const before = memoizedProcessColor('#abcdef');
     for (let i = 0; i < MAX_PROCESSED_COLORS + 1; i += 1) {
       memoizedProcessColor(`hsl(${i}, 10%, 10%)`);
     }
 
-    expect(memoizedProcessColor('#abcdef')).toBe(before);
+    expect(before).toBe(7);
+    expect(memoizedProcessColor('#abcdef')).toBe(7);
   });
 });

@@ -85,10 +85,6 @@ describe('createSmoother', () => {
   });
 
   test('word mode falls back to a char cut when no boundary is in reach', () => {
-    // Chinese, Japanese and Thai are written without spaces, so /\s*\S+\s*/
-    // matches the WHOLE buffer: releasing "the first word" would dump every
-    // pending character in one flush and then freeze for seconds paying off
-    // the debt. Past the word-sized overdraw the cut degrades to 'char'.
     const c = clock();
     const smooth = createSmoother({
       charsPerSecond: 300,
@@ -104,8 +100,6 @@ describe('createSmoother', () => {
   });
 
   test('word mode still overdraws a word-sized run with no boundary in the window', () => {
-    // The degradation above is bounded by WORD_OVERDRAW_LIMIT, so a long
-    // English word (or a short URL) is still released whole.
     const c = clock();
     const smooth = createSmoother({
       charsPerSecond: 300,
@@ -149,19 +143,13 @@ describe('createSmoother', () => {
     smooth('x'); // start the clock
     c.tick(10); // 5 chars accrued
     expect(smooth('abcdef')).toBe(5);
-    // The session retreated the cut off a cluster boundary and released
-    // nothing. Without the refund the 5 would be spent, and at this rate one
-    // frame never accrues more — the reveal would stall on that glyph for
-    // good (finding 106's regression).
     smooth.notifyReleased!(0);
     c.tick(10);
     expect(smooth('abcdefghij')).toBe(10);
-    // A partial release refunds only the remainder…
     smooth.notifyReleased!(4);
     c.tick(10);
     expect(smooth('abcdefghijklmnop')).toBe(11);
-    // …and releasing MORE than the answer (the session's link snap, the lag
-    // snap) is free, exactly as it is charged: nothing extra is deducted.
+    // Releasing more than the answer deducts nothing extra.
     smooth.notifyReleased!(16);
     c.tick(10);
     expect(smooth('abcdef')).toBe(5);
@@ -169,9 +157,7 @@ describe('createSmoother', () => {
 
   test('a glyph wider than the whole credit window still becomes affordable', () => {
     const c = clock();
-    // 30 cps caps the standing budget at 3 units, so a 4-unit flag could
-    // never be paid for while every frame charged the answer the session
-    // threw away.
+    // 30 cps caps the standing budget at 3 units.
     const smooth = createSmoother({ charsPerSecond: 30, now: c.now });
     const flag = '\u{1F1FA}\u{1F1F8} flag';
     smooth(flag);
@@ -183,7 +169,6 @@ describe('createSmoother', () => {
       smooth.notifyReleased!(0); // the retreat released nothing
     }
     expect(answer).toBeGreaterThanOrEqual(4);
-    // …and once it is spent the cap is back: no hoarding past one window.
     smooth.notifyReleased!(answer);
     c.tick(5000);
     expect(smooth(flag)).toBe(3);
@@ -200,11 +185,6 @@ describe('createSmoother', () => {
       smooth(flag);
       smooth.notifyReleased!(0); // blocked: the cap lifts while it lasts
     }
-    // The buffer then empties WITHOUT this policy metering it — a
-    // synchronous drain, the idle drain, a link snap — which the session
-    // reports as an empty offer. Nothing is blocked with nothing pending, so
-    // the lifted cap must go with it: a long stall afterwards may accrue one
-    // credit window and no more.
     expect(smooth('')).toBe(0);
     c.tick(5000);
     expect(smooth(flag)).toBe(3);
@@ -216,9 +196,6 @@ describe('createSmoother', () => {
     smooth('x');
     c.tick(10);
     expect(smooth('abcdef')).toBe(5); // charged 5, never settled
-    // The drain reports itself here; the charge belonged to an answer the
-    // session never asked about again, so refunding it later would hand back
-    // credit that was really spent.
     expect(smooth('')).toBe(0);
     smooth.notifyReleased!(0);
     c.tick(10);
@@ -369,14 +346,7 @@ describe('createAdaptiveSmoother steady pacing', () => {
     expect(smooth('x'.repeat(3500), ctxAt(0, 0, 3500))).toBe(Infinity);
   });
 
-  /**
-   * Closed-loop arrival/release simulation: an opening burst (so there is a
-   * real unrevealed backlog to rewrite), then 300cps arriving with flushes
-   * every 100ms, the policy driven with the backlog it actually left behind.
-   * `deleteAt`/`deleteChars` model a `rewrite()` — or a truncating
-   * `replace()` — removing unrevealed tail at that step; a deletion is
-   * bounded by the backlog, since only unrevealed text can be swapped out.
-   */
+  /** `deleteAt` models a `rewrite()` or truncating `replace()` at that step. */
   function playout(deleteAt: number | null, deleteChars: number) {
     const smooth = strictAdaptive();
     let arrived = 600;
@@ -396,47 +366,24 @@ describe('createAdaptiveSmoother steady pacing', () => {
       /** Units released over the `ms` after step `from`. */
       after: (from: number, ms: number) =>
         releasedAt[from + ms / 100] - releasedAt[from],
-      /** Unrevealed characters left at step `at`. */
       backlog: (at: number) => backlogAt[at],
     };
   }
 
   test('a tail rewrite that shrinks the arrived total does not depress the reveal', () => {
-    // `StreamSession.rewrite` swaps the unrevealed tail for a shorter one
-    // (the citation rewrite that motivates it deletes more than it adds), so
-    // `sourceLength + pendingLength` — the arrival signal — goes DOWN. The
-    // policy rebases its window on the drop, so the very next sample
-    // measures real arrival again and the backlog settles straight back into
-    // the target-lag band (120 chars at this arrival rate).
-    //
-    // Sampling the dip raw reads the deletion as negative arrival; clamping
-    // to a high-water mark instead flattens the series until arrival
-    // re-fills the deleted region, which lasts longer. Either way the
-    // release falls under the arrival rate and the backlog GROWS: measured
-    // against a clamping build, 89 → 157 chars for a 200-char rewrite and
-    // 0 → 200 for a 300-char one, releasing 532 and 400 where this releases
-    // 581 and 525.
-    for (const deleted of [200, 300]) {
+    // The backlog settles back into the target-lag band (120 chars at this rate).
+    const runs = [200, 300].map((deleted) => {
       const run = playout(40, deleted);
-      expect([deleted, run.backlog(60) <= 120]).toEqual([deleted, true]);
-      expect([deleted, run.after(40, 2000) > 500]).toEqual([deleted, true]);
-    }
-    // Undisturbed, the same run works off its opening burst at catch-up rate
-    // and lands in the same band.
-    expect(playout(null, 0).backlog(60)).toBeLessThanOrEqual(120);
+      return [deleted, run.backlog(60), run.after(40, 2000)];
+    });
+    expect(runs).toEqual([[200, 108, 581], [300, 75, 525]]);
+    // The undisturbed run lands in the same band.
+    expect(playout(null, 0).backlog(60)).toBe(117);
   });
 
   test('a truncating replace does not pin the estimate for the rest of the run', () => {
-    // `replace(full)` with divergent, shorter text — also the fallback path
-    // of `rewrite()` when the edit reaches committed text — lowers the
-    // arrival signal permanently. A high-water clamp holds every later
-    // sample at the pre-truncation mark and reads far too little arrival
-    // until the document grows back past it: three seconds after a 400-char
-    // truncation a clamping build still carried a 340-char backlog against
-    // this build's 88, and had not recovered two seconds after that (164).
     const truncated = playout(20, 400);
-    expect(truncated.backlog(50)).toBeLessThanOrEqual(120);
-    expect(truncated.backlog(70)).toBeLessThanOrEqual(120);
+    expect([truncated.backlog(50), truncated.backlog(70)]).toEqual([88, 88]);
   });
 });
 
@@ -532,17 +479,13 @@ describe('createAdaptiveSmoother word snap and grapheme safety', () => {
   });
 
   test('never leaves half a flag: regional indicators snap forward in pairs', () => {
-    // '🇺🇸' is two regional indicators; a cut between them commits a lone
-    // letter tile. dt 50ms at the floored 40cps → budget cut at 2, exactly
-    // between them — the snap carries it past the pair.
+    // dt 50ms at the floored 40cps → budget cut at 2, between the indicators.
     const flag = '\u{1F1FA}\u{1F1F8}';
     expect(primed(0).probe(`${flag}abcdefghijkl`, 350)).toBe(flag.length);
   });
 
   test('never splits a combining mark off its base', () => {
-    // 'café' in NFD: the cut at 4 sits between 'e' and its U+0301. dt 100ms
-    // at the floored 40cps → budget 4, and there is no whitespace in the
-    // lookahead to snap to first.
+    // dt 100ms at the floored 40cps → budget 4, between 'e' and its U+0301.
     expect(primed(0).probe('cafe\u0301abcdefghijkl', 400)).toBe(5);
     // '1️⃣' — '1' U+FE0F U+20E3 — is a variation selector plus a combining
     // enclosing mark. dt 25ms → budget 1.

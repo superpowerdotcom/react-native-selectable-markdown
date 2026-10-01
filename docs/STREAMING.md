@@ -163,6 +163,10 @@ every frame while it withholds text, and holdback arms an idle drain. To
 keep the tail instead of discarding it, call `flushBuffered()` (or
 `finalize()`) first.
 
+`suspend()` cancels scheduled flushes and idle drains while retaining input,
+subscribers, and snapshots. `resume()` schedules remaining buffered input.
+These methods are reversible; `dispose()` permanently ends the session.
+
 ### Smoothing
 
 Coalescing bounds how often the document changes, not how much. A
@@ -223,7 +227,7 @@ the session finds the last top-level block `X` satisfying all of these and
 anchors at the first non-blank line after `X`'s trailing blank line(s):
 
 1. `X` is `paragraph`, `heading`, `thematicBreak`, `table`, `blockquote`, an
-   `htmlBlock` that is not an OPEN CommonMark type 1-5 block, or `codeBlock`
+   `htmlBlock` that is not an OPEN CommonMark type 1-4 block, or `codeBlock`
    with `fenced: true` and `closed: true`. Appending after a blank line can
    never merge back into these.
 2. A blank line separates `X` from what follows, and non-blank content has
@@ -363,19 +367,7 @@ and `value += delta`, when:
   public document shape. The shape of that cost: a fast-path append on a
   constant-size tail measured ~3 µs at 100 blocks and ~7 µs at 3,000 in a
   Node probe on a laptop.
-- **Wall time, but only asymptotically.** On the bundled 1.2 kB transcript
-  the streamed path is not reliably cheaper than reparsing the whole document
-  per chunk: the ratio the bench prints straddles 1.0 there (0.5–1.3 across
-  runs), and its spread line shows the streamed and naive bands overlapping,
-  so at that size it reports noise rather than strategy. The statistic is
-  matched now — both sides are the median, across repeats, of one replay's
-  total — so the overlap is the fixture's size and not a mismatch. The win
-  needs the stream to keep producing anchor-safe blocks and the document to
-  grow: ~0.12 at `--replicas 8`, against 1.2–1.6 on the never-anchoring
-  giant-list transcript, which settles nothing and reuses nothing.
-  [BENCHMARKS.md](BENCHMARKS.md) reports the same measurement on the machine
-  it documents (Apple M2 Max, arm64 Node 22); every one of these ratios is
-  machine-relative.
+- **Wall time depends on anchoring and document size.** The reported ratio is the median streamed append total divided by the median naive full-reparse total, over repeated replays. At the small default fixture, scheduling and warmup can move it across 1.0; a larger transcript with anchor-safe blocks benefits more. A never-anchoring list can cost more than naive reparsing. [BENCHMARKS.md](BENCHMARKS.md) records dated samples rather than guaranteed bounds; compare the printed spread and repeat on the target runtime.
 - **Selection stability.** Settled runs keep stable spans. Tail-run
   selectability is a per-platform view policy ([SELECTION.md](SELECTION.md)).
 
@@ -402,7 +394,7 @@ interface RepairResult {
   text: string;            // the tail as it should be fed to the parser
   appended: string;        // pure virtual suffix, past all real offsets
   touched: SourceSpan[];   // tail spans altered or suppressed for display
-  scan: RepairScan | null; // carry-forward state for the next call
+  scan?: RepairScan | null; // carry-forward state for the next call
 }
 ```
 
@@ -597,14 +589,12 @@ the binding cannot see into, so nothing it remembers as spent is trustworthy.
 With no ids at all nothing is filtered, so such a host must not forward
 events from a run it no longer observes. `bindMessageEvents` and
 `useAgUiSession` never filter — they observe no run start. Both hooks
-dispose every session in their map at unmount, because those flush and
-idle-drain timers outlive a view's unsubscribe; detaching a binding only unsubscribes — never
-flushes or settles, deliberately, so a rebind on an `events` identity change
-cannot dump a smoother's withheld backlog, and the binding that takes over
-keeps an adopted row on the buffered path when the row still had text pending
-at the takeover, so a mid-reveal rebind does not end the row's pacing on its
-next delta either — and a detached session keeps draining on its own timers
-until it is flushed or disposed.
+suspend session timers when their effects disconnect and resume them on
+reconnection, preserving React Activity's retained state. Eviction disposes
+a session permanently. Detaching a binding alone only unsubscribes; a new
+binding preserves the session's buffered routing even when its buffer is
+empty between arrivals. Hosts without `onRunStarted` may reuse a run ID;
+spent-ID filtering requires a run-start subscription.
 
 ## Protocol edge cases
 

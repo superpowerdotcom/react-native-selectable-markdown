@@ -1,30 +1,3 @@
-/**
- * Entity decoding, and the invariant that keeps it from breaking selection.
- *
- * `entities.ts` is the JS fallback behind the decoder's Entity case. It is
- * small, it is pure, and what it does is the kind of thing that is wrong
- * quietly: a mis-decoded entity renders as slightly odd prose, and a
- * mis-measured one moves every offset after it.
- *
- * THE TWO HALVES OF AN ENTITY'S CONTRACT. `value` is what the reader sees;
- * `length` is how much raw source it consumed. The document model then keeps
- * the node's span over the RAW source, so a selection across `&amp;` copies
- * back the five characters the author typed rather than the one they see.
- * `length` is what makes that possible, so it is asserted everywhere `value`
- * is — a decoder that returned the right character and the wrong length would
- * look perfect on screen and shift every subsequent span by four.
- *
- * WHY A SUBSET OF NAMED ENTITIES, AND WHAT THAT DOES NOT MEAN. CommonMark
- * admits the full HTML5 list — over two thousand names, a ~100 KB table.
- * This module ships the couple of dozen that appear in real prose, so
- * `&hearts;` and `&notanentity;` behave identically *at this seam*. They do
- * NOT behave identically in a parsed document: md4c decodes entity events
- * and attribute strings against its own complete table, so `&hearts;` renders
- * as ♥ and only genuinely unknown names stay literal. The end-to-end block at
- * the bottom of this file is what pins that, and the size trade here costs
- * nothing on the shipped path because nothing reaches this table on it.
- */
-
 import { decodeEntityAt } from './entities';
 import { parseDocument } from './Engine';
 import { presets } from './options';
@@ -37,7 +10,7 @@ function at(text: string): { value: string; length: number } | null {
 }
 
 describe('decodeEntityAt: named references', () => {
-  test('the shipped subset decodes, consuming `&` through `;`', () => {
+  test('common names decode, consuming `&` through `;`', () => {
     expect(at('&amp;')).toEqual({ value: '&', length: 5 });
     expect(at('&lt;')).toEqual({ value: '<', length: 4 });
     expect(at('&gt;')).toEqual({ value: '>', length: 4 });
@@ -48,18 +21,16 @@ describe('decodeEntityAt: named references', () => {
     expect(at('&mdash;')).toEqual({ value: '—', length: 7 });
   });
 
-  test('a name outside the subset stays literal', () => {
-    // Not an error and not a replacement character: the source text is left
-    // exactly as written, which is what a reader who typed `&hearts;` sees.
+  test('recognizes the full native table and preserves unknown names', () => {
     expect(at('&notanentity;')).toBeNull();
-    expect(at('&hearts;')).toBeNull();
-  });
-
-  test('names are case-sensitive', () => {
-    // HTML5 distinguishes `&amp;` from `&AMP;`; only the lowercase spellings
-    // are in the table, and an unrecognized one must degrade to literal text
-    // rather than guessing.
-    expect(at('&AMP;')).toBeNull();
+    expect(at('&constructor;')).toBeNull();
+    expect(at('&toString;')).toBeNull();
+    expect(at('&hearts;')).toEqual({ value: '♥', length: 8 });
+    expect(at('&AMP;')).toEqual({ value: '&', length: 5 });
+    expect(at('&Amp;')).toBeNull();
+    expect(at('&fjlig;')).toEqual({ value: 'fj', length: 7 });
+    expect(at('&NotEqualTilde;')).toEqual({ value: '≂̸', length: 15 });
+    expect(at('&CounterClockwiseContourIntegral;')).toEqual({ value: '∳', length: 33 });
   });
 
   test('an unterminated entity is not an entity', () => {
@@ -67,6 +38,7 @@ describe('decodeEntityAt: named references', () => {
     // one character before `&amp;` does, and it has to render as those four
     // literal characters until the semicolon lands.
     expect(at('&amp')).toBeNull();
+    expect(at('&amp;')).toEqual({ value: '&', length: 5 });
     expect(at('&')).toBeNull();
     expect(at('&;')).toBeNull();
   });
@@ -116,27 +88,29 @@ describe('decodeEntityAt: numeric references', () => {
     // longer run is malformed rather than large. Left literal.
     expect(at('&#x0000041;')).toBeNull();
     expect(at('&#00000065;')).toBeNull();
+    // One digit fewer is the longest run each format accepts.
+    expect(at('&#x000041;')).toEqual({ value: 'A', length: 10 });
+    expect(at('&#0000065;')).toEqual({ value: 'A', length: 10 });
     expect(at('&#;')).toBeNull();
     expect(at('&#x;')).toBeNull();
   });
 
   test('the lookahead is capped, so a stray `&` costs O(1)', () => {
     // Prose is full of bare ampersands, and every one of them is a candidate.
-    // The scan window is a fixed 31 characters past the `&`, so a document
+    // The scan window is a fixed 33 characters past the `&`, so a document
     // with an `&` on one line and a `;` on the next does not turn inline
-    // decoding quadratic — and no entity this package knows is anywhere near
-    // that long.
+    // decoding quadratic; the longest HTML5 name still fits.
     expect(at(`&${'a'.repeat(100_000)};`)).toBeNull();
     expect(at(`&#${'0'.repeat(100_000)}65;`)).toBeNull();
+    // The cap bounds the scan, not the text after a complete entity.
+    expect(at(`&amp;${'a'.repeat(100_000)};`)).toEqual({ value: '&', length: 5 });
   });
 });
 
 describeNative('the span-versus-value invariant, end to end', () => {
   test('a text node decodes its entity while its span covers the raw source', () => {
-    // The property the two halves of the contract exist to preserve. `value`
-    // is what the native host draws; the span is what `copy` slices and what
-    // the streaming splice shifts. They are deliberately different lengths
-    // here.
+    // `value` is what the host draws; the span is what copy slices and the
+    // splice shifts.
     const source = 'a &amp; b\n';
     const doc = parseDocument(source, presets.commonmark, requireNativeEngine());
     const [text] = (doc.blocks[0] as { children: Inline[] }).children;
@@ -153,11 +127,7 @@ describeNative('the span-versus-value invariant, end to end', () => {
     expect(doc.source.slice(link.span.start, link.span.end)).toBe(source.slice(0, -1));
   });
 
-  test('a name this table does not carry still decodes, because md4c does', () => {
-    // The counterpart to the size trade in the header: `hearts` is not in
-    // NAMED_ENTITIES, and the rendered document has ♥ in it anyway. A test
-    // that only asserted `at('&hearts;') === null` would leave a reader
-    // believing this package renders `&hearts;` literally.
+  test('native entity values agree with the JavaScript table', () => {
     const doc = parseDocument('x &hearts; y\n', presets.commonmark, requireNativeEngine());
     const [text] = (doc.blocks[0] as { children: Inline[] }).children;
     expect(text).toMatchObject({ kind: 'text', value: 'x ♥ y' });

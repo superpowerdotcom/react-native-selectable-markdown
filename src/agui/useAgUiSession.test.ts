@@ -88,7 +88,6 @@ function makeSink(): RecordingSink {
   return sink;
 }
 
-/** `makeSink` plus the coalescing entry point, logged in arrival order. */
 interface RecordingBufferedSink extends BufferedSessionSink {
   calls: string[];
   finalizeReasons: (string | undefined)[];
@@ -144,8 +143,9 @@ describe('bindMessageEvents', () => {
 
     events.emitDelta('other', 'nope');
     events.emitMessageEnd('other');
+    events.emitDelta('m1', 'yes');
 
-    expect(sink.appended).toEqual([]);
+    expect(sink.appended).toEqual(['yes']);
     expect(sink.finalizeReasons).toEqual([]);
   });
 
@@ -299,8 +299,7 @@ describe('bindMessageEvents coalescing', () => {
   it('falls back to append when the sink has no buffered entry point', () => {
     const events = new FakeEvents();
     const plain = makeSink();
-    // The overloads make this a type error for a typed caller; the runtime
-    // check is what keeps an untyped one appending instead of throwing.
+    // The overloads reject this for typed callers; only untyped ones reach the runtime check.
     bindMessageEvents(events, 'm1', plain as unknown as BufferedSessionSink, {
       coalesce: true,
     });
@@ -350,9 +349,6 @@ describe('resolveSessionInit', () => {
   });
 
   it('does not infer coalescing from repair or now, which work either way', () => {
-    // `repair` threads into every commit's tail repair, synchronous appends
-    // included, and `now` is only the smoother's clock. Neither implies
-    // buffering, so neither may switch the delta route.
     expect(resolveSessionInit({ repair: { hideUriLikeLabels: true } }).coalesce).toBe(
       false,
     );
@@ -366,9 +362,7 @@ describe('resolveSessionInit', () => {
     };
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      // What an untyped (JS) caller writes: `{ ...presets.llmChat, engine }`.
-      // TypeScript rejects the literal outright, so this cast is the only
-      // way to reach the branch — and it is exactly what a JS host reaches.
+      // What a JS caller writes: `{ ...presets.llmChat, engine }`. TypeScript rejects the literal.
       const mixed = {
         engine,
         smartPunctuation: true,
@@ -376,25 +370,19 @@ describe('resolveSessionInit', () => {
 
       const resolved = resolveSessionInit(mixed);
 
-      // Resolved as an init: the parse options are gone, which is the whole
-      // reason the warning exists.
       expect(resolved.engine).toBe(engine);
       expect(resolved.options).toBeUndefined();
       expect(warn).toHaveBeenCalledTimes(1);
       expect(String(warn.mock.calls[0]?.[0])).toContain('smartPunctuation');
 
-      // Warn-once per key combination, so a streaming re-render is quiet...
       resolveSessionInit(mixed);
       expect(warn).toHaveBeenCalledTimes(1);
-      // ...and a different stray key is its own warning.
       resolveSessionInit({
         engine,
         html: 'raw',
       } as unknown as UseAgUiSessionOptions);
       expect(warn).toHaveBeenCalledTimes(2);
 
-      // Neither shape on its own warns: an init keeping its options under
-      // `options`, or bare EngineOptions.
       resolveSessionInit({ engine, options: { smartPunctuation: true } });
       resolveSessionInit({ smartPunctuation: true });
       expect(warn).toHaveBeenCalledTimes(2);
@@ -419,25 +407,22 @@ describe('settleUnboundSession', () => {
 
   it('leaves a settled session alone', () => {
     const reasons: (string | undefined)[] = [];
+    let phase = 'streaming';
     const session = {
-      snapshot: () => ({ phase: 'settled' }),
-      finalize: (reason?: 'end' | 'aborted' | 'failed') => reasons.push(reason),
+      snapshot: () => ({ phase }),
+      finalize: (reason?: 'end' | 'aborted' | 'failed') => {
+        reasons.push(reason);
+        phase = 'settled';
+      },
     } as unknown as StreamSession;
 
     settleUnboundSession(session);
+    settleUnboundSession(session);
 
-    expect(reasons).toEqual([]);
+    expect(reasons).toEqual(['aborted']);
   });
 });
 
-// ---------------------------------------------------------------------------
-// Real StreamSessions: what coalescing through the per-message binding buys,
-// and what settling an unbound one does to the document. Driven by a manual
-// frame scheduler (nothing fires until the test says so) over an engine that
-// needs no native addon.
-// ---------------------------------------------------------------------------
-
-/** Manual stand-in for the frame scheduler: fires only when told to. */
 function manualFrame() {
   let next: (() => void) | null = null;
   const scheduler: BufferScheduler = (flush) => {
@@ -456,10 +441,7 @@ function manualFrame() {
   };
 }
 
-/**
- * Whole-source-as-one-paragraph engine: satisfies the session's span
- * invariant (text value === source slice) without the native md4c addon.
- */
+/** Satisfies the session's span invariant (text value === source slice) without the native addon. */
 const wholeParagraphEngine: Engine = {
   name: 'whole-paragraph',
   parse(source: string): ParsedDocument {
@@ -493,7 +475,7 @@ describe('bindMessageEvents over a real StreamSession', () => {
     events.emitDelta('m1', 'one ');
     events.emitDelta('m1', 'two ');
     events.emitDelta('m1', 'three');
-    expect(revisions).toEqual([]); // nothing parsed yet
+    expect(revisions).toEqual([]);
     frame.fire();
 
     expect(revisions).toEqual([1]);
@@ -506,8 +488,7 @@ describe('bindMessageEvents over a real StreamSession', () => {
       engine: wholeParagraphEngine,
       bufferScheduler: frame.scheduler,
       idleScheduler: () => () => {},
-      // A metered reveal: run end here finalizes straight through it, since
-      // the per-message binding owns no run-end drained hold.
+      // Metered: 4 units per flush.
       smoother: () => 4,
     });
     const events = new FakeEvents();

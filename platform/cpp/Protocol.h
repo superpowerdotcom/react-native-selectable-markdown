@@ -20,11 +20,7 @@
  *    offsets, and the JS decoder slices the JS source string it already
  *    holds. The string table exists only for values that are NOT source
  *    slices: link hrefs/titles, code-block info strings, decoded entities,
- *    and the text md4c synthesizes rather than points at — mostly the "\n"
- *    it reports for every break and every code- or HTML-block line. That
- *    last class is the LARGEST here, not a rare one; `SaxState::intern`
- *    collapses each consecutive run of identical values to a single entry,
- *    so a thousand-line code block adds one entry rather than a thousand.
+ *    and the text md4c synthesizes rather than points at (mostly "\n").
  *
  * 3. Content ranges, not construct ranges. An event's [start, end) covers
  *    the union of its descendants' text (see OffsetParser.h constraint 2).
@@ -41,17 +37,9 @@
  * protocol.ts. The two files are kept in sync by a test that asserts the
  * numeric values match.
  *
- * WHEN kProtocolVersion GETS BUMPED. Only when a decoder built against the
- * other side would read the buffer WRONG: a changed constant, a changed
- * record or header layout, a reused field with a new meaning. The decoder
- * THROWS on a version mismatch ("rebuild the app against the matching native
- * module"), so a bump is not free — it hard-breaks every old-native/new-JS
- * pair, which is exactly the pair a JS-only update produces. A change no
- * decoder on either side can observe therefore does NOT bump: dropping the
- * ListItem task-mark offset and the Table column count from detailA (see the
- * event layout below) left the layout and every constant untouched and
- * nothing had ever read those values, so both binary/JS combinations stayed
- * correct across it.
+ * Bump kProtocolVersion only when an existing decoder would misread the
+ * buffer: the decoder throws on a mismatch, breaking every old-native/new-JS
+ * pair a JS-only update produces.
  */
 
 #ifndef SELECTABLE_MARKDOWN_PROTOCOL_H
@@ -122,13 +110,6 @@ inline constexpr uint32_t kFlagParseOk = 1u << 0;
  *                            OrderedList   -> start number
  *                            CodeBlock     -> fence char code ('`'/'~'), 0
  *                                             for indented code
- *                         A ListItem's task-mark offset and a Table's column
- *                         count used to ride here too. Nothing read them —
- *                         the mark's offset IS the item's byteStart, and the
- *                         column count is re-derived from the cell events —
- *                         so they are no longer encoded (FlatBuffer.cpp's
- *                         packDetailA). Anything that wants one back should
- *                         take this space, not add a field.
  *   +16  i32 stringA       index into the string table, or -1
  *   +20  i32 stringB       index into the string table, or -1
  */

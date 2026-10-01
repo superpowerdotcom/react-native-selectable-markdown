@@ -176,7 +176,7 @@ tail repair, run segmentation, run projection — not parse times.
 | Streaming replay, 131 chunks / 1.2 kB (`bench:streaming`, re-run 2026-09-03) | 2.52–2.80 ms of append time per replay (median of 3, three runs), p50 0.02 ms/chunk, p99 0.06–0.16 ms |
 | Streaming replay, 1055 chunks / 9.3 kB (`--replicas 8`, re-run 2026-09-03) | 14.98 ms of append time (34.83 ms replay total), p50 0.01 ms/chunk, p99 0.09 ms |
 | Streaming replay, 2484 chunks / 21.9 kB, one 420-item bullet list (re-run 2026-09-03) | p50 0.28 ms/chunk, mean parse input 10,854 chars — never anchors; 731 and 769 ms of append time in two runs (per-replay spread 715–945 ms) |
-| Projection over the replayed transcript (`bench:projection`) | 6,042 characters projected for 1,162 of document (5.2×), worst single projection 274 |
+| Projection over the replayed transcript (`bench:projection`) | 6,045 characters projected for 1,162 of document (5.2×), worst single projection 274 |
 
 Five notes on the table:
 
@@ -204,8 +204,7 @@ Five notes on the table:
   transcript (streamed 2.78 / 2.80 / 2.52 ms against naive 4.17 / 4.22 /
   3.90 ms over 131 chunks) and 0.098 at ×8 (14.98 ms against 153 ms over 1055
   chunks of 9.3 kB), falling as the document grows. Still quote it as a band:
-  each of those runs printed a spread reaching 0.447–0.913, so the two
-  distributions overlap at 1.2 kB and only the ×8 figure is a clean win. The
+  those historical runs printed a ratio spread of 0.447–0.913. Other runs can cross 1.0 at 1.2 kB; the recorded range is not a bound on future runs. The larger fixture shows a clearer benefit. The
   structural numbers do not move: parse input per append is mean 105 / p95 254
   / max 277 characters at both sizes, and 11 of 130 appends (88 of 1047 at ×8)
   skipped the engine entirely.

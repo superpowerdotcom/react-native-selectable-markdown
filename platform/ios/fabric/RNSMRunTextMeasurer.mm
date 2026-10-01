@@ -4,15 +4,8 @@
  * this package does not measure through React Native's own TextLayoutManager,
  * and what the interface is shaped around.
  *
- * THE `#ifdef RCT_NEW_ARCH_ENABLED` BELOW IS NOT A GATE, and there is no
- * longer an architecture it could select between. The podspec adds this file
- * unconditionally and calls `install_modules_dependencies` unconditionally,
- * which is what defines the macro — so it is always true for this pod, and
- * SelectableMarkdown.podspec says why at length: from react-native 0.82,
- * which is this package's peer floor, React Native refuses to install the old
- * architecture at all. The guard stays because it costs one line and keeps
- * the file honest about what its includes need (React-Fabric, codegen's
- * Props.h, React-RCTFabric), not because anything reachable turns it off.
+ * The `#ifdef RCT_NEW_ARCH_ENABLED` below is always true at the react-native
+ * >= 0.82 floor; it only states what the includes need.
  *
  * WHAT MAKES THIS SHORT. `prepareContent` returns the exact NSAttributedString
  * the component view will draw, and `measure` lays that same object out in a
@@ -26,6 +19,7 @@
 #ifdef RCT_NEW_ARCH_ENABLED
 
 #import <UIKit/UIKit.h>
+#include <cmath>
 
 #import <react/utils/ManagedObjectWrapper.h>
 
@@ -53,33 +47,10 @@ std::shared_ptr<void> RNSMRunTextMeasurer::prepareContent(
     Float fontSizeMultiplier) const
 {
   /*
-   * `fontSizeMultiplier` is applied, which is what makes a native run scale
-   * with Dynamic Type the way the `<Text>` blocks around it always have (a
-   * document that mixed the two rendered at two type sizes at once). It
-   * reaches the string builder, which multiplies every font size and line
-   * height by it and nothing else.
-   *
-   * THE THREE PIECES THAT MAKE THAT SAFE, none of which are ours:
-   *
-   *   - the value is a layout-context scalar, so it is the same for the
-   *     measurement and for the string the mounting layer draws — they are
-   *     one object here, so measure/draw agreement is untouched;
-   *   - `RCTFabricSurface` refreshes it from `RCTFontSizeMultiplier()` on
-   *     `UIContentSizeCategoryDidChangeNotification` and re-constrains the
-   *     surface (RCTFabricSurface.mm), so a category change re-lays out the
-   *     document rather than leaving it measured at the old size — the
-   *     "re-measures on the notification" half docs/FABRIC-PLAN.md §6.2 asks
-   *     for is React Native's, already in place;
-   *   - RNSMRunHostShadowNode memoises the prepared content keyed on this
-   *     exact scalar, so the rebuild happens once per category change and a
-   *     streamed commit that changes nothing else still carries the handle
-   *     across untouched.
-   *
-   * What is NOT done here is `adjustsFontForContentSizeCategory` on the host
-   * view: it scales at draw time, on the main thread, against a string the
-   * shadow node measured unscaled, and it is a no-op for our fonts anyway
-   * (they come from `UIFont(name:size:)`, not `UIFontMetrics`). That line was
-   * deleted; this is the version that works.
+   * RCTFabricSurface re-lays out the surface on a content size category change,
+   * and RNSMRunHostShadowNode memoises this content on the multiplier. Do not
+   * add `adjustsFontForContentSizeCategory` to the host view: it rescales at
+   * draw time against the string measured here.
    *
    * wrapManagedObject is the ARC-correct bridge to std::shared_ptr<void>
    * (react/utils/ManagedObjectWrapper.h:53-56): it retains once and releases
@@ -114,28 +85,15 @@ Size RNSMRunTextMeasurer::measure(
   }
 
   CGSize size = [RNSMTextKitStack measureAttributedString:attributedString
-                                                    width:layoutConstraints.maximumSize.width
-                                         pointScaleFactor:layoutContext.pointScaleFactor];
+                                                    width:layoutConstraints.maximumSize.width];
 
-  /*
-   * The room a box at the very EDGE of the run needs, which the text layout
-   * above does not ask for and cannot: a table that closes an answer ends at
-   * the last character, so its bottom border has nothing under it, and a code
-   * block that opens one starts at offset 0, so its top border has nothing
-   * above it. Everywhere else the padding is painted into the blank line the
-   * '\n\n' block separator leaves and costs no height at all.
-   *
-   * READ OFF THE STRING THAT WAS JUST MEASURED, not recomputed from `props`.
-   * The builder put it there (RNSMAttributedText.mm), and the host view reads
-   * it back off the identical object through Fabric State — so the height
-   * reported here and the offset the text is drawn at come from one value,
-   * computed once. Recomputing it from props on either side would be the
-   * measure/draw disagreement docs/FABRIC-PLAN.md §4 exists to make
-   * impossible.
-   */
+  // Read off the measured string, never recomputed from props, so the host's
+  // text offset matches the height reported here.
   const UIEdgeInsets edgeInsets =
       [RNSMAttributedText runEdgeInsetsOfAttributedString:attributedString];
-  size.height += edgeInsets.top + edgeInsets.bottom;
+  const Float scale = layoutContext.pointScaleFactor > 0 ? layoutContext.pointScaleFactor : 1;
+  size.width = std::ceil(size.width * scale) / scale;
+  size.height = std::ceil((size.height + edgeInsets.top + edgeInsets.bottom) * scale) / scale;
 
   /*
    * Clamping is where a measured size becomes a legal one, and it is done here

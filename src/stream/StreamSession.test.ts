@@ -255,12 +255,7 @@ describe('StreamSession (fake engine)', () => {
   });
 
   test('an unclosed $$ is not a reason to hold the anchor', () => {
-    // A `$$…$$` span is INLINE: it ends with its block, so a paragraph left
-    // holding one unclosed is finished text the moment a blank line follows
-    // it — nothing appended later can reopen it — and it settles with math
-    // on exactly as with math off. Carrying the state across the blank line
-    // instead froze the anchor at 0 for the rest of the stream on prose that
-    // merely contained a doubled currency sign.
+    // `$$…$$` is inline: a blank line ends its block, so nothing can reopen it.
     const withMath = make({ options: { extensions: { math: true } } });
     withMath.append('$$\nx\n\ny');
     expect(withMath.snapshot().settledUntil).toBe(6);
@@ -368,11 +363,7 @@ describe('StreamSession (fake engine)', () => {
   });
 
   test('snapshot() is referentially stable before the first commit', () => {
-    // `useSyncExternalStore((cb) => s.subscribe(cb), () => s.snapshot())` is
-    // the documented integration, and React re-renders until getSnapshot
-    // stops handing back a new object — so the pre-stream snapshot of a row
-    // that mounted before its answer started must be one object, not one per
-    // render.
+    // useSyncExternalStore re-renders until getSnapshot returns the same object.
     const s = make();
     const first = s.snapshot();
     expect(s.snapshot()).toBe(first);
@@ -396,10 +387,6 @@ describe('StreamSession (fake engine)', () => {
     });
     s.subscribe((snap) => later.push([snap.revision, snap.document.source]));
     s.append('first');
-    // Revision 2 was committed from inside revision 1's delivery. The second
-    // listener must still see 1 before 2: handed them the other way round, a
-    // listener that stores its argument (every React store does) would end on
-    // the stale document while the session says otherwise.
     expect(later).toEqual([
       [1, 'first'],
       [2, 'first and more'],
@@ -414,9 +401,6 @@ describe('StreamSession (fake engine)', () => {
       seen.push(snap.revision);
       s.append('.'); // never stops re-entering
     });
-    // Delivering in revision order means the nested commit is drained by the
-    // outer loop rather than the stack, so this cannot end in a stack
-    // overflow any more; without a bound it would simply hang.
     expect(() => s.append('first')).toThrow(/kept mutating the session/);
     expect(seen.length).toBeGreaterThan(1000);
   });
@@ -435,10 +419,7 @@ describe('StreamSession (fake engine)', () => {
       throw new Error('listener boom');
     });
     s.subscribe((snap) => late.push(snap.revision));
-    // The error still surfaces to the caller…
     expect(() => s.append('first')).toThrow('listener boom');
-    // …but delivery finished: both listeners saw both revisions, in order,
-    // and nobody is left behind the session's own snapshot.
     expect(early).toEqual([1, 2]);
     expect(late).toEqual([1, 2]);
     expect(s.snapshot().revision).toBe(2);
@@ -454,10 +435,7 @@ describe('StreamSession (fake engine)', () => {
       },
     };
     const s = new StreamSession({ engine: recording });
-    // A bare marker line is suppressed whole (repair handler 7), leaving
-    // empty parse input — which `parse` short-circuits. So it is the first
-    // append with non-empty REPAIRED input, not the first non-empty append,
-    // that reaches the engine (and that an unlinked engine would throw on).
+    // Repair suppresses a bare marker line, and `parse` skips empty input.
     s.append('#');
     expect(parsed).toEqual([]);
     expect(s.length).toBe(1);
@@ -485,9 +463,6 @@ describe('StreamSession (fake engine)', () => {
 
     boom = true;
     expect(() => s.append(' more.')).toThrow('engine boom');
-    // The append is atomic up to its commit: `length` must not count text no
-    // snapshot contains, and the anchor must not have advanced over a parse
-    // that never happened.
     expect(s.length).toBe(17);
     expect(s.snapshot()).toBe(before);
     expect(s.snapshot().settledUntil).toBe(12);
@@ -603,17 +578,6 @@ describe('StreamSession repair options', () => {
 linkNativeEngineAsDefault();
 
 describeNative('StreamSession + the md4c engine (integration)', () => {
-  /*
-   * Nesting depth is whatever the model emitted, and md4c parses 40 kB of
-   * '> ' without complaint, so every JavaScript walk the session makes over
-   * the result has to survive it too. This is the whole session path at
-   * once: the splice (`shiftSpans`), the placeholder trim, the anchor scan,
-   * and — because the quote is followed by a blank line, so it FREEZES — the
-   * settled-block identity check in `finalize`, which is the last of them
-   * that recursed. Each one of them threw `RangeError: Maximum call stack
-   * size exceeded` at some depth, from an ordinary streamed append or from
-   * finalize, long after the parser itself had coped.
-   */
   test('a 20000-level blockquote streams, freezes and finalizes', () => {
     const source = `${'> '.repeat(20_000)}echo\n\nnext paragraph\n`;
     const session = new StreamSession();
@@ -624,9 +588,7 @@ describeNative('StreamSession + the md4c engine (integration)', () => {
     expect(streamed.document.source).toBe(source);
     expect(streamed.settledUntil).toBeGreaterThan(0);
 
-    // Finalize re-parses and swaps the frozen block back in by structure,
-    // which is the walk that used to throw here even though the whole
-    // document had already streamed.
+    // finalize swaps the frozen block back in by structure: one more deep walk.
     session.finalize();
     const done = session.snapshot();
     expect(done.document.source).toBe(source);
@@ -680,12 +642,6 @@ describeNative('StreamSession + the md4c engine (integration)', () => {
   });
 
   test('a link reference definition unfreezes the prefix it rewrites', () => {
-    // A definition acts at a distance: this one turns the `[foo]` in the
-    // FIRST paragraph — long since frozen by the anchor, and streamed as
-    // literal text for most of the run — into a resolved reference link. The
-    // session therefore stops freezing the moment it sees a definition, so
-    // the snapshot (and finalize) show what a fresh parse shows rather than
-    // the settled-but-stale literal.
     const source = 'See [foo] here.\n\nmiddle paragraph\n\n[foo]: https://example.com\n';
     const session = new StreamSession();
     for (const ch of source) {
@@ -727,22 +683,13 @@ describeNative('StreamSession + the md4c engine (integration)', () => {
   ])(
     'a definition inside %s unfreezes the prefix it rewrites too',
     (_shape, source) => {
-      // md4c honours a definition behind a container marker and one whose
-      // label spans a line break; a scanner that only recognised
-      // `^ {0,3}[label]:` on a top-level line left the settled paragraph
-      // showing literal '[foo]' while a fresh parse of the same text showed
-      // the resolved link.
       const session = new StreamSession();
       for (const ch of source) {
         session.append(ch);
       }
       const mid = session.snapshot();
       expect(mid.settledUntil).toBe(0);
-      // The first paragraph — frozen literal text before the definition was
-      // seen — now shows the resolved reference link a fresh parse shows.
-      // (Only the paragraph: a trailing container holding nothing but the
-      // definition is an empty placeholder block, which the streaming
-      // document trims and a fresh parse keeps.)
+      // Only the paragraph: streaming trims the definition-only container.
       const para = mid.document.blocks[0] as ParagraphNode;
       expect(JSON.parse(JSON.stringify(para))).toEqual(
         JSON.parse(JSON.stringify(parseDocument(source).blocks[0])),
@@ -763,11 +710,6 @@ describeNative('StreamSession + the md4c engine (integration)', () => {
   ])(
     'a content-indented definition is found the same way, %s',
     (_name, split) => {
-      // Where the deltas fall must not change the answer. It used to: a line
-      // first seen as '    ' or '- ' skipped the "could this be a
-      // definition" test on every later append, so a char-by-char stream
-      // found definitions a line-by-line stream missed AND ruled in prose
-      // that is not one.
       const source =
         'See [foo] here.\n\n- item\n\n    [foo]: https://example.com\n\ntail text\n';
       const session = new StreamSession();
@@ -776,8 +718,6 @@ describeNative('StreamSession + the md4c engine (integration)', () => {
         session.append(delta);
         settled.push(session.snapshot().settledUntil);
       }
-      // The definition rewrites the first paragraph, so nothing may stay
-      // frozen once it is here.
       expect(session.snapshot().settledUntil).toBe(0);
       const para = session.snapshot().document.blocks[0] as ParagraphNode;
       expect(para.children.map((c) => c.kind)).toEqual(['text', 'link', 'text']);
@@ -789,16 +729,13 @@ describeNative('StreamSession + the md4c engine (integration)', () => {
   );
 
   test.each([
-    ['a list item holding a colon', '- see [a]: b'],
-    ['a second list item holding one', '- item one\n- item two [x]: y'],
-    ['a quoted line holding one', '> see [a]: b'],
-    ['an indented code line', '    arr[0]: x'],
-    ['a year at the start of a line', '2024 was [a]: year'],
-  ])('%s is not a definition, however it is chunked', (_name, opener) => {
-    // The same divergence in the other direction: none of these is a link
-    // reference definition (a fresh parse of each finds no link), so none of
-    // them may stand the anchor down — which is what a resumed scan that
-    // only hunts for ']:' did on a one-code-point-per-append stream.
+    ['a list item holding a colon', '- see [a]: b', 49],
+    ['a second list item holding one', '- item one\n- item two [x]: y', 65],
+    ['a quoted line holding one', '> see [a]: b', 49],
+    ['an indented code line', '    arr[0]: x', 50],
+    ['a year at the start of a line', '2024 was [a]: year', 55],
+  ])('%s is not a definition, however it is chunked', (_name, opener, settled) => {
+    // `settled` is the start of 'tail'.
     const source = `${opener}\n\nsecond paragraph\n\nthird paragraph\n\ntail`;
     expect(JSON.stringify(parseDocument(source))).not.toContain('"kind":"link"');
     const highWater = (deltas: string[]): number => {
@@ -810,16 +747,14 @@ describeNative('StreamSession + the md4c engine (integration)', () => {
       }
       return best;
     };
-    const byChar = highWater([...source]);
-    expect(byChar).toBeGreaterThan(0);
-    expect(byChar).toBe(highWater(source.split(/(?<=\n)/)));
-    expect(byChar).toBe(highWater([source]));
+    expect([
+      highWater([...source]),
+      highWater(source.split(/(?<=\n)/)),
+      highWater([source]),
+    ]).toEqual([settled, settled, settled]);
   });
 
   test('prose that merely contains brackets still settles', () => {
-    // The definition scan must not stand the anchor down for every `[`: a
-    // bracket in ordinary prose is not a definition, and treating it as one
-    // would cost every LLM answer with a citation marker its whole anchor.
     const session = new StreamSession();
     session.append('Plain [not a ref] text.\n\nSecond paragraph.\n\nThird');
     expect(session.snapshot().settledUntil).toBe(44);
@@ -829,16 +764,11 @@ describeNative('StreamSession + the md4c engine (integration)', () => {
     const session = new StreamSession();
     session.append('A\n\nsecond *part');
     session.finalize();
-    // finalize reports the full length: everything it parsed is settled *as
-    // long as the stream stays over*.
     expect(session.snapshot().settledUntil).toBe(15);
 
     session.append('*');
     const resumed = session.snapshot();
-    // Resuming drops it back to the incremental anchor, and the text between
-    // the two offsets genuinely reparses: flat text becomes text + emphasis.
-    // Consumers must not treat settledUntil as monotone across a
-    // finalize → append cycle.
+    // The text between the two offsets reparses: flat text becomes emphasis.
     expect(resumed.settledUntil).toBe(3);
     const para = resumed.document.blocks[1] as ParagraphNode;
     expect(para.children.map((c) => c.kind)).toEqual(['text', 'emphasis']);

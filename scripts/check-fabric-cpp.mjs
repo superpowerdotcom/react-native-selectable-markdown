@@ -46,7 +46,7 @@
 //     `ConcreteComponentDescriptor<YourShadowNode>` is a template — a descriptor
 //     that cannot be instantiated is a link-time-shaped bug that only codegen
 //     surfaces, so the default mode pays the cost to surface it.
-//   * The headers are the genuine RN 0.75.4 ones from node_modules, and the
+//   * The headers are the installed React Native ones from node_modules, and the
 //     third-party headers are the genuine upstream releases. Nothing is stubbed.
 //     Stub headers would be worse than no check at all: they would let broken
 //     code pass while reporting green.
@@ -131,13 +131,20 @@ function readPins() {
 
   const podspec = (name) =>
     fs.readFileSync(path.join(rnRoot, 'third-party-podspecs', `${name}.podspec`), 'utf8');
+  const follyConfig = grab(/@@folly_config\s*=\s*\{([\s\S]*?)\n\s*\}/, 'the folly configuration', rb);
+  const follyConfigFile = grab(/:config_file\s*=>\s*\[([\s\S]*?)\]/, 'the folly config header', follyConfig)
+    .split('\n')
+    .filter((line) => line.trim())
+    .map((line) => grab(/^\s*['"](.*)['"],?\s*$/, 'a folly config header line', line))
+    .join('\n');
 
   return {
     rnVersion: JSON.parse(fs.readFileSync(path.join(rnRoot, 'package.json'), 'utf8')).version,
-    folly: grab(/:version\s*=>\s*'([^']+)'/, 'the folly version', rb),
+    folly: grab(/:version\s*=>\s*'([^']+)'/, 'the folly version', follyConfig),
+    follyConfigFile,
     // RN compiles folly with these and only these. Folly's headers are heavily
     // #if'd on them; compiling without them does not describe the real build.
-    follyFlags: grab(/:compiler_flags\s*=>\s*'([^']+)'/, 'the folly compiler flags', rb)
+    follyFlags: grab(/:compiler_flags\s*=>\s*'([^']+)'/, 'the folly compiler flags', follyConfig)
       .split(/\s+/)
       .filter(Boolean),
     cxxStandard: grab(/def self\.cxx_language_standard\s*\n\s*return "([^"]+)"/, 'the C++ standard', rb),
@@ -468,6 +475,7 @@ function ensureDeps() {
     `https://github.com/fmtlib/fmt/archive/refs/tags/${pins.fmt}.tar.gz`,
     `fmt-${pins.fmt}`,
   );
+  fs.writeFileSync(path.join(folly, 'folly', 'folly-config.h'), `${pins.follyConfigFile}\n`);
   const glog = fetchAndExtract(
     'glog',
     `https://github.com/google/glog/archive/refs/tags/v${pins.glog}.tar.gz`,
@@ -505,6 +513,7 @@ const PLATFORM_ROOTS = {
     'react/renderer/textlayoutmanager/platform/ios',
     'react/renderer/components/textinput/platform/ios',
     'react/renderer/components/view/platform/cxx',
+    'react/renderer/components/text/platform/cxx',
     'react/renderer/imagemanager/platform/ios',
   ],
   android: [
@@ -512,6 +521,7 @@ const PLATFORM_ROOTS = {
     'react/renderer/textlayoutmanager/platform/android',
     'react/renderer/components/textinput/platform/android',
     'react/renderer/components/view/platform/android',
+    'react/renderer/components/text/platform/android',
     'react/renderer/imagemanager/platform/cxx',
   ],
 };
@@ -553,7 +563,7 @@ function compileArgs(deps, platform, extraDirs = []) {
     '-fexceptions',
     '-frtti',
     ...pins.follyFlags,
-    ...(platform === 'android' ? ['-DANDROID'] : []),
+    ...(platform === 'android' ? ['-DANDROID', '-DRN_SERIALIZABLE_STATE'] : []),
     '-DLOG_TAG="Fabric"',
     // Newer Apple clang than RN's CI warns on folly/fmt's `operator"" _sp`
     // spelling. That is upstream noise, not a signal about our code.
@@ -611,8 +621,7 @@ class FabricProbeShadowNode final
           FabricProbeComponentName,
           ViewProps,
           ViewEventEmitter,
-          ParagraphState,
-          /* usesMapBufferForStateData */ false>,
+          ParagraphState>,
       public BaseTextShadowNode {
  public:
   using ConcreteViewShadowNode::ConcreteViewShadowNode;
@@ -924,42 +933,13 @@ const MUTATIONS = [
   },
 ];
 
-// ---------------------------------------------------------------------------
-// 5b. Self-test, part two: the clone guard, mutated in the real sources.
-// ---------------------------------------------------------------------------
-
-// The mutations above run against FABRIC_TU, which is a stand-in for a shadow
-// node and knows nothing about the clone guard in
-// platform/fabric/RNSMRunHostShadowNode.{h,cpp}. That guard is the most
-// expensive thing in this package to lose silently — without it every clone of
-// a measurable node is force-dirtied, which is a full-document re-measure per
-// streamed token, with no error and no warning anywhere. So these mutations
-// run against COPIES OF THE REAL FILES: the whole of platform/fabric is copied
-// into the scratch dir, the copy is edited, and the copy's directory goes on
-// the front of the include path so the edited header is the one the edited
-// .cpp sees.
-//
-// WHAT CAN AND CANNOT BE MUTATED HERE, because the difference is the whole
-// design of the guard. Deleting the `keepLayoutCleanAcrossClone(...)` call, or
-// deleting `shouldNewRevisionDirtyMeasurement` outright, compiles perfectly:
-// `cloneGuardIsLive` probes the BASE class for the two mechanisms, not this
-// class for its use of them, so removing our use of one is invisible to it —
-// verified, both edits compile clean against 0.75.4. That is not a hole in the
-// probe, it is what the probe is for: losing the guard is a performance
-// regression, and no compiler can see one. What IS checkable is the tripwire
-// itself, which is what these two mutations pin — that the static_assert
-// really fires when React Native moves, and that the deliberately-absent
-// `override` really is load-bearing rather than an oversight.
+// FABRIC_TU knows nothing of the clone guard, so these mutate copies of platform/fabric.
+// Only the tripwire is checkable: dropping our use of the guard still compiles clean.
 const GUARD_SOURCE = 'RNSMRunHostShadowNode.cpp';
 
 const SOURCE_MUTATIONS = [
   {
-    // The scenario the static_assert exists for: React Native renames or
-    // removes both clean-clone mechanisms at once, so neither half of the
-    // guard is reachable any more. Simulated by renaming what the probe looks
-    // for, because the headers themselves are not ours to edit — the probe's
-    // two `requires` expressions are exactly the surface a header change would
-    // move under us.
+      // Renames what the probe looks for, since React Native's headers are not ours to edit.
     name: 'both clone-guard mechanisms gone from the base (tripwire must fire)',
     edits: [
       {
@@ -977,29 +957,19 @@ const SOURCE_MUTATIONS = [
     expect: /Neither cleanLayout\(\) nor shouldNewRevisionDirtyMeasurement\(\) is/,
   },
   {
-    // The 0.86-era half carries no `override`, and the header says at length
-    // that this is deliberate: the base virtual does not exist on 0.75-era
-    // headers, so the keyword would make the file uncompilable on exactly the
-    // version this harness pins. This mutation is what stops a well-meaning
-    // "you forgot `override`" from landing.
-    name: 'shouldNewRevisionDirtyMeasurement marked `override` (no such base virtual at 0.75)',
+    name: 'clone measurement override has an incompatible signature',
     edits: [
       {
         file: 'RNSMRunHostShadowNode.h',
-        find: 'const ShadowNodeFragment& fragment) const;',
-        replace: 'const ShadowNodeFragment& fragment) const override;',
+        find: 'const ShadowNodeFragment& fragment) const override;',
+        replace: 'const ShadowNodeFragment& fragment, bool extra) const override;',
       },
     ],
-    expect: /only virtual member functions can be marked 'override'/,
+    expect: /marked 'override'/,
   },
 ];
 
-/**
- * Copies platform/fabric into a fresh scratch directory and applies `edits` to
- * the copies. Returns the directory, or the first edit that matched nothing —
- * a stale `find` string would otherwise make a mutation silently test the
- * unmutated file.
- */
+/** Returns the first edit that matched nothing as `stale`, so no mutation tests an unmutated file. */
 function mutateGuardSources(scratch, label, edits) {
   const dir = path.join(scratch, `selftest_src_${label}`);
   fs.mkdirSync(dir, { recursive: true });
@@ -1020,9 +990,7 @@ function mutateGuardSources(scratch, label, edits) {
 function selftestGuard(args, scratch) {
   let failures = 0;
 
-  // The copy must compile untouched first. Otherwise a broken copy step would
-  // read as every mutation below being caught, which is the exact failure this
-  // whole section exists to prevent one level up.
+  // A broken copy step would otherwise read as every mutation being caught.
   const baseline = mutateGuardSources(scratch, 'baseline', []);
   const base = compile(path.join(baseline.dir, GUARD_SOURCE), ['-I', baseline.dir, ...args], scratch);
   if (!base.ok) {
@@ -1162,9 +1130,7 @@ function platformIncludeDirs(platform) {
   // This package's own include roots, mirroring the two HEADER_SEARCH_PATHS
   // entries SelectableMarkdown.podspec declares for its own tree. They are here
   // so that the engine can be checked at the podspec's C++ standard with
-  // `--syntax-only --platform <ios|android> <the platform/cpp sources>` (the
-  // spelling classifyNativeSources() prints and the workflows run, `find`-built
-  // rather than a non-recursive glob), which is what docs/FABRIC-PLAN.md §8
+  // `--syntax-only --platform <ios|android> <sources>`, which is what docs/FABRIC-PLAN.md §8
   // names as the proof that the c++17 -> c++20 bump is safe: without
   // platform/cpp/vendor/md4c on the path OffsetParser.cpp dies on <entity.h>,
   // and the documented command reported a failure that was the harness's, not

@@ -8,10 +8,8 @@
 // tarball into a scratch dir, and asserts that everything a consuming app
 // resolves is present and loadable.
 //
-// Run with `npm run verify:pack`. Packing triggers `prepare` — the one
-// build lifecycle script this package declares, and the same one npm runs on
-// `npm publish` and on a `github:` install — so this also proves the
-// build-on-install hook works.
+// Run with `npm run verify:pack`. Packing triggers `prepare`, as `npm publish`
+// and a `github:` install do, so this also proves the build-on-install hook.
 
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -35,14 +33,13 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // the claim now matches what is actually exercised, and it covers every path
 // a headless consumer is told to use rather than just the first one.
 const NODE_SAFE_ENTRIES = [
-  // The headless `<name>/engine` entry first: a barrel of its own that must
-  // load with no dependency at all (src/index.test.ts pins that it never
-  // reaches the view layer; this keeps the same promise at runtime). Its
-  // sibling `<name>/stream` is NOT here — see PEER_DEPENDENT_ENTRIES.
+  // `<name>/stream` is not here: it imports `react` (see PEER_DEPENDENT_ENTRIES).
   ['dist/engine.js', 'parseDocument'],
   ['dist/engine/Engine.js', 'parseDocument'],
   ['dist/engine/options.js', 'resolveOptions'],
   ['dist/engine/native/index.js', 'createNativeEngine'],
+  ['dist/engine/native.js', '__linkNativeEngine'],
+  ['dist/stream/repair.js', 'isUriLikeLabel'],
   ['dist/document/visit.js', 'visit'],
   ['dist/document/span.js', 'sliceSpan'],
   ['dist/stream/StreamSession.js', 'StreamSession'],
@@ -51,22 +48,13 @@ const NODE_SAFE_ENTRIES = [
   ['dist/selection/copy.js', 'buildCopyPayload'],
 ];
 
-// Entries that load only with the `react` PEER resolvable — which is every
-// consumer's situation, and not this script's: the tarball is unpacked into a
-// scratch directory with nothing above it. `<name>/stream` re-exports
-// `bindRunTextEvents`, whose module imports `react` at load for its hooks, so
-// importing the barrel in a bare directory fails with ERR_MODULE_NOT_FOUND for
-// 'react' however correct the build is. These are loaded AFTER the Node-safe
-// entries above and after `react` has been linked in (see linkPeers), so the
-// zero-dependency property of NODE_SAFE_ENTRIES is still proven for those.
-const PEER_DEPENDENT_ENTRIES = [['dist/stream.js', 'StreamSession']];
+// These need `react`, linked in only after NODE_SAFE_ENTRIES load, so those still prove they need none.
+const PEER_DEPENDENT_ENTRIES = [
+  ['dist/stream.js', 'StreamSession'],
+  ['dist/agui/useAgUiSession.js', 'getOrCreateSession'],
+];
 
-// Links the peer the entries above need into the unpacked package, from this
-// repository's own devDependencies. Node resolves a symlinked package by its
-// REAL path, so one link under <pkgDir>/node_modules serves both the direct
-// `require` below and the ESM probe that reaches the package through a
-// consumer symlink. A symlink is not a directory to fs.Dirent, so the
-// build-artifact walk does not descend into it.
+// Node resolves a symlinked package by its real path, so one link serves require and the ESM probe.
 const linkPeers = (pkgDir) => {
   const modules = path.join(pkgDir, 'node_modules');
   fs.mkdirSync(modules, { recursive: true });
@@ -80,10 +68,7 @@ const linkPeers = (pkgDir) => {
 // src/ ships so the declaration maps and source maps in dist/ resolve back to
 // readable sources in a consuming app.
 //
-// native/node and the addon build script ship because a consumer's test runner
-// builds the Node engine from the installed package (`<name>/node` is the
-// loader, scripts/build-node-addon.mjs the build); a `files` edit that drops
-// either turns every consumer's jest run red with nothing here going red first.
+// native/node and the addon build script ship because consumers' jest builds the Node engine from them.
 const REQUIRED_FILES = [
   'react-native.config.js',
   'src/index.ts',
@@ -113,15 +98,8 @@ const REQUIRED_FILES = [
 //                          registers codegen's non-measuring descriptor and
 //                          every run lays out at zero height — no build error.
 //   platform/ios/fabric    the measurer and the mounting-layer view. Missing,
-//                          the class the generated
-//                          RCTThirdPartyComponentsProvider names is never
-//                          compiled, so at this package's peer floor
-//                          (react-native >= 0.82) its NSClassFromString
-//                          lookup finds nothing: a silent registration miss
-//                          whose only symptom is `RunHost` throwing at mount.
-//                          On the older React Natives that still call
-//                          `SelectableRunHostCls` directly it is instead a
-//                          link failure in the consuming app.
+//                          the class RCTThirdPartyComponentsProvider names is
+//                          never compiled and `RunHost` throws at mount.
 //   android/src/main/jni   the CMake seam itself and the JNI measurer.
 const REQUIRED_NATIVE_FILES = [
   'platform/fabric/RNSMRunHostShadowNode.cpp',
@@ -283,13 +261,8 @@ const checkPodspecPaths = (pkgDir, podspecPath, manifest) => {
  * callee is `codegenNativeComponent`, and build-time codegen only parses a
  * file whose source text matches `/export\s+default\s+\(?codegenNativeComponent</`.
  * `tsc` erases the type argument and turns the export into
- * `exports.default = …`, which matches neither. Nothing in the build reports
- * it: the default export falls back to the runtime `codegenNativeComponent`,
- * which returns `requireNativeComponent`, which is dead under bridgeless — so
- * the run either renders with a null view config (an invariant violation) or,
- * where the module resolves to nothing at all, `RunHost` throws. The
- * `<Text selectable>` fallback that used to swallow both went with the old
- * architecture in 0.10.0.
+ * `exports.default = …`, which matches neither, and nothing reports it: the
+ * run renders with a null view config, or `RunHost` throws.
  *
  * `check:codegen` proves the *build* does not emit a transpiled copy. This is
  * the only check that sees the artifact a consumer actually installs, so it
@@ -301,11 +274,11 @@ const checkPodspecPaths = (pkgDir, podspecPath, manifest) => {
  *   - `codegenConfig.jsSrcsDir` ships, because that directory is what the
  *     app's build-time codegen scans; an app whose scan finds nothing
  *     generates no component at all and still builds cleanly;
+ *   - the shim under `main`'s output tree ships with a .d.ts beside it, because
+ *     `exports` promises one for every `./dist/*` path;
  *   - no transpiled copy ships under `main`'s output tree, where a bundler
  *     that ignores the `react-native` field would resolve it and get exactly
- *     the silent degradation above;
- *   - the shim that replaces it there ships with a .d.ts beside it, because
- *     `exports` promises one for every `./dist/*` path.
+ *     the silent degradation above.
  *
  * THAT LAST ONE IS KEYED ON CONTENT, NOT ON THE FILENAME, and the difference
  * matters. `dist/view/SelectableRunHostNativeComponent.js` legitimately exists:
@@ -376,15 +349,7 @@ const checkCodegenSpec = (pkgDir, manifest) => {
   walk(distDir);
   const shims = shimFiles.length;
 
-  // A shim with no .d.ts beside it is a hole in `exports`, not just a missing
-  // convenience. The `./dist/*` pattern declares its types as `./dist/*.d.ts`,
-  // and a types condition that names a file which is not in the tarball is a
-  // hard TS7016 for any consumer who deep-imports the path — an error the
-  // package cannot be fixed from the consumer's side. tsc emits every other
-  // dist declaration; this one comes from scripts/emit-dist-spec-shim.mjs,
-  // which is exactly the kind of hand-written emit that goes missing. The
-  // declaration re-exports the prop types from the untranspiled spec in src/,
-  // whose presence in the tarball is asserted at the top of this function.
+  // `exports` declares `./dist/*.d.ts`, so a shim without one is a TS7016 for deep importers.
   for (const shim of shimFiles) {
     const declaration = shim.replace(/\.js$/, '.d.ts');
     if (!fs.existsSync(declaration)) {
@@ -483,32 +448,9 @@ const checkRequireGraph = (pkgDir, manifest) => {
 };
 
 /**
- * ONCE `exports` EXISTS, IT — NOT THE FILE TREE — IS THE PACKAGE'S PUBLIC
- * SURFACE, and every check above this one resolves by filesystem path and so
- * cannot see it. `NODE_SAFE_ENTRIES` loads `<pkgDir>/dist/…` directly; a map
- * that forgot `./dist/*` would leave those files present, loadable and
- * unreachable, and the failure would surface as ERR_PACKAGE_PATH_NOT_EXPORTED
- * in a consumer's app rather than here.
- *
- * So the deep paths README documents for headless consumers are resolved the
- * way a consumer resolves them: through a `node_modules` link, by bare
- * specifier. Both spellings are asserted — with and without `.js` — because
- * the README writes them without an extension and `exports` does no extension
- * search of its own; only a subpath pattern for each form makes both work.
- *
- * `<name>/package.json` is checked because autolinking resolves the package
- * root through it (@react-native-community/cli), and an `exports` map that
- * omits it breaks `pod install` and the Gradle sweep in every consuming app
- * while every file in this tarball is still exactly where it belongs.
- *
- * AND BOTH CONDITIONS, BECAUSE THE PACKAGE NOW SHIPS TWO BUILDS. `require`
- * takes the CommonJS tree in dist/, `import` takes the ES modules in dist/esm
- * — and only one of the two can be checked with `createRequire`. So the ESM
- * half is exercised in a child Node process (checkEsmResolution below), which
- * both resolves and IMPORTS each Node-safe deep path: an ESM build is
- * unusually easy to ship broken (a missing `"type": "module"`, one relative
- * specifier left without its `.js`) and every one of those failures is invisible
- * to a resolver and loud on the first import.
+ * Resolves as a consumer does, by bare specifier through a node_modules link:
+ * `exports`, not the file tree, decides what a consumer can reach.
+ * `<name>/package.json` must resolve because autolinking reads it.
  */
 const checkExportsResolution = (pkgDir, manifest) => {
   const consumer = path.join(scratch, 'consumer');
@@ -541,11 +483,6 @@ const checkExportsResolution = (pkgDir, manifest) => {
 
   resolves(`${manifest.name}/package.json`);
 
-  // The named subpaths, each pinned to the file it must land on under Node's
-  // own (`require`) conditions. `engine` and `stream` are the headless
-  // entries a consumer's jest imports; `node` is the addon loader its test
-  // setup requires. Resolution alone is the check here — the two dist entries
-  // are also LOADED, under both conditions, through NODE_SAFE_ENTRIES.
   const SUBPATH_TARGETS = {
     engine: 'dist/engine.js',
     stream: 'dist/stream.js',
@@ -567,12 +504,6 @@ const checkExportsResolution = (pkgDir, manifest) => {
     resolves(`${manifest.name}/${relative.replace(/\.js$/, '')}`);
   }
 
-  // Metro reads `exports` from React Native 0.79 on, and prefers the
-  // `react-native` condition over `main` when it is there. That condition is
-  // therefore the same load-bearing thing the `react-native` field is (see
-  // checkCodegenSpec): it is what gets the untranspiled codegen spec in front
-  // of Metro. A map whose "." entry lost it sends Metro to dist/ instead, and
-  // the component silently stops having a static view config.
   const rootEntry = manifest.exports?.['.'];
   if (manifest.exports && typeof rootEntry === 'object' && rootEntry !== null) {
     if (rootEntry['react-native'] !== `./${manifest['react-native']}`) {
@@ -588,10 +519,7 @@ const checkExportsResolution = (pkgDir, manifest) => {
           `expected "./${manifest.main}" — every bundler that is not Metro lands here.`,
       );
     }
-    // The two builds, each pinned to the field that names it. `require` must
-    // stay on the CommonJS tree even though `import` exists, and `import` must
-    // point at the ESM one: a map where both conditions resolved to dist/ would
-    // pass every resolution check above and quietly undo the ESM build.
+    // Both conditions landing in dist/ would pass every resolution check above.
     if (rootEntry.require?.default !== `./${manifest.main}`) {
       fail(
         `exports: the "." entry's "require" condition is ${JSON.stringify(rootEntry.require)}, ` +
@@ -609,34 +537,34 @@ const checkExportsResolution = (pkgDir, manifest) => {
     fail('exports: the "." entry is not a conditions object, so nothing pins Metro to src/.');
   }
 
+  const nativeProbe = path.join(consumer, 'native-resolution.cjs');
+  const nativeEntries = ['engine/native', 'agui/useAgUiSession', 'selection/runs', 'stream/repair', 'view/RunHost'];
+  fs.writeFileSync(nativeProbe, `
+    const fs = require('node:fs');
+    for (const entry of ${JSON.stringify(nativeEntries)}) {
+      const source = require.resolve(${JSON.stringify(manifest.name)} + '/src/' + entry);
+      for (const prefix of ['dist/', 'dist/esm/']) {
+        const built = require.resolve(${JSON.stringify(manifest.name)} + '/' + prefix + entry);
+        if (fs.realpathSync(source) !== fs.realpathSync(built)) throw Error(entry + ' resolves to multiple modules');
+      }
+    }
+  `);
+  try {
+    execFileSync(process.execPath, ['--conditions=react-native', nativeProbe], { encoding: 'utf8' });
+  } catch (error) {
+    fail(`React Native deep-import resolution: ${error.stderr ?? error.message}`);
+  }
   checkEsmResolution(consumer, pkgDir, manifest);
 };
 
 /**
- * The `import` condition, resolved AND loaded the way a bundler's Node does.
- *
- * It has to be a child process: `createRequire().resolve` above can only ever
- * take the `require` condition, and this package's ESM output is exactly the
- * kind that resolves and then fails to load — dist/esm/package.json's
- * `"type": "module"` is what stops Node parsing those files as CommonJS, and
- * every relative specifier in them needs the `.js` that tsc does not write
- * (scripts/finish-esm-build.mjs adds both). A missing one is an
- * ERR_MODULE_NOT_FOUND in a consumer's app and nothing at all here, unless
- * something actually imports the module.
- *
- * The root barrel is resolved but NOT imported, for the same reason it is
- * absent from NODE_SAFE_ENTRIES: it re-exports the React Native view layer.
+ * A child process, since `createRequire` only takes `require`. The root barrel
+ * is resolved but not imported: it loads the React Native view layer.
  */
 const checkEsmResolution = (consumer, pkgDir, manifest) => {
   if (!manifest.exports) return;
 
-  // The `"type": "module"` marker is asserted on the FILE rather than inferred
-  // from the probe below, because the probe cannot see it on a new enough
-  // runtime: Node detects ES module syntax in an untyped .js from 22.7 on, so
-  // this same import succeeds there and fails with `Cannot use import statement
-  // outside a module` on Node 20 — the version both workflows pin and the floor
-  // most consumers are on. A check that passes or fails with the checker's Node
-  // is not a check.
+  // Asserted on the file: Node 22.7+ detects module syntax, so the probe passes there regardless.
   const esmDir = path.dirname(path.join(pkgDir, manifest.module ?? 'dist/esm/index.js'));
   const marker = path.join(esmDir, 'package.json');
   if (!fs.existsSync(marker)) {
@@ -653,10 +581,6 @@ const checkEsmResolution = (consumer, pkgDir, manifest) => {
           'not "module" — the ES module build would be parsed as CommonJS.',
       );
     }
-    // Bundlers read `sideEffects` from the package.json nearest the module, so
-    // the root's declaration does not reach dist/esm. Without it here, the ESM
-    // build resolves and loads and still cannot be tree-shaken, which is the
-    // only reason it exists.
     if (declared.sideEffects !== false) {
       fail(
         `exports: ${path.relative(pkgDir, marker)} does not declare "sideEffects": false. ` +
@@ -668,14 +592,9 @@ const checkEsmResolution = (consumer, pkgDir, manifest) => {
 
   const probe = path.join(consumer, 'esm-probe.mjs');
   const specifiers = {
-    // `<name>/node` is deliberately absent: everything resolved here must land
-    // in the ES module BUILD, and the addon loader is a hand-written .mjs under
-    // native/ that is the same file under every condition. Its subpath is
-    // pinned to that file by SUBPATH_TARGETS in checkExportsResolution.
+    // `<name>/node` is absent: it is the same .mjs under every condition, pinned by SUBPATH_TARGETS.
     resolveOnly: [manifest.name, `${manifest.name}/dist`],
     load: [
-      // The bare subpaths under the `import` condition — the spelling a
-      // bundler resolves to dist/esm/engine.js and dist/esm/stream.js.
       [`${manifest.name}/engine`, 'parseDocument'],
       [`${manifest.name}/stream`, 'StreamSession'],
       ...[...NODE_SAFE_ENTRIES, ...PEER_DEPENDENT_ENTRIES].flatMap(([relative, exported]) => [
@@ -723,8 +642,6 @@ const checkEsmResolution = (consumer, pkgDir, manifest) => {
   }
 
   for (const entry of reported) {
-    // Every one of these must land in the ES module tree; the point of the
-    // condition is that it does not serve the CommonJS build twice.
     if (!entry.resolved.includes('/dist/esm/')) {
       fail(
         `exports: "${entry.specifier}" resolves to ${entry.resolved} under the "import" ` +
@@ -741,17 +658,7 @@ const checkEsmResolution = (consumer, pkgDir, manifest) => {
   }
 };
 
-/**
- * Compiled objects are not source, and `files` is not `.gitignore`.
- *
- * A root `.gitignore` does NOT filter what npm packs out of a directory named
- * in `files`: with `platform` allowlisted, an `md4c.o` left behind by the
- * vendor sync smoke test in platform/cpp/vendor/md4c/UPSTREAM.md ships to the
- * registry — an object built for one maintainer's machine, in a package whose
- * whole native contract is "the consumer compiles these sources". The
- * `files` negations exist to stop that; this is what proves they still work,
- * since the tarball is the only place the two rulesets meet.
- */
+/** `.gitignore` does not filter inside a `files` directory; only the `files` negations keep objects out. */
 const BUILD_ARTIFACT_EXTENSIONS = new Set(['.o', '.a', '.so', '.dylib', '.obj', '.lib', '.node']);
 
 const checkNoBuildArtifacts = (pkgDir) => {
@@ -802,9 +709,7 @@ try {
       try {
         loaded = require(path.join(pkgDir, relative));
       } catch (error) {
-        // A deep path that throws on require is the failure this exists to
-        // catch: it means the build emitted something Node cannot load, or
-        // that the module grew a React Native import it must not have.
+        // A throw means a bad emit, or a React Native import in a Node-safe module.
         fail(`entry: ${relative} threw on require (${error.message})`);
         continue;
       }
@@ -813,9 +718,7 @@ try {
       }
     }
   };
-  // Order matters: the Node-safe entries load before any peer exists, which
-  // is what proves they need none; only then is `react` linked in for the
-  // entries that legitimately import it.
+  // Node-safe entries load before `react` is linked, which proves they need no peer.
   loadEntries(NODE_SAFE_ENTRIES);
   linkPeers(pkgDir);
   loadEntries(PEER_DEPENDENT_ENTRIES);

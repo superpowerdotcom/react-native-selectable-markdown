@@ -110,11 +110,6 @@ describe('visit', () => {
   });
 
   it("returning 'stop' ends the traversal, siblings included", () => {
-    // The distinction from `false`, asserted on the same node: `false`
-    // prunes the heading's subtree and the paragraph after it is still
-    // visited; `'stop'` ends the walk there. Without the second signal a
-    // search has to be hand-rolled off `childrenOf` just to short-circuit,
-    // which is what `runs.ts` did before this existed.
     const stopped: string[] = [];
     visit(doc, (n) => {
       stopped.push(n.kind);
@@ -192,16 +187,14 @@ describe('findAt', () => {
     expect(findAt(doc, 4)).toEqual([]);
     expect(findAt(doc, 5)).toEqual([]);
     expect(findAt(doc, 11)).toEqual([]);
+    expect(findAt(doc, 3).map((n) => n.kind)).toEqual(['heading', 'text']);
+    expect(findAt(doc, 10).map((n) => n.kind)).toEqual(['paragraph', 'text']);
   });
 });
 
 /**
- * NESTING DEPTH IS UNTRUSTED INPUT: three kilobytes of `'> '` is 1500 levels
- * of blockquote, the native decoder builds its tree off an explicit stack and
- * so returns a tree that deep, and `visit` is the generic walk every other
- * layer reaches for (streaming, the spoiler sweep, the conformance oracles).
- * A recursive walk over such a tree overflows the JS stack; this one runs off
- * a stack of its own.
+ * Nesting depth is untrusted input: 3 kB of `'> '` is 1500 levels of
+ * blockquote.
  */
 describe('visit at depth', () => {
   const DEPTH = 20_000;
@@ -229,7 +222,6 @@ describe('visit at depth', () => {
     expect(kinds).toHaveLength(DEPTH + 2);
     expect(kinds[0]).toBe('paragraph');
     expect(kinds[kinds.length - 1]).toBe('text');
-    // Every node but the root the walk started from has a parent.
     expect(parented).toBe(DEPTH + 1);
   });
 

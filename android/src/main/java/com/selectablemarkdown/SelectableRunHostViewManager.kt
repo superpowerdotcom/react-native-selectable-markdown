@@ -16,17 +16,13 @@ import com.facebook.yoga.YogaMeasureMode
 import com.facebook.yoga.YogaMeasureOutput
 
 /**
- * Manager for the `SelectableRunHost` component.
- *
  * The name must match the string in `codegenNativeComponent('SelectableRunHost')`
  * (src/view/SelectableRunHostNativeComponent.ts): it is what
  * `FabricUIManager.measure` and the mounting layer route on, and what the C++
  * component name resolves to.
  *
- * FABRIC ONLY, AND THERE IS NO ARCHITECTURE GATE LEFT ANYWHERE IN THIS
- * MODULE. The package's peer range starts at react-native 0.82, where the old
- * architecture cannot be installed, so the Kotlin measuring shadow node this
- * manager used to build and type is gone. The shadow node for
+ * FABRIC ONLY: the peer range starts at react-native 0.82, so there is no
+ * Kotlin measuring shadow node. The shadow node for
  * `SelectableRunHost` is C++ — `RNSMRunHostShadowNode` in platform/fabric,
  * registered through the component descriptor the app's generated
  * autolinking.cpp instantiates. Measurement arrives through `measure` below,
@@ -57,11 +53,7 @@ class SelectableRunHostViewManager :
      *
      * With a delegate present, `ViewManager.updateProperties` routes each prop
      * through `delegate.setProperty` instead of reflecting over @ReactProp
-     * (ViewManager.java:82-89). That is the same set of props reflection would
-     * have found — the generated switch calls the interface methods this class
-     * implements, and its default branch hands the base view props to
-     * BaseViewManagerDelegate — so nothing is lost by taking the generated
-     * path, and taking it is what makes the spec a compile-time contract.
+     * (ViewManager.java:82-89), which reaches the same props reflection would.
      */
     private val delegate: ViewManagerDelegate<SelectableRunHostView> =
         SelectableRunHostManagerDelegate<SelectableRunHostView, SelectableRunHostViewManager>(this)
@@ -71,14 +63,7 @@ class SelectableRunHostViewManager :
     override fun getName(): String = COMPONENT_NAME
 
     override fun createViewInstance(reactContext: ThemedReactContext): SelectableRunHostView {
-        // Two process-wide singletons this component owns are armed from the
-        // Contexts it is handed, both idempotent and both registered on the
-        // APPLICATION context so they survive ReactInstance teardown the way
-        // the singletons themselves do: the layout cache's trim-memory
-        // reclamation, and the font resolver's asset table. `measure` arms the
-        // font resolver too, because under Fabric it runs before anything
-        // mounts — and a measurement taken before families resolve would be
-        // cached under a key that cannot tell the difference.
+        // Idempotent, and kept on the application context so both outlive ReactInstance teardown.
         RunLayoutCache.installTrimHook(reactContext)
         RunTypefaces.install(reactContext)
         return SelectableRunHostView(reactContext as ReactContext)
@@ -139,41 +124,19 @@ class SelectableRunHostViewManager :
         view.setSelectable(selectable)
     }
 
-    /**
-     * Whether this host takes part in the process-wide one-active-selection
-     * coordination. `defaultBoolean = true` matches the spec's
-     * `WithDefault<boolean, true>` and the view's own field, so a prop reset
-     * restores coordinating — the safe direction, since the failure of the
-     * other one is two live highlights with only the newest carrying handles.
-     */
+    /** `defaultBoolean` must match the spec's `WithDefault<boolean, true>` and the view's own field. */
     @ReactProp(name = "exclusiveSelection", defaultBoolean = true)
     override fun setExclusiveSelection(view: SelectableRunHostView, exclusive: Boolean) {
         view.setExclusiveSelection(exclusive)
     }
 
-    /**
-     * The imperative half of the contract: the two codegen commands.
-     *
-     * THERE IS NO `receiveCommand` OVERRIDE HERE, AND THERE MUST NOT BE ONE.
-     * `ViewManager.receiveCommand(root, commandId, args)` already asks
-     * `getDelegate()` and forwards to it (ViewManager.java:296-301), and this
-     * manager returns the codegen'd `SelectableRunHostManagerDelegate` from
-     * `getDelegate` — whose own `receiveCommand` switch maps `"clearSelection"`
-     * and `"setSelection"` to the two methods below. An override that
-     * re-implemented that routing by hand would be a second copy of the wire
-     * format, which is the mistake the delegate exists to prevent;
-     * scripts/check-codegen.mjs pins the generated dispatcher so the route
-     * cannot vanish unnoticed.
-     */
+    /** No `receiveCommand` override: `ViewManager` already forwards commands to the codegen delegate. */
     override fun clearSelection(view: SelectableRunHostView) {
         view.clearSelection()
     }
 
     override fun setSelection(view: SelectableRunHostView, start: Int, end: Int) {
-        // Straight through: clamping belongs in the view, which is the only
-        // place that knows what the text currently is. JS computed these
-        // offsets against a snapshot that can be a frame behind, exactly like
-        // the offsets travelling the other way on an event.
+        // Clamped in the view, the only place that knows the current text.
         view.setSelection(start, end)
     }
 
@@ -195,19 +158,11 @@ class SelectableRunHostViewManager :
         view.setEmbeds(RunEmbeds.parse(embeds))
     }
 
-    /**
-     * The ordered menu, one string per item: an action identifier, or
-     * `identifier + U+001F + title` (src/view/selectionActions.ts packs it,
-     * and the view unpacks it). The strings are copied out of the
-     * ReadableArray unexamined — splitting them here would put the wire
-     * format in two places, and the view has to know it anyway to resolve a
-     * title against its own string resources.
-     */
+    /** Copied unexamined: the view unpacks `identifier + U+001F + title` (src/view/selectionActions.ts). */
     @ReactProp(name = "selectionActions")
     override fun setSelectionActions(view: SelectableRunHostView, actions: ReadableArray?) {
         if (actions == null) {
-            // Prop reset: fall back to the default menu (both built-in
-            // actions, each taking the view's own localised title).
+            // Prop reset: fall back to the default menu (both actions).
             view.setSelectionActions(
                 listOf(
                     SelectableRunHostView.ACTION_COPY_TEXT,
@@ -258,9 +213,6 @@ class SelectableRunHostViewManager :
      * Native's own text measurement ends with the same
      * `PixelUtil.toDIPFromPixel` pair (TextLayoutManager.java:692-711).
      * Skipping it would report every run three times too tall on a 3x device.
-     * `RunTextMeasure` itself stays in pixels and leaves the conversion here,
-     * because it is also what configures the `TextView`'s paint and the view
-     * side wants pixels.
      */
     override fun measure(
         context: Context,
@@ -273,10 +225,7 @@ class SelectableRunHostViewManager :
         heightMode: YogaMeasureMode,
         attachmentsPositions: FloatArray?
     ): Long {
-        // The earliest Context this component ever holds: Fabric measures
-        // before it mounts, so this — not createViewInstance — is what keeps
-        // a bundled `fontFamily` from being measured in the system fallback
-        // face. Idempotent and one volatile read after the first call.
+        // Fabric measures before mounting, so without this a bundled `fontFamily` measures in the system face.
         RunTypefaces.install(context)
         val text = if (props != null && props.hasKey("text")) props.getString("text") ?: "" else ""
         val attributes = if (props != null && props.hasKey("attributes")) {

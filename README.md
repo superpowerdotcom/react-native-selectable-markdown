@@ -242,7 +242,7 @@ A block-level embed may be any height; an inline one shares a line with prose, s
 
 `EmbedSpec.render` carries the same identity rule as a renderer: it is the overlay's component type, so switching `render` for a span remounts the card — the point — while an arrow rebuilt on every claim remounts it on every reprojection. Give it a stable identity, reading what it needs off the `node` it is handed, when the card holds state.
 
-`images` decides how pictures ride along. The default `'embed'` claims each image, reserves `spacing.imageWidth` × `spacing.imageHeight` (280 × 200 points) and overlays `renderers.image` on it, so an illustrated paragraph keeps the sweep; `'standalone'` sends the containing block to the renderer path instead, which is what you want for full-bleed or intrinsically sized pictures, or when a streamed image must draw before its run settles.
+`images` decides how pictures ride along. The default `'embed'` claims a sole image in a top-level paragraph, reserves `spacing.imageWidth` × `spacing.imageHeight` (280 × 200 points) and overlays `renderers.image` on it, so an isolated picture keeps the sweep. Inline and container images keep normal layout; `'standalone'` sends the containing block to the renderer path instead, which is what you want for full-bleed or intrinsically sized pictures, or when a streamed image must draw before its run settles.
 
 `classifyBlock` marks a block `'standalone'` so it gets its own selection scope and renderer. Use it for blocks that own a competing gesture and should end the sweep rather than flow through it. A block holding a spoiler, or an image no claim covered, is standalone already. Give it a stable identity; the document is resegmented when it changes.
 
@@ -281,7 +281,7 @@ selection offsets ──► mapSelectionToSource ──► exact source span ─
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/PERFORMANCE.md](docs/PERFORMANCE.md): measurements, cost model, roadmap.
 - [docs/FABRIC-PLAN.md](docs/FABRIC-PLAN.md): design retrospective of the new-architecture port.
 
-## Status (0.11.x)
+## Status (Unreleased)
 
 | Area | Where it stands |
 | --- | --- |
@@ -290,7 +290,7 @@ selection offsets ──► mapSelectionToSource ──► exact source span ─
 | Selection and copy | Exact source ranges, property-tested. Code blocks, tables and rules flow through runs; a block holding a spoiler, or an image no claim covered, is standalone — the whole block, not just the construct. Selections never span hosts: a document's runs clear another's unless `exclusiveSelection={false}` opts them out in both directions — which keeps every range reported and exact for copy, but only the run holding focus draws a highlight. |
 | Copy menu | Copy Text and Copy Markdown, retitleable from JS and extensible with your own ids. With no title from JS the labels come from platform resources (`NSLocalizedString`, `res/values/strings.xml`), which the host app can override. Custom items need iOS 16+; iOS 13.4 to 15 gets the system menu only. |
 | Imperative selection | `onSelectionChange`, and a ref with `getSelection()`, `clearSelection()` and `setSelection(span)`. Codegen commands on both hosts; reviewed rather than exercised on device, like the host itself. No scroll-to-span. |
-| Selection host | Fabric only (`react-native >= 0.82`). CI compiles the C++ and runs codegen against the pinned RN 0.75.4 in `devDependencies` — below the peer floor, since that bump has not landed — and the Swift against the iOS SDK. There is no example app yet, so on-device behaviour is reviewed rather than exercised. |
+| Selection host | Fabric only (`react-native >= 0.82`). CI compiles C++ and runs codegen against React Native 0.82.1, the supported minimum release line, and checks Swift against the iOS SDK. There is no example app yet, so on-device behaviour is reviewed rather than exercised. |
 | Accessibility | Links, headings, list items and table cells survive run merging: each is a VoiceOver/TalkBack focus stop, a link activates through the same press path a tap takes, a heading carries the platform heading trait, and on Android an item or cell carries its position (`CollectionItemInfoCompat`), which iOS has no trait for. Code-block and blockquote structure is still flattened by merging — neither platform has a primitive for it. `accessible` or `accessibilityRole` on the container collapses the document to one element, so label it but do not make it a leaf. Standalone blocks keep the roles `renderers.tsx` sets. Reviewed, not exercised: no screen reader has run against it here. |
 | Embeds | The `embed` prop: a claimed node flows through its run as one placeholder, the host reserves its declared size and reports the rect (`onEmbedLayout`), JS overlays the element. Images are claimed this way by default. Removed in 0.10.0, restored in 0.11.0 ([CHANGELOG.md](CHANGELOG.md) is the record; the 0.10.0 release notes are one squashed commit). Reviewed on-device like the host itself. |
 | Package surface | The entry names every export instead of re-exporting modules wholesale, so internals (the flat-buffer decoder, the host-binding lookup, the agui session map) moved to deep paths under `dist/`, which the `exports` map declares and `verify:pack` resolves; the `classifyBlock` function is `classifyTopLevelBlock`, with the old name kept as a deprecated alias. `withOptions(preset, overrides)` composes options without flattening a preset. |
@@ -301,6 +301,20 @@ selection offsets ──► mapSelectionToSource ──► exact source span ─
 ## Benchmarks
 
 Measured on an Apple M2 Max with an arm64 Node 22, from the harnesses in `bench/`: the cross-parser comparison is the 2026-09-01 run, everything else a 2026-09-02 re-run. Markdown-to-HTML over a 289 kB spec-derived corpus, one fresh process per library, all in the same run: this package 15.8 MB/s, commonmark.js 10.0, marked 9.4, markdown-it 6.2. The number for this package includes building the span-carrying AST and serializing it to HTML. `engine.parse` on a 64 B tail cost 3.0 µs in the re-run — a parse alone, without the tail repair, span splice and snapshot an append also pays. What an append actually parses depends on whether the stream anchors. On the bundled sprint-review transcript it does: a blank line closes a paragraph and everything above it freezes, so appends parse a mean of 105 and at most 277 of the 1,162 final characters. A stream that never anchors gets none of that. `StreamSession.isAnchorSafe` is false for a list and for unclosed or indented code, and a blank line does not end a list, so `conformance/fixtures/transcript-giant-list.json` — 21.9 kB in 2,484 deltas, the commonest long LLM answer shape — parses a mean of 10,854 and a max of 21,881 of 21,927 characters, every append reaching the engine, and its incremental-vs-full ratio comes out above 1: tail-only parsing costs more there than reparsing the whole document per token. `npm run bench:streaming` replays both. These are V8 numbers; on Hermes the JS decode (38 to 51% of a parse) will be slower. Methodology and full tables in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+### Jest in React Native applications
+
+The React Native Jest preset resolves this package to TypeScript source. Include it in your existing transform allowlist so Babel transforms files in `node_modules`:
+
+```js
+transformIgnorePatterns: [
+  'node_modules/(?!((jest-)?react-native|@react-native(-community)?|react-native-selectable-markdown)/)',
+],
+```
+
+Add the package name to your existing expression, preserving other allowed packages; do not append a second ignore pattern. Headless `engine` and `stream` imports also use source under the React Native condition; plain Node resolves their compiled entries. Native parser tests additionally need the Node addon described in `native/node/README.md`.
+
+Create `withOptions(...)` results outside render or memoize them. It deliberately returns a fresh, independently mutable object, and passing a new options object reparses a static document.
 
 ## Contributing
 
@@ -319,12 +333,12 @@ Without a compiler the native suites report as skipped, not passed. CI, the rele
 
 Publishing is tag-triggered. The tarball `npm run release` writes locally is a dry run, never the published artifact.
 
-1. `npm run release <patch|minor|major|x.y.z>` — typecheck, native addon build and `npm test` (before the bump, so a red suite leaves the tree alone), the version bump in `package.json` and `package-lock.json`, the release guard, `verify:pack`, `npm pack`. Nothing is committed, tagged or published. The guard (`scripts/check-unreleased-breaking.mjs`) runs after the bump, so it judges the bump: it fails when [CHANGELOG.md](CHANGELOG.md)'s Unreleased section names a BREAKING change and the version has not moved past the latest `v*` tag, and a failure rolls the bump back.
-2. Add the version's section to [CHANGELOG.md](CHANGELOG.md) (`## [X.Y.Z] — <date>`), moving the Unreleased entries under it. `.github/workflows/release.yml` quotes the section as the GitHub release notes and refuses to publish a version that has none. Moving the entries is required, not tidying: the preflight job runs the same release guard with the tag being pushed, so a BREAKING line left under Unreleased fails the tag in seconds — notes are read from the section for the tag, so the break would otherwise ship inside a version whose notes never mention it.
+1. Move the Unreleased entries into the target version's section in [CHANGELOG.md](CHANGELOG.md), `## [X.Y.Z] — <date>`.
+2. Run `npm run release <patch|minor|major|x.y.z>`. It checks types and tests, bumps the manifest and lockfile, verifies the proposed tag against the changelog, verifies the package, and packs a local dry run. Unreleased BREAKING entries fail both this guard and CI; a failure rolls the version bump back. Nothing is committed, tagged or published.
 3. `git add package.json package-lock.json CHANGELOG.md && git commit -m "release X.Y.Z"`.
 4. `git push origin main && git tag vX.Y.Z && git push origin vX.Y.Z`.
 
-The tag runs `release.yml`: the macOS gates (Swift, the iOS header set), then everything CI runs, then its own `npm pack`, the GitHub release with the tarball attached, and `npm publish --provenance --access public`. A hand `npm publish <tarball>` from a laptop is not the supported path — it ships without provenance, which only that workflow can mint, and without the release gates. `scripts/release.mjs` prints steps 2 to 4 with the version filled in.
+The tag runs `release.yml`: the macOS gates (Swift, the iOS header set), then everything CI runs, then its own `npm pack`, `npm publish <that-tarball> --provenance --access public`, and the GitHub release with that same tarball attached. A hand `npm publish <tarball>` from a laptop is not the supported path — it ships without provenance, which only that workflow can mint, and without the release gates. `scripts/release.mjs` prints steps 2 to 4 with the version filled in.
 
 ## Prior art
 

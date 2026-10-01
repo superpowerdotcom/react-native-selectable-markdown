@@ -96,10 +96,24 @@ describe('parseDocument', () => {
     const spy = spyEngine();
     parseDocument('x', { smartPunctuation: true }, spy);
 
-    const { options } = spy.calls[0];
-    expect(options.smartPunctuation).toBe(true);
-    expect(options.urlPolicy).toBeDefined();
-    expect(options.extensions).toBeDefined();
+    expect(spy.calls[0].options).toEqual({
+      extensions: {
+        tables: false,
+        strikethrough: false,
+        tasklists: false,
+        autolinks: false,
+        math: false,
+        spoilers: false,
+        underline: false,
+      },
+      html: 'strip',
+      smartPunctuation: true,
+      urlPolicy: {
+        linkPrefixes: ['https://', 'http://', 'mailto:'],
+        imagePrefixes: ['https://'],
+        blockedLinks: 'text',
+      },
+    });
   });
 
   test('applies the spoiler transform on top of a custom engine', () => {
@@ -111,8 +125,21 @@ describe('parseDocument', () => {
       { extensions: { spoilers: true } },
       literalEngine(),
     );
-    const kinds = JSON.stringify(withSpoilers);
-    expect(kinds).toContain('spoiler');
+    expect(withSpoilers.blocks).toEqual([
+      {
+        kind: 'paragraph',
+        span: { start: 0, end: 14 },
+        children: [
+          { kind: 'text', value: 'a ', span: { start: 0, end: 2 } },
+          {
+            kind: 'spoiler',
+            span: { start: 2, end: 12 },
+            children: [{ kind: 'text', value: 'secret', span: { start: 4, end: 10 } }],
+          },
+          { kind: 'text', value: ' b', span: { start: 12, end: 14 } },
+        ],
+      },
+    ]);
   });
 
   test('an engine that returns a document is not second-guessed', () => {
@@ -122,8 +149,16 @@ describe('parseDocument', () => {
     // correctness is proven.
     const spy = spyEngine();
     const doc = parseDocument('anything at all', undefined, spy);
-    expect(doc.source).toBe('anything at all');
-    expect(doc.blocks).toHaveLength(1);
+    expect(doc).toEqual({
+      source: 'anything at all',
+      blocks: [
+        {
+          kind: 'paragraph',
+          span: { start: 0, end: 15 },
+          children: [{ kind: 'text', value: 'SPY', span: { start: 0, end: 15 } }],
+        },
+      ],
+    });
   });
 });
 

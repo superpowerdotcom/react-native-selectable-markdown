@@ -55,6 +55,10 @@ describeNative('resolveRunDecorations', () => {
   test('a plain paragraph decorates nothing', () => {
     const { decorations } = decorate('Just prose.\n');
     expect(decorations).toEqual([]);
+    // A block with chrome beside it decorates that block only.
+    expect(
+      decorate('Just prose.\n\n---\n\nMore.\n').decorations.map((d) => d.kind),
+    ).toEqual(['rule']);
   });
 
   test('a code block gets a filled, inset box over exactly its literal', () => {
@@ -299,6 +303,13 @@ describeNative('resolveRunDecorations', () => {
     const code = decorations.find((d) => d.kind === 'box');
     if (!code) throw new Error('no code box');
     expect(code.inset).toBeUndefined();
+    // The same island inside a quote does carry one.
+    const quoted = decorate('> ```\n> code\n> ```\n').decorations.find(
+      (d) => d.kind === 'box' && d.color === defaultTheme.colors.codeBackground,
+    );
+    expect(quoted?.inset).toBe(
+      defaultTheme.quote.barWidth + defaultTheme.quote.indent,
+    );
   });
 
   test('a table inside a blockquote insets its border, band and row rules alike', () => {
@@ -335,32 +346,8 @@ describeNative('resolveRunDecorations', () => {
     expect(rule.inset).toBe(defaultTheme.rule.inset + quoteStep);
   });
 
-  /*
-   * A box at the very edge of a run has NO block separator to paint into.
-   *
-   * Box padding is drawn into the blank line the '\n\n' separators leave
-   * around a block (see `RunDecoration.paddingTop`), and both hosts clamp a
-   * band to their own bounds — `min(bounds.height, band.bottom + padding)` on
-   * iOS, `coerceAtMost(height)` on Android. A run used to be measured as
-   * exactly as tall as its lines, so a box that ENDS the run had
-   * `band.bottom == bounds.height` already and its bottom padding clamped to
-   * nothing: the border of a trailing table stroked across the bottom of its
-   * last row instead of below it, which is the ordinary shape of an answer
-   * that ends with a table, and a box that OPENS one lost its top border the
-   * same way.
-   *
-   * BOTH HOSTS NOW RESERVE THAT ROOM, and these two cases are the JS half of
-   * the contract they reserve it from: the padding IS declared at both edges,
-   * with `start === 0` and `end === text.length` as the marker. iOS derives
-   * it in the one string builder and carries it on the string the measurer
-   * and the view share (`RNSMAttributedText.runEdgeInsets(of:)`); Android
-   * derives it in `RunDecorations.edgePaddingDp`, which `RunTextMeasure`
-   * adds to the measured height and `SelectableRunHostView` sets as the
-   * child TextView's padding. Zero the padding here and both hosts stop
-   * reserving anything — which is why these cases exist: they fail the day
-   * someone "fixes" the artifact from this end, trading a squashed border
-   * for a missing one.
-   */
+  // Both hosts reserve edge padding from these declarations (`RNSMAttributedText.runEdgeInsets(of:)`,
+  // `RunDecorations.edgePaddingDp`); zero it here and the edge border loses its room.
   describe('a box at the edge of a run', () => {
     test('a trailing table still declares its bottom padding', () => {
       const { projected, decorations } = decorate(
@@ -397,6 +384,16 @@ describeNative('resolveRunDecorations', () => {
       expect(decoration.end).toBeGreaterThanOrEqual(decoration.start);
       expect(decoration.end).toBeLessThanOrEqual(projected.text.length);
     }
+    expect(
+      decorations.map((d) => [d.kind, projected.text.slice(d.start, d.end)]),
+    ).toEqual([
+      ['box', 'x = 1\n'],
+      ['box', 'h\ti\nj\tk'],
+      ['columns', 'h\ti\nj\tk'],
+      ['rule', ''],
+      ['box', 'h\ti'],
+      ['rule', ''],
+    ]);
   });
 });
 

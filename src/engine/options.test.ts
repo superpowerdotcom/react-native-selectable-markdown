@@ -1,11 +1,8 @@
+import type { Block, Inline } from '../document/nodes';
+import { parseDocument } from './Engine';
+import { describeNative, requireNativeEngine } from './native/__tests__/support';
 import type { EngineOptions } from './options';
-import {
-  DEFAULT_IMAGE_PREFIXES,
-  DEFAULT_LINK_PREFIXES,
-  presets,
-  resolveOptions,
-  withOptions,
-} from './options';
+import { presets, resolveOptions, withOptions } from './options';
 
 describe('resolveOptions', () => {
   it('defaults every extension off, html strip, plain punctuation', () => {
@@ -21,12 +18,8 @@ describe('resolveOptions', () => {
     });
     expect(r.html).toBe('strip');
     expect(r.smartPunctuation).toBe(false);
-    expect(r.urlPolicy.linkPrefixes).toEqual([
-      ...DEFAULT_LINK_PREFIXES,
-    ]);
-    expect(r.urlPolicy.imagePrefixes).toEqual([
-      ...DEFAULT_IMAGE_PREFIXES,
-    ]);
+    expect(r.urlPolicy.linkPrefixes).toEqual(['https://', 'http://', 'mailto:']);
+    expect(r.urlPolicy.imagePrefixes).toEqual(['https://']);
     expect(r.urlPolicy.blockedLinks).toBe('text');
   });
 
@@ -53,9 +46,7 @@ describe('resolveOptions', () => {
       urlPolicy: { linkPrefixes: ['https://'] },
     });
     expect(r.urlPolicy.linkPrefixes).toEqual(['https://']);
-    expect(r.urlPolicy.imagePrefixes).toEqual([
-      ...DEFAULT_IMAGE_PREFIXES,
-    ]);
+    expect(r.urlPolicy.imagePrefixes).toEqual(['https://']);
   });
 });
 
@@ -64,23 +55,6 @@ describe('presets', () => {
     expect(resolveOptions(presets.commonmark).extensions.spoilers).toBe(false);
     expect(resolveOptions(presets.llmChat).extensions.spoilers).toBe(false);
     expect(resolveOptions(presets.everything).extensions.spoilers).toBe(true);
-  });
-
-  it('commonmark keeps every extension off', () => {
-    const r = resolveOptions(presets.commonmark);
-    expect(Object.values(r.extensions).every((v) => v === false)).toBe(true);
-  });
-
-  it('llmChat enables the GFM set but not math/spoilers/underline', () => {
-    const r = resolveOptions(presets.llmChat);
-    expect(r.extensions.tables).toBe(true);
-    expect(r.extensions.strikethrough).toBe(true);
-    expect(r.extensions.tasklists).toBe(true);
-    expect(r.extensions.autolinks).toBe(true);
-    expect(r.extensions.math).toBe(false);
-    expect(r.extensions.spoilers).toBe(false);
-    expect(r.extensions.underline).toBe(false);
-    expect(r.html).toBe('strip');
   });
 
   it('everything enables all extensions', () => {
@@ -95,15 +69,38 @@ describe('presets', () => {
   });
 });
 
+describeNative('what the commonmark and llmChat presets parse', () => {
+  // `$m$` stays literal (math off) and `_u_` is emphasis (underline off).
+  const source = '- [x] ~~s~~ $m$ _u_ www.e.com\n\n| a |\n| - |\n';
+  const shape = (options: EngineOptions): unknown => {
+    const [list, second] = parseDocument(source, options, requireNativeEngine()).blocks;
+    const item = (list as { items: Block[] }).items[0] as { task?: string; children: Block[] };
+    const inlines = (item.children[0] as { children: Inline[] }).children;
+    return {
+      task: item.task,
+      inlines: inlines.map((n) => ('value' in n ? `${n.kind}:${n.value}` : n.kind)),
+      second: second.kind,
+    };
+  };
+
+  it('llmChat turns on tables, strikethrough, tasklists and autolinks only', () => {
+    expect(shape(presets.llmChat)).toEqual({
+      task: 'checked',
+      inlines: ['strikethrough', 'text: $m$ ', 'emphasis', 'text: ', 'autolink'],
+      second: 'table',
+    });
+  });
+
+  it('commonmark leaves every one of them literal', () => {
+    expect(shape(presets.commonmark)).toEqual({
+      task: undefined,
+      inlines: ['text:[x] ~~s~~ $m$ ', 'emphasis', 'text: www.e.com'],
+      second: 'paragraph',
+    });
+  });
+});
+
 describe('withOptions', () => {
-  /**
-   * The composition trap this helper exists for: `extensions` REPLACES, so a
-   * literal that names one field turns every other flag off, and a shallow
-   * preset spread cannot fix it because the spread copies the whole
-   * `extensions` object and then the override replaces it wholesale. Both
-   * shapes below resolve to seven false flags without the helper, which is
-   * why each case asserts the resolved flags rather than the literal.
-   */
   it('keeps a preset\'s extensions when the override touches something else', () => {
     const composed = withOptions(presets.llmChat, {
       urlPolicy: { blockedLinks: 'node' },
@@ -115,7 +112,6 @@ describe('withOptions', () => {
     expect(r.extensions.autolinks).toBe(true);
     expect(r.urlPolicy.blockedLinks).toBe('node');
     expect(r.html).toBe('strip');
-    // The shape the README used to hand a reader, for contrast.
     const bare: EngineOptions = { urlPolicy: { blockedLinks: 'node' } };
     expect(Object.values(resolveOptions(bare).extensions).every((v) => v === false)).toBe(true);
   });
@@ -126,7 +122,6 @@ describe('withOptions', () => {
     expect(r.extensions.tables).toBe(true);
     expect(r.extensions.spoilers).toBe(true);
     expect(r.smartPunctuation).toBe(true);
-    // Spreading instead of composing is the bug: same intent, all off.
     const spread = resolveOptions({ ...presets.everything, extensions: { math: false } });
     expect(Object.values(spread.extensions).every((v) => v === false)).toBe(true);
   });
@@ -141,12 +136,12 @@ describe('withOptions', () => {
     );
     expect(r.urlPolicy.linkPrefixes).toEqual(['app://']);
     expect(r.urlPolicy.blockedLinks).toBe('node');
-    expect(r.urlPolicy.imagePrefixes).toEqual([...DEFAULT_IMAGE_PREFIXES]);
+    expect(r.urlPolicy.imagePrefixes).toEqual(['https://']);
   });
 
   it('replaces prefix arrays rather than concatenating them', () => {
-    // Deliberate: an allowlist that grew because two layers each added to it
-    // is a security bug that reads as a convenience.
+    // An allowlist that grew because two layers each added to it is a security
+    // bug.
     const r = resolveOptions(
       withOptions(
         { urlPolicy: { linkPrefixes: ['app://'] } },
@@ -157,8 +152,6 @@ describe('withOptions', () => {
   });
 
   it('an undefined value never overwrites', () => {
-    // Overrides are often built from optional props; a hole in one must not
-    // clear what the preset set.
     const r = resolveOptions(
       withOptions(presets.everything, {
         html: undefined,
@@ -173,15 +166,16 @@ describe('withOptions', () => {
 
   it('never mutates the preset it composed from', () => {
     const before = JSON.stringify(presets.llmChat);
-    withOptions(presets.llmChat, { extensions: { math: true }, html: 'raw' });
+    const r = resolveOptions(
+      withOptions(presets.llmChat, { extensions: { math: true }, html: 'raw' }),
+    );
     expect(JSON.stringify(presets.llmChat)).toBe(before);
+    expect(r.extensions.math).toBe(true);
+    expect(r.extensions.tables).toBe(true);
+    expect(r.html).toBe('raw');
   });
 
   it('with no overrides it returns a COPY, equivalent but not the preset', () => {
-    // It used to return `base` itself (a `reduce` over no elements returns
-    // its seed), so `withOptions(presets.llmChat)` handed back the shared
-    // preset object and a caller who wrote to what looked like their own
-    // options rewrote the preset for every other consumer in the process.
     const copy = withOptions(presets.llmChat);
     expect(copy).not.toBe(presets.llmChat);
     expect(resolveOptions(copy)).toEqual(resolveOptions(presets.llmChat));
@@ -192,7 +186,7 @@ describe('withOptions', () => {
 
   it('the copy is deep enough to be written to', () => {
     // A top-level spread alone would still share `extensions` and the prefix
-    // arrays with the preset, which is where a caller is most likely to poke.
+    // arrays.
     const before = JSON.stringify(presets.everything);
     const copy = withOptions(presets.everything);
     expect(copy.extensions).not.toBe(presets.everything.extensions);
@@ -200,5 +194,30 @@ describe('withOptions', () => {
     copy.urlPolicy?.linkPrefixes?.push('app://');
     expect(JSON.stringify(presets.everything)).toBe(before);
     expect(resolveOptions(presets.everything).extensions.math).toBe(true);
+  });
+  it('never shares override arrays or groups with the result', () => {
+    const override: EngineOptions = {
+      extensions: { math: true },
+      urlPolicy: { linkPrefixes: ['https://'], imagePrefixes: ['https://'] },
+    };
+    const before = JSON.stringify(override);
+    const a = withOptions(presets.llmChat, override);
+    const b = withOptions(presets.everything, override);
+    const c = withOptions(presets.llmChat, override, { html: 'raw' });
+
+    for (const r of [a, b, c]) {
+      expect(r.urlPolicy).not.toBe(override.urlPolicy);
+      expect(r.urlPolicy?.linkPrefixes).not.toBe(override.urlPolicy?.linkPrefixes);
+      expect(r.urlPolicy?.imagePrefixes).not.toBe(override.urlPolicy?.imagePrefixes);
+      expect(r.extensions).not.toBe(override.extensions);
+    }
+
+    a.urlPolicy?.linkPrefixes?.push('javascript:');
+    a.urlPolicy?.imagePrefixes?.push('data:');
+    (a.extensions as { spoilers: boolean }).spoilers = true;
+    expect(JSON.stringify(override)).toBe(before);
+    expect(resolveOptions(b).urlPolicy.linkPrefixes).toEqual(['https://']);
+    expect(resolveOptions(b).urlPolicy.imagePrefixes).toEqual(['https://']);
+    expect(resolveOptions(c).urlPolicy.linkPrefixes).toEqual(['https://']);
   });
 });

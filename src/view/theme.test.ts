@@ -1,15 +1,3 @@
-/**
- * `mergeTheme`: its deprecation aliases, and its DEV guard against tokens
- * that do not exist.
- *
- * Each alias exists for the same back-compat promise: a token that used to
- * style something keeps styling it after the schema grew a more specific home
- * for the value — an existing client theme touching only the old name must
- * still visibly affect rendering, while an explicit override of the new name
- * always wins. What an alias does NOT do is ship a default of its own; see
- * 'deprecated tokens are inputs only'.
- */
-
 /* `theme.ts` reaches for `Platform.select` to pick default font families;
  * stub the one API used rather than pulling a whole RN preset into a Node
  * test environment. */
@@ -26,9 +14,14 @@ import type { PartialTheme } from './theme';
 
 describe('mergeTheme aliases', () => {
   test('colors.quoteBar alone recolours the quote bar (pre-`quote`-group themes)', () => {
+    const warning = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const merged = mergeTheme({ colors: { quoteBar: '#e11d48' } });
     expect(merged.quote.barColor).toBe('#e11d48');
     expect(merged.colors.quoteBar).toBe('#e11d48');
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining('colors.quoteBar is deprecated'));
+    mergeTheme({ colors: { quoteBar: '#123456' } });
+    expect(warning).toHaveBeenCalledTimes(1);
+    warning.mockRestore();
   });
 
   test('an explicit quote.barColor wins over colors.quoteBar', () => {
@@ -67,21 +60,14 @@ describe('mergeTheme aliases', () => {
     // A dark base with no overrides keeps its own bar colour — the alias
     // must never re-link the two defaults after the fact.
     expect(mergeTheme(undefined, defaultDarkTheme).quote.barColor).toBe(
-      defaultDarkTheme.quote.barColor,
+      '#3d444d',
     );
-    expect(mergeTheme({}, defaultTheme).quote.barColor).toBe(
-      defaultTheme.quote.barColor,
-    );
+    expect(mergeTheme({}, defaultTheme).quote.barColor).toBe('#c9ced6');
   });
 });
 
 describe('the image box', () => {
   test('both dimensions ship a default, and both are overridable', () => {
-    // The two tokens are one box: `imageHeight` is the standalone `<Image>`'s
-    // height AND the height an image embed reserves, and `imageWidth` is the
-    // reserved width. A theme that resizes images has to be able to move the
-    // reservation with them, or the picture and the space the host measured
-    // for it stop agreeing.
     expect(defaultTheme.spacing.imageHeight).toBeGreaterThan(0);
     expect(defaultTheme.spacing.imageWidth).toBeGreaterThan(0);
 
@@ -94,13 +80,14 @@ describe('the image box', () => {
 
 describe('deprecated tokens are inputs only', () => {
   test('neither default theme ships colors.quoteBar', () => {
-    // The alias is an accepted INPUT and nothing else. A shipped default for
-    // it would be a readable colour on the theme that the rendered bar does
-    // not follow: override `quote.barColor` alone and this token would sit
-    // there still naming the old one, which is the trap its own doc comment
-    // promises to avoid.
-    expect(defaultTheme.colors.quoteBar).toBeUndefined();
-    expect(defaultDarkTheme.colors.quoteBar).toBeUndefined();
+    const warning = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(mergeTheme(undefined, defaultTheme).colors.quoteBar).toBeUndefined();
+    expect(mergeTheme(undefined, defaultDarkTheme).colors.quoteBar).toBeUndefined();
+    expect(
+      mergeTheme({ colors: { quoteBar: '#e11d48' } }, defaultDarkTheme).colors
+        .quoteBar,
+    ).toBe('#e11d48');
+    warning.mockRestore();
   });
 
   test('an explicit quote.barColor leaves colors.quoteBar unset', () => {
@@ -110,13 +97,6 @@ describe('deprecated tokens are inputs only', () => {
   });
 });
 
-/**
- * The DEV guard over override keys. `mergeGroup` copies every own key of an
- * override onto the merged theme, so a token that does not exist survives the
- * merge, is read by nothing, and changes no pixel — the failure mode is
- * silence. TypeScript rejects it as an excess property; an untyped JS theme
- * gets only this warning.
- */
 describe('unknown theme tokens warn in DEV', () => {
   let warn: jest.SpyInstance;
 
@@ -129,8 +109,7 @@ describe('unknown theme tokens warn in DEV', () => {
   });
 
   test('a token that does not exist warns, naming it and the group', () => {
-    // `fonts.family` is the one the README taught for two releases; the key
-    // that actually sets the body face is `fonts.body`.
+    // `fonts.family` is the key the README once taught; the body face is `fonts.body`.
     const merged = mergeTheme({
       fonts: { baseSize: 16, family: 'Inter' },
     } as unknown as PartialTheme);
@@ -138,19 +117,16 @@ describe('unknown theme tokens warn in DEV', () => {
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toContain('fonts.family');
     expect(warn.mock.calls[0][0]).toContain('body');
-    // The rest of the group still merges, and the body face is untouched —
-    // which is exactly why the warning has to exist.
     expect(merged.fonts.baseSize).toBe(16);
     expect(merged.fonts.body).toBe(defaultTheme.fonts.body);
   });
 
   test('the warning is once per token, not once per merge', () => {
-    // `mergeTheme` re-runs whenever the theme's identity changes, so an
-    // object literal passed inline would otherwise warn on every render.
     mergeTheme({ colors: { accent: '#f00' } } as unknown as PartialTheme);
     mergeTheme({ colors: { accent: '#0f0' } } as unknown as PartialTheme);
 
     expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('colors.accent');
   });
 
   test('a group that does not exist warns too', () => {
@@ -161,9 +137,7 @@ describe('unknown theme tokens warn in DEV', () => {
   });
 
   test('deprecated aliases and optional unset tokens do not warn', () => {
-    // Every one of these is declared: three deprecated inputs plus four
-    // tokens that no default theme ships. A check built from `defaultTheme`'s
-    // own keys would flag all seven.
+    // Declared but absent from `defaultTheme`, so a check built from its keys would flag them.
     mergeTheme({
       colors: {
         quoteBar: '#e11d48',
@@ -176,6 +150,19 @@ describe('unknown theme tokens warn in DEV', () => {
       headings: { lineHeight: 24 },
     });
 
-    expect(warn).not.toHaveBeenCalled();
+    // Filtered: `colors.quoteBar` also logs its own deprecation notice.
+    const unknownTokenWarnings = () =>
+      warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes('Unknown theme'));
+    expect(unknownTokenWarnings()).toEqual([]);
+
+    mergeTheme({
+      colors: { listMarker: '#0f0', listMarkr: '#0f0' },
+      fonts: { strongFamily: 'Inter-Medium' },
+    } as unknown as PartialTheme);
+
+    expect(unknownTokenWarnings()).toHaveLength(1);
+    expect(unknownTokenWarnings()[0]).toContain('"colors.listMarkr"');
   });
 });

@@ -86,10 +86,11 @@ public final class SelectableRunHostView: UIView {
   @objc public var onSelectionAction: ((Int, Int, NSString, NSString) -> Void)?
 
   /// Emitted when a single tap lands inside one of `pressables`, with the
-  /// range (clamped to the current text) and JS's identifier for it. A plain
+  /// range (clamped to the current text), JS's identifier for it and its
+  /// bounds as x, y, width, height in page space (see `pageRect`). A plain
   /// closure for the same reason `onSelectionAction` is: the mounting layer
   /// owns the wire format, so this class emits values.
-  @objc public var onInlinePress: ((Int, Int, Int) -> Void)?
+  @objc public var onInlinePress: ((Int, Int, Int, Double, Double, Double, Double) -> Void)?
 
   /// Emitted per embed once layout has placed its reserved space, with the
   /// embed's id and the rect in this view's coordinates — and re-emitted only
@@ -149,6 +150,24 @@ public final class SelectableRunHostView: UIView {
   private struct Pressable {
     let range: NSRange
     let id: Int
+    /// Nil announces the range's own text.
+    let label: String?
+    let isButton: Bool
+    /// False for role 'text': tappable, but read as part of the prose around it.
+    let announced: Bool
+    let pressedColor: UIColor?
+    let pressedRadius: CGFloat
+    let hitSlop: CGFloat
+  }
+
+  /// Whether any pressable paints pressed feedback; touches skip the hit test otherwise.
+  private var hasPressedFeedback = false
+
+  /// The pressable a touch went down on, while it is painted pressed.
+  private var pressedPressableId: Int? {
+    didSet {
+      if oldValue != pressedPressableId { setNeedsDisplay() }
+    }
   }
 
   /// Never overlapping (JS's `resolveRunPressables` guarantees it), so the
@@ -197,6 +216,36 @@ public final class SelectableRunHostView: UIView {
   final class RunTextView: UITextView {
     var accessibilityFocusRect: CGRect?
 
+    /// Pressed-state tracking. A recognizer that wins the touch (the inline
+    /// tap, a selection long-press) cancels it here, which is what clears it.
+    var onTouchDown: ((CGPoint) -> Void)?
+    var onTouchMove: ((CGPoint) -> Void)?
+    var onTouchUp: (() -> Void)?
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+      super.touchesBegan(touches, with: event)
+      if touches.count == 1, (event?.allTouches?.count ?? 1) == 1, let touch = touches.first {
+        onTouchDown?(touch.location(in: self))
+      } else {
+        onTouchUp?()
+      }
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+      super.touchesMoved(touches, with: event)
+      if let touch = touches.first { onTouchMove?(touch.location(in: self)) }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+      super.touchesEnded(touches, with: event)
+      onTouchUp?()
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+      super.touchesCancelled(touches, with: event)
+      onTouchUp?()
+    }
+
     override var accessibilityFrame: CGRect {
       get {
         guard let rect = accessibilityFocusRect, window != nil else {
@@ -209,13 +258,15 @@ public final class SelectableRunHostView: UIView {
   }
 
   /// One block-chrome instruction, parsed from the `decorations` prop. Only
-  /// the two DRAWN kinds are kept — 'columns' is layout, consumed entirely by
+  /// the DRAWN kinds are kept — 'columns' is layout, consumed entirely by
   /// the string builder, and holding it here would imply draw code that does
   /// not exist.
   private struct Decoration {
     enum Kind {
       case box
       case rule
+      case chip
+      case marker
     }
     let kind: Kind
     let range: NSRange
@@ -233,6 +284,8 @@ public final class SelectableRunHostView: UIView {
     let inset: CGFloat
     /// Nonzero marks an island box, whose direction `leadingEdgeRuns(in:)` ignores.
     let textInset: CGFloat
+    /// 'marker' only.
+    let dotSize: CGFloat
   }
 
   /// `decorations` parsed on arrival, in prop order. Painted in `draw(_:)`
@@ -342,6 +395,17 @@ public final class SelectableRunHostView: UIView {
     tap.isEnabled = false
     textView.addGestureRecognizer(tap)
     inlineTapRecognizer = tap
+
+    textView.onTouchDown = { [weak self] point in
+      guard let self, self.hasPressedFeedback else { return }
+      let hit = self.pressable(at: point)
+      self.pressedPressableId = hit?.pressedColor != nil ? hit?.id : nil
+    }
+    textView.onTouchMove = { [weak self] point in
+      guard let self, let id = self.pressedPressableId else { return }
+      if self.pressable(at: point)?.id != id { self.pressedPressableId = nil }
+    }
+    textView.onTouchUp = { [weak self] in self?.pressedPressableId = nil }
   }
 
   @available(*, unavailable)
@@ -465,6 +529,9 @@ public final class SelectableRunHostView: UIView {
     let hadSelectAll =
       saved.length > 0 && saved.location == 0 && saved.length == previousLength
 
+    // The pressed rect was laid out against the old text.
+    pressedPressableId = nil
+
     let plan = RNSMTextSplice.plan(from: lastAppliedText, to: attributedText)
     lastAppliedText = NSAttributedString(attributedString: attributedText)
     if plan.prefix == previousLength && previousLength == newLength { return }
@@ -544,8 +611,19 @@ public final class SelectableRunHostView: UIView {
               let end = (dictionary["end"] as? NSNumber)?.intValue,
               let id = (dictionary["pressableId"] as? NSNumber)?.intValue,
               start >= 0, end > start else { return nil }
-        return Pressable(range: NSRange(location: start, length: end - start), id: id)
+        let label = (dictionary["accessibilityLabel"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        return Pressable(
+          range: NSRange(location: start, length: end - start),
+          id: id,
+          label: label,
+          isButton: (dictionary["accessibilityRole"] as? String) == "button",
+          announced: (dictionary["accessibilityRole"] as? String) != "text",
+          pressedColor: Self.decorationColor(dictionary["pressedColor"]),
+          pressedRadius: CGFloat((dictionary["pressedRadius"] as? NSNumber)?.doubleValue ?? 0),
+          hitSlop: max(0, CGFloat((dictionary["hitSlop"] as? NSNumber)?.doubleValue ?? 0)))
       }
+      hasPressedFeedback = resolvedPressables.contains { $0.pressedColor != nil }
+      pressedPressableId = nil
       inlineTapRecognizer?.isEnabled = !resolvedPressables.isEmpty
       invalidateAccessibilityElements()
     }
@@ -656,6 +734,7 @@ public final class SelectableRunHostView: UIView {
     // previous run reported — the same stale-state failure class as the
     // selection reset above.
     lastEmbedRects.removeAll()
+    pressedPressableId = nil
     // `resolvedDecorations` is deliberately NOT cleared — it is prop-derived,
     // like `pressables`, and the props survive recycling. The redraw is what
     // matters: with the text emptied, `draw(_:)` paints nothing (it guards on
@@ -806,16 +885,16 @@ public final class SelectableRunHostView: UIView {
       vended.append(Vended(range: clamped, element: element, order: vended.count))
     }
 
-    for pressable in resolvedPressables {
+    for pressable in resolvedPressables where pressable.announced {
       let clamped = NSIntersectionRange(pressable.range, textRange)
       guard clamped.length > 0, let frame = frameFor(clamped) else { continue }
       let element = PressableAccessibilityElement(accessibilityContainer: self)
-      element.accessibilityLabel = full.substring(with: clamped)
-      element.accessibilityTraits = .link
+      element.accessibilityLabel = pressable.label ?? full.substring(with: clamped)
+      element.accessibilityTraits = pressable.isButton ? .button : .link
       element.accessibilityFrameInContainerSpace = frame
       element.activate = { [weak self] in
         guard let self else { return false }
-        self.emitInlinePress(pressable)
+        self.emitInlinePress(pressable, frame: frame)
         return true
       }
       vended.append(Vended(range: clamped, element: element, order: vended.count))
@@ -920,7 +999,9 @@ public final class SelectableRunHostView: UIView {
     switch kindName {
     case "box": kind = .box
     case "rule": kind = .rule
-    // 'columns' and 'indent' are builder-only (layout, no drawn half);
+    case "chip": kind = .chip
+    case "marker": kind = .marker
+    // 'columns', 'indent' and 'spacing' are builder-only (layout, no drawn half);
     // unknown kinds are newer JS driving an older binary.
     default: return nil
     }
@@ -942,7 +1023,8 @@ public final class SelectableRunHostView: UIView {
       thickness: number("thickness"),
       alignTop: (dictionary["align"] as? String) == "top",
       inset: number("inset"),
-      textInset: number("textInset"))
+      textInset: number("textInset"),
+      dotSize: number("dotSize"))
   }
 
   private static func decorationColor(_ value: Any?) -> UIColor? {
@@ -973,7 +1055,7 @@ public final class SelectableRunHostView: UIView {
   /// string builder, where measurement sees it too.
   public override func draw(_ rect: CGRect) {
     super.draw(rect)
-    guard !resolvedDecorations.isEmpty,
+    guard !resolvedDecorations.isEmpty || pressedPressableId != nil,
           let context = UIGraphicsGetCurrentContext() else { return }
     let length = textView.attributedText?.length ?? 0
     guard length > 0, textView.layoutManager.numberOfGlyphs > 0 else { return }
@@ -987,9 +1069,183 @@ public final class SelectableRunHostView: UIView {
           if pass == 2 {
             drawRule(decoration, in: context, textLength: length)
           }
+        case .chip:
+          drawChip(decoration, pass: pass, in: context, textLength: length)
+        case .marker:
+          if pass == 0 {
+            drawMarkerDot(decoration, in: context, textLength: length)
+          }
         }
       }
+      // Above every fill and bar, below every stroke.
+      if pass == 1 {
+        drawPressed(in: context, textLength: length)
+      }
     }
+  }
+
+  // MARK: - Chips, markers and pressed feedback
+
+  /// The box a chip's builder reserved, in this view's coordinates: the
+  /// natural text width plus the lead and trail kern, over the font's glyph
+  /// box padded vertically. Empty where the builder stamped no chip (skew).
+  /// The trail follows the last glyph's direction, the lead sits opposite.
+  /// The stack keeps a chip on one line and gives a wrapped chip its lead
+  /// (RNSMTextKitStack.h); only a chip wider than the line breaks, and that
+  /// degrades to one padded rect per line rather than a box overhanging it.
+  private func chipRects(_ decoration: Decoration, textLength: Int) -> [CGRect] {
+    let clamped = NSIntersectionRange(decoration.range, NSRange(location: 0, length: textLength))
+    guard clamped.length > 0,
+          let metrics = RNSMAttributedText.chipMetrics(
+            of: textView.textStorage, at: clamped.location),
+          let anchor = glyphAnchor(at: clamped)
+    else { return [] }
+    let lead = CGFloat(metrics[0].doubleValue)
+    let trail = CGFloat(metrics[1].doubleValue)
+    let width = CGFloat(metrics[2].doubleValue)
+    let layoutManager = textView.layoutManager
+    let glyphRange = layoutManager.glyphRange(forCharacterRange: clamped, actualCharacterRange: nil)
+    let origin = textView.frame.origin
+    var line = NSRange(location: 0, length: 0)
+    _ = layoutManager.lineFragmentRect(forGlyphAt: glyphRange.location, effectiveRange: &line)
+    guard NSMaxRange(glyphRange) <= NSMaxRange(line) else {
+      var rects: [CGRect] = []
+      layoutManager.enumerateEnclosingRects(
+        forGlyphRange: glyphRange,
+        withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
+        in: textView.textContainer
+      ) { rect, _ in
+        rects.append(CGRect(
+          x: rect.minX + origin.x, y: rect.minY + origin.y - decoration.paddingTop,
+          width: rect.width,
+          height: rect.height + decoration.paddingTop + decoration.paddingBottom))
+      }
+      return rects
+    }
+    var level: UInt8 = 0
+    layoutManager.getGlyphs(
+      in: NSRange(location: NSMaxRange(glyphRange) - 1, length: 1),
+      glyphs: nil, properties: nil, characterIndexes: nil, bidiLevels: &level)
+    let text = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textView.textContainer)
+    let x = level % 2 == 1
+      ? text.maxX + origin.x - width - trail
+      : text.minX + origin.x - lead
+    let top = anchor.baseline - anchor.font.ascender - decoration.paddingTop
+    let bottom = anchor.baseline - anchor.font.descender + decoration.paddingBottom
+    var rect = CGRect(x: x, y: top, width: lead + width + trail, height: bottom - top)
+    // Belt and braces: the stack reserves the lead on a wrapped line, so this
+    // only bites if layout and the builder's metrics ever disagree.
+    rect.origin.x = max(0, min(rect.minX, bounds.width - rect.width))
+    return [rect]
+  }
+
+  /// The first glyph's x and baseline (view coordinates) and its font.
+  private func glyphAnchor(at range: NSRange) -> (x: CGFloat, baseline: CGFloat, font: UIFont)? {
+    let layoutManager = textView.layoutManager
+    let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+    guard glyphRange.length > 0 else { return nil }
+    let fragment = layoutManager.lineFragmentRect(
+      forGlyphAt: glyphRange.location, effectiveRange: nil)
+    let location = layoutManager.location(forGlyphAt: glyphRange.location)
+    let origin = textView.frame.origin
+    let font = textView.textStorage.attribute(.font, at: range.location, effectiveRange: nil)
+      as? UIFont ?? UIFont.systemFont(ofSize: UIFont.systemFontSize)
+    return (fragment.minX + location.x + origin.x, fragment.minY + location.y + origin.y, font)
+  }
+
+  private func drawChip(
+    _ decoration: Decoration, pass: Int, in context: CGContext, textLength: Int
+  ) {
+    guard pass != 1 else { return }
+    let rects = chipRects(decoration, textLength: textLength)
+    guard !rects.isEmpty else { return }
+    let path = { (box: CGRect) -> UIBezierPath in
+      decoration.borderRadius > 0
+        ? UIBezierPath(roundedRect: box, cornerRadius: decoration.borderRadius)
+        : UIBezierPath(rect: box)
+    }
+    context.saveGState()
+    if pass == 0, let fill = decoration.fill {
+      fill.setFill()
+      rects.forEach { path($0).fill() }
+    } else if pass == 2, let borderColor = decoration.borderColor, decoration.borderWidth > 0 {
+      borderColor.setStroke()
+      for rect in rects {
+        let stroke = path(rect.insetBy(dx: decoration.borderWidth / 2, dy: decoration.borderWidth / 2))
+        stroke.lineWidth = decoration.borderWidth
+        stroke.stroke()
+      }
+    }
+    context.restoreGState()
+  }
+
+  /// A dot at the marker column's leading edge, centred on the x-height.
+  private func drawMarkerDot(_ decoration: Decoration, in context: CGContext, textLength: Int) {
+    guard decoration.dotSize > 0, let color = decoration.fill else { return }
+    let clamped = NSIntersectionRange(decoration.range, NSRange(location: 0, length: textLength))
+    guard clamped.length > 0, let anchor = glyphAnchor(at: clamped) else { return }
+    let style = textView.textStorage.attribute(
+      .paragraphStyle, at: clamped.location, effectiveRange: nil) as? NSParagraphStyle
+    var centerX = anchor.x + decoration.dotSize / 2
+    if style?.baseWritingDirection == .rightToLeft {
+      let layoutManager = textView.layoutManager
+      let glyphRange = layoutManager.glyphRange(forCharacterRange: clamped, actualCharacterRange: nil)
+      let bounds = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textView.textContainer)
+      centerX = bounds.maxX + textView.frame.origin.x - decoration.dotSize / 2
+    }
+    let centerY = anchor.baseline - anchor.font.xHeight / 2
+    context.saveGState()
+    color.setFill()
+    UIBezierPath(ovalIn: CGRect(
+      x: centerX - decoration.dotSize / 2, y: centerY - decoration.dotSize / 2,
+      width: decoration.dotSize, height: decoration.dotSize)).fill()
+    context.restoreGState()
+  }
+
+  /// The chip exactly covering `range`, when one does.
+  private func chip(covering range: NSRange) -> Decoration? {
+    resolvedDecorations.first { $0.kind == .chip && NSEqualRanges($0.range, range) }
+  }
+
+  /// A pressable's painted extent in this view's coordinates: its chip, or
+  /// the rects its glyphs enclose line by line.
+  private func pressableRects(_ pressable: Pressable, textLength: Int) -> [CGRect] {
+    let clamped = NSIntersectionRange(pressable.range, NSRange(location: 0, length: textLength))
+    guard clamped.length > 0 else { return [] }
+    if let chip = chip(covering: pressable.range) {
+      let rects = chipRects(chip, textLength: textLength)
+      if !rects.isEmpty { return rects }
+    }
+    let layoutManager = textView.layoutManager
+    let glyphRange = layoutManager.glyphRange(forCharacterRange: clamped, actualCharacterRange: nil)
+    guard glyphRange.length > 0 else { return [] }
+    let origin = textView.frame.origin
+    var rects: [CGRect] = []
+    layoutManager.enumerateEnclosingRects(
+      forGlyphRange: glyphRange,
+      withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
+      in: textView.textContainer
+    ) { rect, _ in
+      rects.append(rect.offsetBy(dx: origin.x, dy: origin.y))
+    }
+    return rects
+  }
+
+  private func drawPressed(in context: CGContext, textLength: Int) {
+    guard let id = pressedPressableId,
+          let pressable = resolvedPressables.first(where: { $0.id == id }),
+          let color = pressable.pressedColor else { return }
+    // Unset: the chip's own radius, else square.
+    let radius = pressable.pressedRadius > 0
+      ? pressable.pressedRadius
+      : chip(covering: pressable.range)?.borderRadius ?? 0
+    context.saveGState()
+    color.setFill()
+    for rect in pressableRects(pressable, textLength: textLength) {
+      (radius > 0 ? UIBezierPath(roundedRect: rect, cornerRadius: radius) : UIBezierPath(rect: rect))
+        .fill()
+    }
+    context.restoreGState()
   }
 
   /// The vertical band a character range's line fragments occupy, in this
@@ -1192,7 +1448,9 @@ public final class SelectableRunHostView: UIView {
     emit(clamped.location, clamped.location + clamped.length)
   }
 
-  private func emitInlinePress(_ pressable: Pressable) {
+  /// `frame` (view coordinates) overrides the layout-derived bounds; the
+  /// accessibility path passes its element's frame.
+  private func emitInlinePress(_ pressable: Pressable, frame: CGRect? = nil) {
     guard let emit = onInlinePress else { return }
     let length = ((textView.text ?? "") as NSString).length
     // Same clamp discipline as emitSelectionAction: the ranges were computed
@@ -1202,7 +1460,31 @@ public final class SelectableRunHostView: UIView {
     let start = min(pressable.range.location, length)
     let end = min(pressable.range.location + pressable.range.length, length)
     guard end > start else { return }
-    emit(start, end, pressable.id)
+    // pressableRects clamps the same way and prefers an exactly-covering chip.
+    let local = frame ?? pressableRects(pressable, textLength: length)
+      .reduce(CGRect.null) { $0.union($1) }
+    let rect = local.isNull ? CGRect.zero : pageRect(local)
+    emit(start, end, pressable.id,
+         Double(rect.minX), Double(rect.minY), Double(rect.width), Double(rect.height))
+  }
+
+  /// A rect in this view's coordinates converted to the space a touch's
+  /// `pageX` / `pageY` use: RCTSurfaceTouchHandler takes `locationInView:` of
+  /// the view it is attached to (the surface view, or a Fabric modal's own
+  /// root), so convert to the nearest ancestor carrying one. A host-set
+  /// `viewOriginOffset` (brownfield only) is not visible from here. Window
+  /// coordinates when no handler is found, which match for a full-screen root.
+  private func pageRect(_ rect: CGRect) -> CGRect {
+    if let handler = NSClassFromString("RCTSurfaceTouchHandler") {
+      var candidate = superview
+      while let view = candidate {
+        if view.gestureRecognizers?.contains(where: { $0.isKind(of: handler) }) == true {
+          return convert(rect, to: view)
+        }
+        candidate = view.superview
+      }
+    }
+    return window != nil ? convert(rect, to: nil) : rect
   }
 
   // MARK: - Inline presses
@@ -1241,9 +1523,22 @@ public final class SelectableRunHostView: UIView {
     let glyphIndex = layoutManager.glyphIndex(for: location, in: container)
     let glyphRect = layoutManager.boundingRect(
       forGlyphRange: NSRange(location: glyphIndex, length: 1), in: container)
-    guard glyphRect.contains(location) else { return nil }
-    let characterIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
-    return resolvedPressables.first { NSLocationInRange(characterIndex, $0.range) }
+    if glyphRect.contains(location) {
+      let characterIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
+      if let hit = resolvedPressables.first(where: { NSLocationInRange(characterIndex, $0.range) }) {
+        return hit
+      }
+    }
+    // Widened targets: a chip's padding and any hit slop. Still a real
+    // rect test, so empty space past a line's end stays inert.
+    let length = textView.textStorage.length
+    let viewPoint = CGPoint(x: point.x + textView.frame.origin.x, y: point.y + textView.frame.origin.y)
+    return resolvedPressables.first { pressable in
+      guard pressable.hitSlop > 0 || chip(covering: pressable.range) != nil else { return false }
+      return pressableRects(pressable, textLength: length).contains {
+        $0.insetBy(dx: -pressable.hitSlop, dy: -pressable.hitSlop).contains(viewPoint)
+      }
+    }
   }
 }
 
@@ -1255,6 +1550,7 @@ extension SelectableRunHostView: UITextViewDelegate {
   /// before the old one's empty report and the toolbar does not flicker.
   /// Clearing re-enters with an empty range, which returns at the guard.
   public func textViewDidChangeSelection(_ textView: UITextView) {
+    if textView.selectedRange.length > 0 { pressedPressableId = nil }
     emitSelectionChange()
     guard textView.selectedRange.length > 0, exclusiveSelection else { return }
     if let previous = Self.activeSelectionHost, previous !== self,

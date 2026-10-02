@@ -27,6 +27,10 @@ internal class InlinePressEvent(
     private val start: Int,
     private val end: Int,
     private val pressableId: Int,
+    private val x: Float,
+    private val y: Float,
+    private val width: Float,
+    private val height: Float,
 ) : Event<InlinePressEvent>(surfaceId, viewId) {
 
     override fun getEventName(): String = EVENT_NAME
@@ -38,13 +42,18 @@ internal class InlinePressEvent(
      * clamped by the emitter in `SelectableRunHostView` — informational, the
      * same way `selectedText` is on the selection event. `pressableId` is
      * JS's identifier for the range, echoed verbatim; it is what JS routes
-     * on.
+     * on. `x`/`y`/`width`/`height` are the pressed range's bounds in dp,
+     * root-view-relative like a touch's `pageX`/`pageY` (see the emitter).
      */
     override fun getEventData(): WritableMap =
         Arguments.createMap().apply {
             putInt("start", start)
             putInt("end", end)
             putInt("pressableId", pressableId)
+            putDouble("x", x.toDouble())
+            putDouble("y", y.toDouble())
+            putDouble("width", width.toDouble())
+            putDouble("height", height.toDouble())
         }
 
     companion object {

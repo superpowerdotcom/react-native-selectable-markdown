@@ -8,7 +8,6 @@ import android.text.TextDirectionHeuristics
 import android.text.TextPaint
 import android.view.View
 import android.widget.TextView
-import com.facebook.react.uimanager.PixelUtil
 import com.facebook.yoga.YogaMeasureMode
 import com.facebook.yoga.YogaMeasureOutput
 import java.util.Locale
@@ -137,8 +136,12 @@ internal object RunTextMeasure {
      * caller with no run in hand — a freshly constructed view — takes the
      * fallback default.
      */
-    fun configurePaint(paint: TextPaint, baseSizeSp: Float = TEXT_SIZE_SP) {
-        paint.textSize = PixelUtil.toPixelFromSP(baseSizeSp)
+    fun configurePaint(
+        paint: TextPaint,
+        baseSizeSp: Float = TEXT_SIZE_SP,
+        scaling: RunFontScaling = RunFontScaling.DEFAULT,
+    ) {
+        paint.textSize = scaling.toPixel(baseSizeSp)
         paint.isElegantTextHeight = true
         // Set explicitly on every configuration, measure side and view side
         // alike, for two reasons at once: the measure side's scratch paint is
@@ -195,8 +198,13 @@ internal object RunTextMeasure {
      * every such change with a `setText` that rebuilds the widget's layout
      * from the paint as written here.
      */
-    fun updateTextViewBaseSize(view: TextView, text: String, spec: RunAttributedText.Spec) {
-        configurePaint(view.paint, baseTextSizeSp(text, spec))
+    fun updateTextViewBaseSize(
+        view: TextView,
+        text: String,
+        spec: RunAttributedText.Spec,
+        scaling: RunFontScaling,
+    ) {
+        configurePaint(view.paint, baseTextSizeSp(text, spec), scaling)
     }
 
     /**
@@ -221,17 +229,18 @@ internal object RunTextMeasure {
         width: Float,
         widthMode: YogaMeasureMode,
         height: Float,
-        heightMode: YogaMeasureMode
+        heightMode: YogaMeasureMode,
+        scaling: RunFontScaling = RunFontScaling.DEFAULT,
     ): Long {
         if (text.isEmpty()) {
             return YogaMeasureOutput.make(0f, 0f)
         }
 
-        val key = RunLayoutCache.key(text, spec, decorations, embeds)
+        val key = RunLayoutCache.key(text, spec, decorations, embeds, scaling)
         RunLayoutCache.measurement(key, width, widthMode, height, heightMode)?.let { return it }
 
         val paint = checkNotNull(scratchPaint.get())
-        configurePaint(paint, baseTextSizeSp(text, spec))
+        configurePaint(paint, baseTextSizeSp(text, spec), scaling)
 
         // The same styled string the view will draw — under RunLayoutCache,
         // now the same INSTANCE, not merely the same builder call. Its spans

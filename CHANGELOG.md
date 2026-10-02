@@ -4,6 +4,44 @@ Versions follow [semver](https://semver.org/); pre-1.0, breaking changes land in
 
 ## [Unreleased]
 
+- BREAKING: complete `MarkdownTheme` objects now require `colors.highlight`, `table.frame`, `table.hideEmptyHeader`, `blocks`, `list`, `link`, and `html`. Use `mergeTheme(overrides)` to fill defaults before passing a theme to the run resolvers, or update complete theme literals.
+
+- Theme: `blocks` group of per-kind margins (`paragraph`, `heading`, `list`, `listItem`, `quote`, `code`, `table`, `rule`, `firstBlockLead`), collapsed web-style and measured from box edges. In a run each margin is the height of the separator's blank line, so selection offsets do not move. Unset, spacing is unchanged.
+- Theme: `headings.levels[n]` (`fontSize`, `lineHeight`, `fontFamily`, `color`, `weight`, `letterSpacing`, `before`, `after`), plus group-wide `headings.fontFamily` and `headings.letterSpacing`; `headingStyle(theme, level)` resolves one level for custom renderers.
+- Theme: `list` group: `marker` (`{ kind: 'dot', size, gap, color? }` or `{ kind: 'glyph', glyph?, color?, fontFamily?, fontSize?, weight? }`), `itemGap`, and `hangingIndent`, which pins the marker column so first-line text lines up with wrapped lines.
+- Theme: `link.underline` (`'solid' | 'double' | 'dotted' | 'dashed' | 'none'`) and `link.underlineColor`.
+- Theme: `table.frame`, `frameColor`, `ruleColor`, `header` and `body` cell typography, `hideEmptyHeader`; `colors.highlight` and `colors.highlightText`.
+- View: `RunMarkStyle` gains `letterSpacing`, `textDecorationColor` and `textDecorationStyle`.
+- View: `allowFontScaling` and `maxFontSizeMultiplier` on `<SelectableMarkdown>` and `RunHost`, applied to native runs and standalone `<Text>` alike.
+- View: `highlights` (source spans or `{ query, caseSensitive?, matchTokens? }`) paints matches inside native runs without reprojecting; `matchTokens` falls back to individual words in a run with no phrase match.
+- View: `accessibilityForPressable` (label, and role `'link' | 'button'`, `'text'` for tappable but not announced, or `'none'` for inert), `pressedStyle`, `pressableHitSlop` and `chipForMark` (a padded rounded fill with `minWidth`, and optional `color`, `fontFamily`, `fontSize`, `fontWeight`, `letterSpacing` for the text inside).
+- View: `softBreak="newline"`; `ProjectRunOptions.softBreak` and `recordBlocks` (`ProjectedRun.blocks`, `ProjectedBlock`).
+- View: `images="none"`, and the object form `{ mode?, width?: number | 'container', height?: number | 'intrinsic', maxHeight? }`; `withImageEmbeds` accepts a per-image sizing function, and an embedded image fills its reserved box (`RenderContext.embedBox`).
+- BREAKING: standalone lists render as marker-column rows and blockquote children as blocks, so wrapped list lines hang under the text. The `list` renderer now draws every marker, task boxes included, so a `listItem` override should no longer draw one; `RenderContext` gains `softBreak`, `allowFontScaling`, `maxFontSizeMultiplier`, `highlight` and `embedBox`.
+- Selection: on the standalone path, selection is confined to each text block and cannot span list items or quote paragraphs. List markers sit outside the selectable text and are not copied. This also applies when the native run host is unavailable.
+- View: direct `RunHost` consumers can import `resolveRunSpacing`, `hiddenHeaderLines`, `presentPressables`, `resolveChips`, and `resolveRunHighlights` from the package entry. Add spacing, hidden-header, highlight, and chip attributes through `resolveRunAttributes`' fourth argument, and append spacing/chip decorations to `resolveRunDecorations`. Spacing needs a projection made with `recordBlocks: true`.
+- View: `onLinkPress` now also handles links on standalone blocks (`RenderContext.onLinkPress`); the built-in `link` and `autolink` renderers fall back to `openUrl` only without it, and a blocked link there is pressable when it is set.
+- BREAKING: `InlineLinkPress.start` and `end` are optional (a standalone press has no run offsets). It gains `span` (the link's source span, on both paths) and `rect` (the pressed range's bounds in `pageX`/`pageY` space natively, the touch point on a standalone block).
+- View: `transformInline` rewrites (`{ text }`) or hides (`{ hide }`) inline nodes during projection and rendering; a hidden node takes the space before it, and spans stay the node's own, so copy-as-markdown is exact. `copySnapping="headings"` widens a markdown copy that starts inside a heading to the whole heading.
+- View: `EmbedSpec.height: 'auto'` (with `estimatedHeight`) measures the overlay and re-reserves once; streaming-tail embeds keep the estimate until they settle. `SizedEmbedSpec` is what `withImageEmbeds` returns.
+- View: `RenderContext.marks` (`InlineScope[]`) lists the enclosing heading/strong/emphasis/link/quote for custom renderers; `withMark` extends it.
+- View: `theme` is compared by value and `renderers` shallowly, so inline literals no longer re-render every run.
+- Theme: `colors.emphasis`, `rule.color`, `blocks.lastBlockTrail`, and `html.display` (`'code' | 'text'`) for raw HTML.
+- Engine: `html: { allow, other? }` turns `<a href>`, `<br>`, `<strong>`/`<b>`, `<em>`/`<i>`, `<s>`/`<del>`, `<u>`/`<ins>` and `<code>` into real nodes and strips (or keeps raw) the rest; a line opening with an allowed tag no longer swallows its paragraph. `ResolvedEngineOptions` gains `htmlAllow` and `htmlOther`.
+- Engine: `AutolinkNode.text`, the address as written; `extractLinks(source, options?, engine?)` on the root and `./engine` entries lists links from the same parse the view renders.
+- iOS and Android: `onInlinePress` carries the pressed range's rect; pressables accept `accessibilityRole: 'text'` (tappable, not announced).
+- iOS and Android: native support for the above on the run wire: `letterSpacing`, underline colour and style, pressable label/role/pressed fill/hit slop, `'chip'`, `'marker'` and `'spacing'` decorations, and the font-scaling props.
+- View: `codeBlocks="card"` (or `{ mode?, copyLabel?, copiedLabel? }`) draws each top-level closed code block as a full-width card in its run, with a language label, a Copy button and sideways scrolling. `onCodeCopy` receives `{ code, language?, span }`; without it the card writes the system clipboard through the new native `copyText`. `CodeBlockMode`, `CodeBlockOptions` and `CodeCopyEvent` are exported.
+- View: `EmbedSpec.width: 'container'` reserves the document's measured width less its horizontal padding; hosts holding such a claim mount once the width is known. `withImageEmbeds` declines a wrapped `'container'` claim.
+- View: `streamingEmbeds` mounts embed overlays on the streaming tail. Default false, as before.
+- View: `attributeForMark`, `chipForMark` and `accessibilityForPressable` apply on the standalone path too, through `RenderContext`. A chip there is an inline box around the mark's text.
+- View: `transformInline` may return `prefix: { text, style? }`, display-only text before the node in its own colour, font and size (`ProjectedRun.prefixes`). It maps to no source, so copy-as-markdown leaves it out. `InlineTransform`, `InlineTransformResult`, `InlinePrefix`, `InlinePrefixStyle` and `ProjectedPrefix` are exported.
+- View: a hidden `transformInline` node keeps the space before it when a letter or digit follows directly: `lead [1]mg` reads `lead mg`.
+- Theme: `blocks.firstBlockLead` also takes a list of kinds (`BlockSpacingKind[]`), so `['heading']` keeps an opening heading's margin and lets an opening paragraph sit flush.
+- View: `withMark` and `InlineScope` are exported.
+- Fix: with `theme.blocks` set, the last run no longer gets `spacing.blockGap` below it.
+- Fix: a half-typed task box at the end of a stream (`- [`, `- [x`, `- [x]`) is held back instead of flashing as an item reading `x`.
+
 ## [0.12.0] — 2026-10-01
 
 - BREAKING: the package entry exports an explicit list of 191 names. Ten internals left the root and are imported by path instead: `decodeFlatBuffer`, `NativeProtocolError`, `applySmartPunctuation`, `PROTOCOL_VERSION`, `findHostBinding`, `NativeHostBinding` and `__linkNativeEngine` from `dist/engine/native`; `getOrCreateSession` from `dist/agui/useAgUiSession`; `embedContentFor` from `dist/selection/runs`; `isUriLikeLabel` from `dist/stream/repair`.

@@ -1,5 +1,8 @@
 package com.selectablemarkdown
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.util.Log
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -58,6 +61,15 @@ class SelectableMarkdownModule(reactContext: ReactApplicationContext) :
 
     /** Per module instance, so a reload's fresh runtime is asked afresh; `unavailable` and success stay unmemoized. */
     private var refused = false
+
+    /** The code-block card's Copy button when the app supplies no `onCodeCopy`. */
+    @ReactMethod
+    fun copyText(text: String) {
+        val clipboard =
+            reactApplicationContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                ?: return
+        clipboard.setPrimaryClip(ClipData.newPlainText("code", text))
+    }
 
     @ReactMethod(isBlockingSynchronousMethod = true)
     fun install(): String {

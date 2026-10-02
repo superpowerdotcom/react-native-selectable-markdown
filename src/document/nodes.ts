@@ -156,6 +156,12 @@ export interface ImageNode extends NodeBase {
 export interface AutolinkNode extends NodeBase {
   kind: 'autolink';
   href: string;
+  /**
+   * The address as written, without `<>` or an added `mailto:` / `http://`.
+   * Set by the built-in engine; a custom engine may leave it out, and
+   * renderers then fall back to the source slice or `href`.
+   */
+  text?: string;
 }
 
 export interface HardBreakNode extends NodeBase {

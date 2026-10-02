@@ -1,3 +1,4 @@
+import { applyHtmlSubset } from './htmlSubset';
 import type { ParsedDocument } from '../document/nodes';
 import { applySpoilers } from './extensions/spoilers';
 // Type-only, and that is load-bearing: `native/index.ts` imports `Engine` from
@@ -64,6 +65,7 @@ export function parseDocument(
   engine?: Engine,
 ): ParsedDocument {
   const resolved = resolveOptions(options);
-  const doc = (engine ?? nativeEngine).parse(source, resolved);
+  let doc = (engine ?? nativeEngine).parse(source, resolved);
+  if (resolved.htmlAllow.length > 0) doc = applyHtmlSubset(doc, resolved);
   return resolved.extensions.spoilers ? applySpoilers(doc) : doc;
 }

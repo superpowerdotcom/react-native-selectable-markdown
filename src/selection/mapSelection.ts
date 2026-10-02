@@ -1,6 +1,7 @@
 import { IS_DEV } from '../dev';
 import type { AnyNode, Block, Inline, ParsedDocument } from '../document/nodes';
 import type { SourceSpan } from '../document/span';
+import type { ThemeFontWeight } from '../view/theme';
 import { decodeEntityAt } from '../engine/entities';
 import type { EmbedContent, EmbedLookup, RunSegment } from './runs';
 import { constrainsEmbedWidth, embedContentFor } from './runs';
@@ -21,6 +22,42 @@ export interface ProjectedRun {
    * outermost first; see `ProjectedExtent`. Absent when the run has none.
    */
   extents?: ProjectedExtent[];
+  /** Present only when projected with `recordBlocks`; see `ProjectedBlock`. */
+  blocks?: ProjectedBlock[];
+  /** Each `transformInline` prefix's range and style. Absent when the run has none. */
+  prefixes?: ProjectedPrefix[];
+}
+
+/** Where a `transformInline` prefix landed in `ProjectedRun.text`. */
+export interface ProjectedPrefix {
+  start: number;
+  end: number;
+  style?: InlinePrefixStyle;
+}
+
+/**
+ * One block as projected, in document (pre-)order: where it sits in the text
+ * and which block contains it. Table rows and cells are not recorded. The
+ * view's block spacing reads the separators between siblings off this list.
+ */
+export interface ProjectedBlock {
+  kind:
+    | 'paragraph'
+    | 'heading'
+    | 'list'
+    | 'listItem'
+    | 'blockquote'
+    | 'codeBlock'
+    | 'table'
+    | 'thematicBreak'
+    | 'htmlBlock';
+  /** Heading level; absent otherwise. */
+  level?: number;
+  /** UTF-16 offsets into `ProjectedRun.text`; a thematic break has `start === end`. */
+  start: number;
+  end: number;
+  /** Index of the containing block in `blocks`, or -1 at the top level. */
+  parent: number;
 }
 
 /**
@@ -155,6 +192,12 @@ export type MarkKind =
   | 'table'
   | 'tableHeader'
   /**
+   * Every body row of a table: the text after the header row and its
+   * separator. Carries `theme.table.body` so the body typography stays off
+   * the header row, which the enclosing 'table' mark also covers.
+   */
+  | 'tableBody'
+  /**
    * A thematic break. THE ONE ZERO-LENGTH MARK KIND: a rule contributes no
    * selectable text (see the `thematicBreak` case below), so `start === end`,
    * and the mark exists purely to say *where* the rule sits so the view layer
@@ -218,6 +261,7 @@ export const EMBED_PLACEHOLDER = '￼';
 //            task list items
 //   - '\n'   for a hard break, ' ' for a soft break — the two are not the same
 //            glyph, and the reason is on the `softBreak` case below
+//            (`ProjectRunOptions.softBreak: 'newline'` projects '\n' instead)
 // The separators are STRUCTURAL AND FIXED — they are what block boundaries,
 // item boundaries and table cells look like to every consumer of the
 // projected text. The three marker glyphs are only the DEFAULTS: a caller
@@ -304,7 +348,57 @@ export interface ProjectRunOptions {
    * on all three.
    */
   previous?: PreviousProjection;
+  /**
+   * What a soft break projects as: ' ' (default, CommonMark) or '\n', the
+   * same glyph a hard break gets. Offset-neutral either way, but it changes
+   * the text, so it keys a cached projection like `glyphs` does.
+   */
+  softBreak?: 'space' | 'newline';
+  /** Record `ProjectedRun.blocks`. Keys a cached projection like `glyphs`. */
+  recordBlocks?: boolean;
+  /**
+   * Rewrites or hides inline nodes as they project. Keys a cached projection
+   * like `embed`: keep it pure and referentially stable.
+   */
+  transformInline?: InlineTransform;
 }
+
+/**
+ * What an inline node shows instead of its own projection.
+ *
+ * - `text`: the node displays this string. A container (a link, emphasis)
+ *   keeps its mark — a renumbered citation stays pressable — and the string
+ *   maps to the node's whole source span as one indivisible piece, so a
+ *   selection across it still copies the original markdown.
+ * - `prefix`: display-only text before the node — a status dot, an icon
+ *   font glyph — in its own style. It maps to no source, so copy-as-markdown
+ *   leaves it out; plain-text copy keeps it. It sits outside the node's
+ *   marks: not part of a link's press target or chip.
+ * - `hide`: the node displays nothing, and a single space just before it
+ *   goes too, so "fact [3]." reads "fact.". The space stays when a letter or
+ *   digit follows directly: "lead [1]mg" reads "lead mg". Its source still
+ *   copies with any selection spanning it.
+ */
+export interface InlineTransformResult {
+  text?: string;
+  hide?: boolean;
+  prefix?: InlinePrefix;
+}
+
+export interface InlinePrefix {
+  /** Must not contain a line break. */
+  text: string;
+  style?: InlinePrefixStyle;
+}
+
+export interface InlinePrefixStyle {
+  color?: string;
+  fontFamily?: string;
+  fontSize?: number;
+  fontWeight?: ThemeFontWeight;
+}
+
+export type InlineTransform = (node: Inline) => InlineTransformResult | undefined;
 
 /**
  * A projection to grow. `blocks` must be a prefix of the run's blocks by
@@ -381,6 +475,9 @@ export function projectRun(
     glyphs,
     options?.embed,
     reuse?.projected,
+    options?.softBreak === 'newline' ? '\n' : ' ',
+    options?.recordBlocks === true,
+    options?.transformInline,
   );
   projector.project(
     reuse === null ? run.blocks : run.blocks.slice(reuse.blocks.length),
@@ -396,13 +493,16 @@ export function projectRun(
  */
 type ProjectionTask =
   | { op: 'block'; node: Block; topLevel: boolean; listDepth: number }
-  | { op: 'inline'; node: Inline }
+  | { op: 'inline'; node: Inline; next?: Inline }
   | { op: 'emit'; chunk: string; source: SourceSpan | null }
+  | { op: 'prefix'; prefix: InlinePrefix }
   | { op: 'literal'; node: AnyNode; display: string }
   | { op: 'openMark'; kind: MarkKind; level?: number; href?: string }
   | { op: 'closeMark' }
   | { op: 'openExtent'; source: SourceSpan }
-  | { op: 'closeExtent' };
+  | { op: 'closeExtent' }
+  | { op: 'openBlock'; kind: ProjectedBlock['kind']; level?: number; start?: number }
+  | { op: 'closeBlock' };
 
 interface OpenMark {
   kind: MarkKind;
@@ -455,8 +555,53 @@ function blockSeq(
   ]);
 }
 
+/** The kinds `ProjectedRun.blocks` records; rows and cells ride their table. */
+function loggedKind(node: Block): ProjectedBlock['kind'] | null {
+  switch (node.kind) {
+    case 'tableRow':
+    case 'tableCell':
+    case 'listItem':
+      return null;
+    default:
+      return node.kind;
+  }
+}
+
 function inlineSeq(children: Inline[]): ProjectionTask[] {
-  return children.map((node): ProjectionTask => ({ op: 'inline', node }));
+  return children.map((node, i): ProjectionTask => ({ op: 'inline', node, next: children[i + 1] }));
+}
+
+const WORD_START = /^[\p{L}\p{N}]/u;
+
+/**
+ * Whether `node` shows a letter or digit first. A hidden node keeps the
+ * space before it when one follows directly: hiding the `[1]` in
+ * 'lead [1]mg' reads 'lead mg', not 'leadmg'.
+ */
+export function startsWithWord(node: Inline | undefined): boolean {
+  for (let at = node; at !== undefined; ) {
+    switch (at.kind) {
+      case 'text':
+      case 'codeSpan':
+      case 'math':
+        return WORD_START.test(at.value);
+      case 'autolink':
+        return WORD_START.test(at.text ?? at.href);
+      case 'image':
+        return WORD_START.test(at.alt);
+      case 'emphasis':
+      case 'strong':
+      case 'strikethrough':
+      case 'underline':
+      case 'spoiler':
+      case 'link':
+        at = at.children[0];
+        break;
+      default:
+        return false;
+    }
+  }
+  return false;
 }
 
 class RunProjector {
@@ -464,6 +609,7 @@ class RunProjector {
   private readonly pieces: RunPiece[];
   private readonly marks: RunMark[];
   private readonly embeds: ProjectedRunEmbed[];
+  private readonly prefixes: ProjectedPrefix[];
   /** The piece the last embed pushed, so `emit`'s linear merge can refuse to
    * grow it: an embed's piece is atomic BY CONTRACT, not by the length
    * inequality that usually keeps a piece indivisible — a claimed node whose
@@ -474,6 +620,9 @@ class RunProjector {
   private readonly openMarks: OpenMark[] = [];
   private readonly extents: ProjectedExtent[];
   private readonly openExtents: OpenExtent[] = [];
+  private readonly blockLog: ProjectedBlock[] | null;
+  /** Indices into `blockLog` of the blocks still open, innermost last. */
+  private readonly openBlocks: number[] = [];
 
   /**
    * `seed` resumes a projection at a top-level block boundary, where
@@ -486,20 +635,27 @@ class RunProjector {
     private readonly glyphs: ProjectionGlyphs,
     private readonly embedLookup?: EmbedLookup,
     seed?: ProjectedRun,
+    private readonly softBreakGlyph = ' ',
+    recordBlocks = false,
+    private readonly transform?: InlineTransform,
   ) {
     if (seed === undefined) {
       this.text = '';
       this.pieces = [];
       this.marks = [];
       this.embeds = [];
+      this.prefixes = [];
       this.extents = [];
+      this.blockLog = recordBlocks ? [] : null;
       return;
     }
     this.text = seed.text;
     this.pieces = seed.pieces.slice();
     this.marks = seed.marks.slice();
     this.embeds = seed.embeds === undefined ? [] : seed.embeds.slice();
+    this.prefixes = seed.prefixes === undefined ? [] : seed.prefixes.slice();
     this.extents = seed.extents === undefined ? [] : seed.extents.slice();
+    this.blockLog = recordBlocks ? (seed.blocks ?? []).slice() : null;
     const last = this.pieces[this.pieces.length - 1];
     if (last !== undefined) {
       const clone: RunPiece = { ...last };
@@ -548,6 +704,12 @@ class RunProjector {
         .slice()
         .sort((a, b) => a.start - b.start || b.end - a.end);
     }
+    if (this.blockLog !== null) {
+      projected.blocks = this.blockLog;
+    }
+    if (this.prefixes.length > 0) {
+      projected.prefixes = this.prefixes;
+    }
     return projected;
   }
 
@@ -570,15 +732,33 @@ class RunProjector {
 
   private step(task: ProjectionTask): void {
     switch (task.op) {
-      case 'block':
-        this.push(this.blockTasks(task.node, task.topLevel, task.listDepth));
+      case 'block': {
+        // Taken first: an embed claim emits its placeholder inside `blockTasks`.
+        const start = this.text.length;
+        const tasks = this.blockTasks(task.node, task.topLevel, task.listDepth);
+        const kind = this.blockLog === null ? null : loggedKind(task.node);
+        if (kind === null) {
+          this.push(tasks);
+          return;
+        }
+        const level = task.node.kind === 'heading' ? task.node.level : undefined;
+        this.push([{ op: 'openBlock', kind, level, start }, ...tasks, { op: 'closeBlock' }]);
         return;
+      }
       case 'inline':
-        this.push(this.inlineTasks(task.node));
+        this.push(this.inlineTasks(task.node, task.next));
         return;
       case 'emit':
         this.emit(task.chunk, task.source);
         return;
+      case 'prefix': {
+        const start = this.text.length;
+        this.emit(task.prefix.text, null);
+        const prefix: ProjectedPrefix = { start, end: this.text.length };
+        if (task.prefix.style !== undefined) prefix.style = task.prefix.style;
+        this.prefixes.push(prefix);
+        return;
+      }
       case 'literal':
         this.literal(task.node, task.display);
         return;
@@ -599,6 +779,27 @@ class RunProjector {
       case 'closeExtent':
         this.closeExtent();
         return;
+      case 'openBlock': {
+        if (this.blockLog === null) return;
+        const parent = this.openBlocks.length > 0 ? this.openBlocks[this.openBlocks.length - 1] : -1;
+        const entry: ProjectedBlock = {
+          kind: task.kind,
+          start: task.start ?? this.text.length,
+          end: this.text.length,
+          parent,
+        };
+        if (task.level !== undefined) entry.level = task.level;
+        this.openBlocks.push(this.blockLog.length);
+        this.blockLog.push(entry);
+        return;
+      }
+      case 'closeBlock': {
+        const index = this.openBlocks.pop();
+        if (index !== undefined && this.blockLog !== null) {
+          this.blockLog[index].end = this.text.length;
+        }
+        return;
+      }
     }
   }
 
@@ -798,7 +999,7 @@ class RunProjector {
           // bullet. This walks `item.children` rather than delegating to
           // `case 'listItem'`, which is why that case carrying the same
           // separator was not enough on its own.
-          return this.extended(
+          const itemTasks = this.extended(
             item,
             marked(
               'listItem',
@@ -811,6 +1012,9 @@ class RunProjector {
               depth,
             ),
           );
+          return this.blockLog === null
+            ? itemTasks
+            : [{ op: 'openBlock', kind: 'listItem' }, ...itemTasks, { op: 'closeBlock' }];
           }),
         );
       }
@@ -836,10 +1040,19 @@ class RunProjector {
             ...marked('tableHeader', [
               { op: 'block', node: node.header, topLevel: false, listDepth },
             ]),
-            ...node.rows.flatMap((row): ProjectionTask[] => [
-              { op: 'emit', chunk: ROW_SEPARATOR, source: null },
-              { op: 'block', node: row, topLevel: false, listDepth },
-            ]),
+            // The separator after the header stays outside 'tableBody', so
+            // the body mark covers exactly the body rows' text.
+            ...(node.rows.length === 0
+              ? NO_TASKS
+              : ([
+                  { op: 'emit', chunk: ROW_SEPARATOR, source: null },
+                  ...marked(
+                    'tableBody',
+                    separated(node.rows, ROW_SEPARATOR, (row) => [
+                      { op: 'block', node: row, topLevel: false, listDepth },
+                    ]),
+                  ),
+                ] satisfies ProjectionTask[])),
           ]),
         );
       case 'tableRow':
@@ -867,10 +1080,24 @@ class RunProjector {
     }
   }
 
-  private inlineTasks(node: Inline): ProjectionTask[] {
+  private inlineTasks(node: Inline, next?: Inline): ProjectionTask[] {
     if (this.tryEmbed(node)) {
       return NO_TASKS;
     }
+    const transformed = this.transform?.(node);
+    if (transformed?.hide === true) {
+      if (!startsWithWord(next)) this.dropTrailingSpace();
+      return NO_TASKS;
+    }
+    const prefix = transformed?.prefix;
+    const tasks =
+      transformed?.text !== undefined ? this.replacedTasks(node, transformed.text) : this.nodeTasks(node);
+    return prefix === undefined || prefix.text === '' || /[\r\n]/.test(prefix.text)
+      ? tasks
+      : [{ op: 'prefix', prefix }, ...tasks];
+  }
+
+  private nodeTasks(node: Inline): ProjectionTask[] {
     switch (node.kind) {
       case 'text':
         return [{ op: 'literal', node, display: node.value }];
@@ -966,12 +1193,62 @@ class RunProjector {
         // that offset simply looks different, and still maps to the source
         // newline it came from. Nothing in `mapSelectionToSource`, the copy
         // payload or the streaming prefix oracle moves.
-        return [{ op: 'emit', chunk: ' ', source: this.realSpan(node) }];
+        return [{ op: 'emit', chunk: this.softBreakGlyph, source: this.realSpan(node) }];
       case 'math':
         return marked('math', [{ op: 'literal', node, display: node.value }]);
       case 'htmlSpan':
         return marked('html', [{ op: 'literal', node, display: node.literal }]);
     }
+  }
+
+  /** A transformed node: its marks as usual, the replacement text inside. */
+  private replacedTasks(node: Inline, text: string): ProjectionTask[] {
+    const body: ProjectionTask[] =
+      text.length === 0 ? NO_TASKS : [{ op: 'emit', chunk: text, source: this.realSpan(node) }];
+    switch (node.kind) {
+      case 'emphasis':
+      case 'strong':
+      case 'strikethrough':
+      case 'underline':
+      case 'spoiler':
+        return marked(node.kind, body);
+      case 'link':
+        if (node.incomplete) return body;
+        return marked(node.blocked ? 'blockedLink' : 'link', body, undefined, node.href);
+      case 'autolink':
+        return marked('link', body, undefined, node.href);
+      case 'codeSpan':
+        return marked('code', body);
+      case 'math':
+        return marked('math', body);
+      case 'htmlSpan':
+        return marked('html', body);
+      default:
+        return body;
+    }
+  }
+
+  /**
+   * Takes back one ' ' just emitted, for a hidden node. Only from a linear
+   * piece, and only when no open mark or extent starts after it.
+   */
+  private dropTrailingSpace(): void {
+    const at = this.text.length - 1;
+    if (at < 0 || this.text.charCodeAt(at) !== 32) return;
+    const last = this.pieces[this.pieces.length - 1];
+    if (last === undefined || last === this.embedPiece || last.textEnd !== this.text.length) return;
+    if (this.openMarks.some((mark) => mark.start > at)) return;
+    if (this.openExtents.some((extent) => extent.start > at)) return;
+    if (this.marks.some((mark) => mark.end > at)) return;
+    if (this.extents.some((extent) => extent.end > at)) return;
+    if (last.source !== null) {
+      const linear = last.textEnd - last.textStart === last.source.end - last.source.start;
+      if (!linear) return;
+      last.source = { start: last.source.start, end: last.source.end - 1 };
+    }
+    last.textEnd -= 1;
+    this.text = this.text.slice(0, at);
+    if (last.textEnd === last.textStart) this.pieces.pop();
   }
 
   /**
@@ -1432,6 +1709,11 @@ function isHighSurrogate(code: number): boolean {
 export function mapSelectionToSource(
   projected: ProjectedRun,
   sel: { start: number; end: number },
+  /**
+   * `snapHeadings`: a selection that starts inside a heading and runs past
+   * its end widens to the heading's start, syntax included.
+   */
+  options?: { snapHeadings?: boolean },
 ): SourceSpan | null {
   if (!Number.isFinite(sel.start) || !Number.isFinite(sel.end)) {
     return null;
@@ -1511,6 +1793,16 @@ export function mapSelectionToSource(
     }
     if (extent.source.end > sourceEnd) {
       sourceEnd = extent.source.end;
+    }
+  }
+
+  if (options?.snapHeadings === true) {
+    for (const mark of projected.marks) {
+      if (mark.kind !== 'heading' || mark.start >= start) continue;
+      if (mark.end <= start || mark.end > end) continue;
+      // The heading's extent carries its source, `#`s included.
+      const extent = extents.find((e) => e.start === mark.start && e.end === mark.end);
+      if (extent !== undefined && extent.source.start < sourceStart) sourceStart = extent.source.start;
     }
   }
 

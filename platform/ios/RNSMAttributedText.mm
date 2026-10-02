@@ -1,6 +1,9 @@
 #import "RNSMAttributedText.h"
+#import "RNSMTextKitStack.h"
 
 #include <cmath>
+#include <utility>
+#include <vector>
 
 /*
  * Ranges arrive as sparse dictionaries, decoded from codegen's struct by the
@@ -423,6 +426,56 @@ static void RNSMApplyTabColumns(
   });
 }
 
+/* 'solid' (or unknown) -> single; the pattern bits compose with the single line. */
+static NSUnderlineStyle RNSMUnderlineStyle(NSString *_Nullable style)
+{
+  if ([style isEqualToString:@"double"]) {
+    return NSUnderlineStyleDouble;
+  }
+  if ([style isEqualToString:@"dotted"]) {
+    return NSUnderlineStyleSingle | NSUnderlineStylePatternDot;
+  }
+  if ([style isEqualToString:@"dashed"]) {
+    return NSUnderlineStyleSingle | NSUnderlineStylePatternDash;
+  }
+  return NSUnderlineStyleSingle;
+}
+
+/* Rewrites only the sub-ranges where `key` is already on, so "off" stays off. */
+static void RNSMRestyleLines(
+    NSMutableAttributedString *store,
+    NSRange range,
+    NSAttributedStringKey key,
+    NSUnderlineStyle style)
+{
+  [store enumerateAttribute:key
+                    inRange:range
+                    options:0
+                 usingBlock:^(id _Nullable value, NSRange sub, BOOL *stop) {
+                   if ([value isKindOfClass:[NSNumber class]] && ((NSNumber *)value).integerValue != 0) {
+                     [store addAttribute:key value:@(style) range:sub];
+                   }
+                 }];
+}
+
+/* Adds to whatever kern the character already carries (letterSpacing, another chip). */
+static void RNSMAddKern(NSMutableAttributedString *store, NSUInteger index, CGFloat delta)
+{
+  if (delta == 0.0 || index >= store.length) {
+    return;
+  }
+  id existing = [store attribute:NSKernAttributeName atIndex:index effectiveRange:NULL];
+  CGFloat kern = [existing isKindOfClass:[NSNumber class]] ? (CGFloat)((NSNumber *)existing).doubleValue : 0.0;
+  [store addAttribute:NSKernAttributeName value:@(kern + delta) range:NSMakeRange(index, 1)];
+}
+
+/* Natural advance of a range in the fonts the attribute loop gave it. Unrounded:
+ * the view paints exactly this width next to the kern the builder reserved. */
+static CGFloat RNSMNaturalWidth(NSAttributedString *store, NSRange range)
+{
+  return [store attributedSubstringFromRange:range].size.width;
+}
+
 /*
  * Interior row padding for one 'columns' decoration: paragraph spacing at the
  * row boundaries INSIDE the range — spacing after every row but the last,
@@ -555,6 +608,9 @@ static void RNSMApplyRowPadding(
 /* Carried on the string so the measurer and the host view read one value off one object. */
 static NSString *const RNSMRunEdgeInsetsAttributeName = @"RNSMRunEdgeInsets";
 
+/* A chip's [lead, trail, width] as the builder reserved them, so the view paints the same box. */
+static NSString *const RNSMChipMetricsAttributeName = @"RNSMChipMetrics";
+
 /* Unlike the full-cover edge insets, covers only its construct's range, which frames the element. */
 static NSString *const RNSMSemanticRoleAttributeName = @"RNSMSemanticRole";
 
@@ -593,6 +649,21 @@ static BOOL RNSMKnownSemanticRole(NSString *_Nullable role)
                     }];
                   }];
   return ranges;
+}
+
++ (nullable NSArray<NSNumber *> *)chipMetricsOfAttributedString:(nullable NSAttributedString *)string
+                                                          atIndex:(NSInteger)index
+{
+  if (index < 0 || (NSUInteger)index >= string.length) {
+    return nil;
+  }
+  id value = [string attribute:RNSMChipMetricsAttributeName
+                      atIndex:(NSUInteger)index
+               effectiveRange:NULL];
+  if (![value isKindOfClass:[NSArray class]] || ((NSArray *)value).count != 3) {
+    return nil;
+  }
+  return (NSArray<NSNumber *> *)value;
 }
 
 + (UIEdgeInsets)runEdgeInsetsOfAttributedString:(nullable NSAttributedString *)string
@@ -661,13 +732,29 @@ static BOOL RNSMKnownSemanticRole(NSString *_Nullable role)
       [store addAttribute:NSBackgroundColorAttributeName value:background range:range];
     }
     NSString *decoration = RNSMString(spec[@"textDecorationLine"]);
+    NSString *decorationStyle = RNSMString(spec[@"textDecorationStyle"]);
+    const NSUnderlineStyle lineStyle = RNSMUnderlineStyle(decorationStyle);
     if (decoration != nil) {
       [store addAttribute:NSUnderlineStyleAttributeName
-                    value:@([decoration isEqualToString:@"underline"] ? NSUnderlineStyleSingle : 0)
+                    value:@([decoration isEqualToString:@"underline"] ? lineStyle : 0)
                     range:range];
       [store addAttribute:NSStrikethroughStyleAttributeName
-                    value:@([decoration isEqualToString:@"line-through"] ? NSUnderlineStyleSingle : 0)
+                    value:@([decoration isEqualToString:@"line-through"] ? lineStyle : 0)
                     range:range];
+    } else if (decorationStyle != nil) {
+      // A style alone restyles whatever line an enclosing range turned on.
+      RNSMRestyleLines(store, range, NSUnderlineStyleAttributeName, lineStyle);
+      RNSMRestyleLines(store, range, NSStrikethroughStyleAttributeName, lineStyle);
+    }
+    UIColor *decorationColor = RNSMColor(spec[@"textDecorationColor"]);
+    if (decorationColor != nil) {
+      [store addAttribute:NSUnderlineColorAttributeName value:decorationColor range:range];
+      [store addAttribute:NSStrikethroughColorAttributeName value:decorationColor range:range];
+    }
+    NSNumber *letterSpacing = RNSMNumber(spec[@"letterSpacing"]);
+    if (letterSpacing != nil && std::isfinite(letterSpacing.doubleValue) &&
+        letterSpacing.doubleValue != 0.0) {
+      [store addAttribute:NSKernAttributeName value:letterSpacing range:range];
     }
 
     /*
@@ -714,6 +801,87 @@ static BOOL RNSMKnownSemanticRole(NSString *_Nullable role)
    * From a box it takes only the text inset and the run-edge padding; chrome
    * and rules are painted by the view.
    */
+  /*
+   * Chip and marker room first, so tab-stop columns below measure cells with
+   * it. Kern on the last character widens the range's trailing edge; a chip's
+   * lead sits on the character before it, or, at a paragraph start, in the
+   * first-line head indent (applied after the decoration loop, which assigns
+   * indents). Every width is measured before any kern lands, so neighbouring
+   * chips and markers cannot inflate each other's natural width.
+   *
+   * A chip is also stamped for the stack's line breaking (RNSMTextKitStack.h):
+   * no soft break inside it unless it is wider than the line, and room on a
+   * wrapped line's leading edge for the lead its previous line kept. Only
+   * attributes, so the characters and their offsets are what JS sent.
+   */
+  struct RNSMRoom {
+    NSRange range;
+    BOOL chip;
+    CGFloat minWidth;
+    CGFloat padding;
+    CGFloat width;
+  };
+  std::vector<RNSMRoom> rooms;
+  for (id entry in decorations) {
+    if (![entry isKindOfClass:[NSDictionary class]]) {
+      continue;
+    }
+    NSDictionary *spec = (NSDictionary *)entry;
+    NSString *kind = RNSMString(spec[@"kind"]);
+    BOOL chip = [kind isEqualToString:@"chip"];
+    NSRange range;
+    if ((!chip && ![kind isEqualToString:@"marker"]) || !RNSMClampedRange(spec, length, &range) ||
+        range.length == 0) {
+      continue;
+    }
+    NSNumber *minWidthValue = RNSMNumber(spec[@"minWidth"]);
+    CGFloat minWidth = minWidthValue != nil ? (CGFloat)minWidthValue.doubleValue : 0.0;
+    if (!std::isfinite(minWidth)) {
+      minWidth = 0.0;
+    }
+    NSNumber *paddingValue = RNSMNumber(spec[@"paddingH"]);
+    CGFloat padding = paddingValue != nil ? (CGFloat)paddingValue.doubleValue : 0.0;
+    if (!std::isfinite(padding) || padding < 0.0) {
+      padding = 0.0;
+    }
+    rooms.push_back({range, chip, minWidth, padding, RNSMNaturalWidth(store, range)});
+  }
+  std::vector<std::pair<NSRange, CGFloat>> paragraphLeads;
+  for (const RNSMRoom &room : rooms) {
+    const NSUInteger last = NSMaxRange(room.range) - 1;
+    if (!room.chip) {
+      if (room.minWidth > room.width) {
+        RNSMAddKern(store, last, room.minWidth - room.width);
+      }
+      continue;
+    }
+    const CGFloat extra = MAX((CGFloat)0.0, room.minWidth - room.width - 2.0 * room.padding);
+    const CGFloat lead = room.padding + extra / 2.0;
+    const CGFloat trail = room.padding + extra / 2.0;
+    RNSMAddKern(store, last, trail);
+    NSRange paragraph = [store.string paragraphRangeForRange:NSMakeRange(room.range.location, 0)];
+    if (paragraph.location == room.range.location) {
+      if (lead > 0.0) {
+        paragraphLeads.emplace_back(paragraph, lead);
+      }
+    } else {
+      RNSMAddKern(store, room.range.location - 1, lead);
+      if (lead > 0.0) {
+        [store addAttribute:RNSMChipWrapLeadAttributeName
+                      value:@(lead)
+                      range:NSMakeRange(room.range.location, 1)];
+      }
+    }
+    if (room.range.length > 1) {
+      [store addAttribute:RNSMChipUnbreakableAttributeName
+                    value:@(lead + room.width + trail)
+                    range:NSMakeRange(room.range.location + 1, room.range.length - 1)];
+    }
+    [store addAttribute:RNSMChipMetricsAttributeName
+                  value:@[ @(lead), @(trail), @(room.width) ]
+                  range:room.range];
+  }
+
   UIEdgeInsets edgeInsets = UIEdgeInsetsZero;
   for (id entry in decorations) {
     if (![entry isKindOfClass:[NSDictionary class]]) {
@@ -769,6 +937,16 @@ static BOOL RNSMKnownSemanticRole(NSString *_Nullable role)
       if (rowPadding != nil && rowPadding.doubleValue > 0.0) {
         RNSMApplyRowPadding(store, range, (CGFloat)rowPadding.doubleValue);
       }
+    } else if ([kind isEqualToString:@"spacing"]) {
+      NSNumber *spacing = RNSMNumber(spec[@"paddingBottom"]);
+      if (spacing != nil && std::isfinite(spacing.doubleValue) && spacing.doubleValue > 0.0) {
+        const CGFloat after = (CGFloat)spacing.doubleValue;
+        NSRange paragraph =
+            [store.string paragraphRangeForRange:NSMakeRange(NSMaxRange(range) - 1, 0)];
+        RNSMUpdateParagraphStyle(store, paragraph, ^(NSMutableParagraphStyle *style) {
+          style.paragraphSpacing = MAX(style.paragraphSpacing, after);
+        });
+      }
     } else if ([kind isEqualToString:@"indent"]) {
       /*
        * List indentation: the first line at `textInset` (the marker column)
@@ -792,6 +970,14 @@ static BOOL RNSMKnownSemanticRole(NSString *_Nullable role)
         });
       }
     }
+  }
+
+  // Added, not assigned: the loop above assigned this paragraph's indents.
+  for (const auto &paragraphLead : paragraphLeads) {
+    const CGFloat lead = paragraphLead.second;
+    RNSMUpdateParagraphStyle(store, paragraphLead.first, ^(NSMutableParagraphStyle *style) {
+      style.firstLineHeadIndent += lead;
+    });
   }
 
   // Full cover or nothing: the reader reads index 0, and RNSMTextSplice only
@@ -983,6 +1169,15 @@ using namespace facebook::react;
     if (decoration.rowPaddingV != 0.0) {
       entry[@"rowPaddingV"] = @(decoration.rowPaddingV);
     }
+    if (decoration.paddingH != 0.0) {
+      entry[@"paddingH"] = @(decoration.paddingH);
+    }
+    if (decoration.minWidth != 0.0) {
+      entry[@"minWidth"] = @(decoration.minWidth);
+    }
+    if (decoration.dotSize != 0.0) {
+      entry[@"dotSize"] = @(decoration.dotSize);
+    }
     [decorations addObject:entry];
   }
   return decorations;
@@ -1017,8 +1212,15 @@ using namespace facebook::react;
 {
   // Unreachable through RCTFontSizeMultiplier, but a NaN size here would
   // measure a blank run with no error anywhere.
-  const CGFloat scale =
+  CGFloat scale =
       (std::isfinite(fontSizeMultiplier) && fontSizeMultiplier > 0.0) ? fontSizeMultiplier : 1.0;
+  // Resolved here, from the props the string is built from, so the measured
+  // and the drawn string agree; RN's Text applies the same two rules.
+  if (!props.allowFontScaling) {
+    scale = 1.0;
+  } else if (std::isfinite(props.maxFontSizeMultiplier) && props.maxFontSizeMultiplier >= 1.0) {
+    scale = MIN(scale, (CGFloat)props.maxFontSizeMultiplier);
+  }
 
   /*
    * `props.text` is a std::string because that is the only thing codegen
@@ -1075,6 +1277,16 @@ using namespace facebook::react;
     }
     if (!attribute.textDecorationLine.empty()) {
       entry[@"textDecorationLine"] = RCTNSStringFromString(attribute.textDecorationLine);
+    }
+    if (!attribute.textDecorationStyle.empty()) {
+      entry[@"textDecorationStyle"] = RCTNSStringFromString(attribute.textDecorationStyle);
+    }
+    if (attribute.textDecorationColor) {
+      entry[@"textDecorationColor"] = RCTUIColorFromSharedColor(attribute.textDecorationColor);
+    }
+    // Scaled with the font, as RN's Text scales its letterSpacing.
+    if (attribute.letterSpacing != 0.0) {
+      entry[@"letterSpacing"] = @(attribute.letterSpacing * scale);
     }
     // SharedColor::operator bool() *is* the is-set test — an unset colour is
     // HostPlatformColor::UndefinedColor, not a transparent black that a

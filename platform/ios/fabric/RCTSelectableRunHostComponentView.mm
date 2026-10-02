@@ -86,11 +86,27 @@ static NSArray<NSDictionary *> *RCTSelectableRunHostPressables(
 {
   NSMutableArray<NSDictionary *> *result = [NSMutableArray arrayWithCapacity:pressables.size()];
   for (const auto &pressable : pressables) {
-    [result addObject:@{
-      @"start" : @(pressable.start),
-      @"end" : @(pressable.end),
-      @"pressableId" : @(pressable.pressableId),
-    }];
+    // Sentinel -> absent, as in RNSMAttributedText's decoders.
+    NSMutableDictionary *entry = [NSMutableDictionary dictionaryWithCapacity:8];
+    entry[@"start"] = @(pressable.start);
+    entry[@"end"] = @(pressable.end);
+    entry[@"pressableId"] = @(pressable.pressableId);
+    if (!pressable.accessibilityLabel.empty()) {
+      entry[@"accessibilityLabel"] = RCTNSStringFromString(pressable.accessibilityLabel);
+    }
+    if (!pressable.accessibilityRole.empty()) {
+      entry[@"accessibilityRole"] = RCTNSStringFromString(pressable.accessibilityRole);
+    }
+    if (pressable.pressedColor) {
+      entry[@"pressedColor"] = RCTUIColorFromSharedColor(pressable.pressedColor);
+    }
+    if (pressable.pressedRadius != 0.0) {
+      entry[@"pressedRadius"] = @(pressable.pressedRadius);
+    }
+    if (pressable.hitSlop != 0.0) {
+      entry[@"hitSlop"] = @(pressable.hitSlop);
+    }
+    [result addObject:entry];
   }
   return result;
 }
@@ -141,8 +157,8 @@ static bool RCTSelectableRunHostEmbedsEqual(
 
 /*
  * Codegen emits no operator== for generated structs, so the prop diff below
- * compares by hand. Element-wise and in order, because order is identity
- * here: `pressableId` is JS's index into the array as sent.
+ * compares by hand. In order, because order is identity here: `pressableId`
+ * is JS's index into the array as sent.
  */
 static bool RCTSelectableRunHostPressablesEqual(
     const std::vector<SelectableRunHostPressablesStruct> &lhs,
@@ -151,9 +167,12 @@ static bool RCTSelectableRunHostPressablesEqual(
   if (lhs.size() != rhs.size()) {
     return false;
   }
-  for (size_t i = 0; i < lhs.size(); i++) {
-    if (lhs[i].start != rhs[i].start || lhs[i].end != rhs[i].end ||
-        lhs[i].pressableId != rhs[i].pressableId) {
+  for (size_t i = 0; i < lhs.size(); ++i) {
+    const auto &a = lhs[i];
+    const auto &b = rhs[i];
+    if (a.start != b.start || a.end != b.end || a.pressableId != b.pressableId ||
+        a.accessibilityLabel != b.accessibilityLabel || a.accessibilityRole != b.accessibilityRole ||
+        a.pressedColor != b.pressedColor || a.pressedRadius != b.pressedRadius || a.hitSlop != b.hitSlop) {
       return false;
     }
   }
@@ -219,8 +238,17 @@ static bool RCTSelectableRunHostPressablesEqual(
      * vector) and the host's default (an empty array) agree, so the
      * diff-then-push in updateProps starts from a true premise.
      */
-    _hostView.onInlinePress = ^(NSInteger start, NSInteger end, NSInteger pressableId) {
-      [weakSelf emitInlinePressWithStart:start end:end pressableId:pressableId];
+    _hostView.onInlinePress = ^(NSInteger start,
+                                NSInteger end,
+                                NSInteger pressableId,
+                                double x,
+                                double y,
+                                double width,
+                                double height) {
+      [weakSelf emitInlinePressWithStart:start
+                                     end:end
+                             pressableId:pressableId
+                                   frame:CGRectMake(x, y, width, height)];
     };
     /*
      * Weak for the identical reason. Like `pressables`, `embeds` needs no
@@ -406,12 +434,14 @@ static bool RCTSelectableRunHostPressablesEqual(
 - (void)emitInlinePressWithStart:(NSInteger)start
                              end:(NSInteger)end
                      pressableId:(NSInteger)pressableId
+                           frame:(CGRect)frame
 {
   /*
    * The nil check matters for the same recycling reason as above: after
    * prepareForRecycle a tap that was mid-flight has nowhere to go, instead of
    * somewhere wrong. The offsets were clamped against the current text by
-   * SelectableRunHostView; nothing here re-derives them.
+   * SelectableRunHostView; nothing here re-derives them. The frame is already
+   * in page space (the host converts it to the touch handler's view).
    */
   if (!_eventEmitter) {
     return;
@@ -421,7 +451,11 @@ static bool RCTSelectableRunHostPressablesEqual(
       .onInlinePress(SelectableRunHostEventEmitter::OnInlinePress{
           .start = static_cast<int>(start),
           .end = static_cast<int>(end),
-          .pressableId = static_cast<int>(pressableId)});
+          .pressableId = static_cast<int>(pressableId),
+          .x = static_cast<Float>(frame.origin.x),
+          .y = static_cast<Float>(frame.origin.y),
+          .width = static_cast<Float>(frame.size.width),
+          .height = static_cast<Float>(frame.size.height)});
 }
 
 - (void)emitEmbedLayoutWithId:(NSInteger)embedId

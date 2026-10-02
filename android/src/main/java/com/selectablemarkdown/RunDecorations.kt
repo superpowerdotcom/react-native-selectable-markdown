@@ -1,11 +1,20 @@
 package com.selectablemarkdown
 
+import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.RectF
 import android.text.Layout
 import android.text.Spannable
+import android.text.Spanned
+import android.text.TextDirectionHeuristics
 import android.text.TextPaint
+import android.text.style.CharacterStyle
+import android.text.style.ForegroundColorSpan
 import android.text.style.LeadingMarginSpan
 import android.text.style.LineHeightSpan
+import android.text.style.MetricAffectingSpan
+import android.text.style.ReplacementSpan
 import android.text.style.TabStopSpan
 import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.ReadableMap
@@ -66,6 +75,12 @@ object RunDecorations {
         /** 'columns' only: interior row-boundary padding, in dp — see
          * `RunDecoration.rowPaddingV` (runDecorations.ts). */
         val rowPaddingV: Float,
+        /** 'chip' only: horizontal room on each side, in dp. */
+        val paddingH: Float,
+        /** 'chip' and 'marker': least advance, in dp. */
+        val minWidth: Float,
+        /** 'marker' only: dot diameter, in dp. */
+        val dotSize: Float,
     )
 
     class Spec internal constructor(internal val decorations: List<Decoration>) {
@@ -111,6 +126,9 @@ object RunDecorations {
             inset = optFloat(entry, "inset"),
             gap = optFloat(entry, "gap"),
             rowPaddingV = optFloat(entry, "rowPaddingV"),
+            paddingH = optFloat(entry, "paddingH"),
+            minWidth = optFloat(entry, "minWidth"),
+            dotSize = optFloat(entry, "dotSize"),
         )
     }
 
@@ -209,9 +227,217 @@ object RunDecorations {
                         out.setSpan(LeadingMarginSpan.Standard(first, rest), start, end, flags)
                     }
                 }
+                "chip" -> out.setSpan(
+                    RunChipSpan(
+                        PixelUtil.toPixelFromDIP(decoration.paddingH),
+                        PixelUtil.toPixelFromDIP(decoration.minWidth),
+                        paint,
+                    ),
+                    start,
+                    end,
+                    flags,
+                )
+                "marker" -> {
+                    val paragraphStart = lastNewlineBefore(out, start) + 1
+                    val paragraphEnd = nextNewlineFrom(out, start)
+                    val rtl = TextDirectionHeuristics.FIRSTSTRONG_LTR
+                        .isRtl(out, paragraphStart, paragraphEnd - paragraphStart)
+                    out.setSpan(
+                        RunMarkerSpan(
+                            PixelUtil.toPixelFromDIP(decoration.minWidth),
+                            PixelUtil.toPixelFromDIP(decoration.dotSize),
+                            decoration.color,
+                            rtl,
+                        ),
+                        start,
+                        end,
+                        flags,
+                    )
+                }
+                "spacing" -> if (decoration.paddingBottom > 0f) {
+                    applyParagraphSpacing(out, end, decoration.paddingBottom)
+                }
                 // 'rule' and unknown (newer-JS) kinds have no layout half.
             }
         }
+    }
+
+    private fun lastNewlineBefore(text: CharSequence, offset: Int): Int {
+        var index = offset - 1
+        while (index >= 0 && text[index] != '\n') index -= 1
+        return index
+    }
+
+    private fun nextNewlineFrom(text: CharSequence, offset: Int): Int {
+        var index = offset
+        while (index < text.length && text[index] != '\n') index += 1
+        return index
+    }
+
+    /**
+     * 'spacing': the bottom half of the row-padding mechanism on the paragraph
+     * holding the range's last character, so it composes with line heights
+     * exactly as `rowPaddingV` does (after `RunLineHeightSpan` by insertion order).
+     */
+    private fun applyParagraphSpacing(out: Spannable, end: Int, paddingDp: Float) {
+        val padding = PixelUtil.toPixelFromDIP(paddingDp).toInt()
+        if (padding <= 0 || end <= 0) return
+        val last = end - 1
+        // A '\n' at `last` terminates the paragraph it belongs to.
+        val paragraphEnd = if (out[last] == '\n') last else nextNewlineFrom(out, last)
+        val paragraphStart = lastNewlineBefore(out, paragraphEnd) + 1
+        // The last paragraph of the text has no line past `paragraphEnd` to pad; JS never sends it.
+        if (paragraphEnd >= out.length) return
+        out.setSpan(
+            RunRowPaddingSpan(
+                paddingPx = padding,
+                rowStart = paragraphStart,
+                rowEnd = paragraphEnd,
+                padTop = false,
+                padBottom = true,
+            ),
+            paragraphStart,
+            paragraphEnd + 1,
+            Spannable.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+    }
+
+    /**
+     * A chip's painted rect in layout coordinates, or false when the range
+     * carries no `RunChipSpan` (prop skew) or has not laid out. `scratch` is
+     * overwritten: it is re-styled with the range's metric spans, the same
+     * ones the span's own `getSize` was measured under.
+     */
+    internal fun chipRect(
+        layout: Layout,
+        text: Spanned,
+        decoration: Decoration,
+        basePaint: TextPaint,
+        scratch: TextPaint,
+        out: RectF,
+    ): Boolean {
+        val length = text.length
+        val start = decoration.start.coerceIn(0, length)
+        val end = decoration.end.coerceIn(start, length)
+        if (end <= start) return false
+        val chip = text.getSpans(start, end, RunChipSpan::class.java).firstOrNull {
+            text.getSpanStart(it) == start && text.getSpanEnd(it) == end
+        } ?: return false
+        styleLike(text, start, end, basePaint, scratch)
+        val width = chip.getSize(scratch, text, start, end, null).toFloat()
+        val line = layout.getLineForOffset(start)
+        val x = layout.getPrimaryHorizontal(start)
+        val left = if (layout.isRtlCharAt(start)) x - width else x
+        val baseline = layout.getLineBaseline(line).toFloat()
+        val metrics = scratch.fontMetrics
+        out.set(
+            left,
+            baseline + metrics.ascent - PixelUtil.toPixelFromDIP(decoration.paddingTop),
+            left + width,
+            baseline + metrics.descent + PixelUtil.toPixelFromDIP(decoration.paddingBottom),
+        )
+        return true
+    }
+
+    /** `paint` as the text stack would style `[start, end)` for measuring: metric spans in insertion order. */
+    internal fun styleLike(text: Spanned, start: Int, end: Int, base: TextPaint, paint: TextPaint) {
+        paint.set(base)
+        for (span in text.getSpans(start, end, MetricAffectingSpan::class.java)) {
+            if (span is ReplacementSpan) continue
+            if (text.getSpanStart(span) > start || text.getSpanEnd(span) <= start) continue
+            span.updateMeasureState(paint)
+        }
+    }
+
+    /**
+     * Layout and TextLine split a `ReplacementSpan` at every metric-span
+     * boundary inside it and ask each piece separately. Only the piece at the
+     * span's own start answers, for the whole range: its end is returned, and
+     * -1 for a continuation piece (zero width, draws nothing).
+     */
+    internal fun replacementEnd(span: Any, text: CharSequence?, start: Int, end: Int): Int {
+        if (text !is Spanned) return end
+        val spanStart = text.getSpanStart(span)
+        if (spanStart < 0) return end
+        if (start > spanStart) return -1
+        return maxOf(end, text.getSpanEnd(span))
+    }
+
+    /** ReplacementSpan bypasses character styles, including backgrounds and ordinary decoration lines. */
+    internal fun drawReplacementText(
+        canvas: Canvas, text: CharSequence, start: Int, end: Int,
+        x: Float, top: Int, baseline: Int, bottom: Int, base: Paint, paint: TextPaint,
+    ) {
+        val spanned = text as? Spanned
+        val rtl = TextDirectionHeuristics.FIRSTSTRONG_LTR.isRtl(text, start, end - start)
+        val width = base.getRunAdvance(text, start, end, start, end, rtl, end)
+        var from = start
+        while (from < end) {
+            val to = spanned?.nextSpanTransition(from, end, CharacterStyle::class.java) ?: end
+            paint.set(base)
+            paint.bgColor = 0
+            if (spanned != null) {
+                for (span in spanned.getSpans(from, to, CharacterStyle::class.java)) {
+                    if (span !is MetricAffectingSpan) span.updateDrawState(paint)
+                }
+            }
+            val lead = base.getRunAdvance(text, start, end, start, end, rtl, from)
+            val trail = base.getRunAdvance(text, start, end, start, end, rtl, to)
+            val left = x + if (rtl) width - trail else lead
+            val right = x + if (rtl) width - lead else trail
+            if (paint.bgColor != 0) {
+                val foreground = paint.color
+                paint.color = paint.bgColor
+                canvas.drawRect(left, top.toFloat(), right, bottom.toFloat(), paint)
+                paint.color = foreground
+            }
+            canvas.drawTextRun(text, from, to, start, end, left, baseline.toFloat(), rtl, paint)
+            from = to
+        }
+    }
+
+    /**
+     * `out` styled as the text stack styles one span run `[from, to)` of a
+     * replacement range: `base` (the paint the span was handed, which already
+     * carries the metric spans at the range's start) with its metric state
+     * reset to `unstyled`, then every span covering the run applied, except
+     * replacement spans. `draw` picks draw state (colours, backgrounds) over
+     * measure state; metric spans update both identically here.
+     */
+    internal fun styleRun(
+        text: Spanned?, from: Int, to: Int, base: Paint, unstyled: TextPaint, out: TextPaint, draw: Boolean,
+    ) {
+        if (base is TextPaint) out.set(base) else out.set(base)
+        out.textSize = unstyled.textSize
+        out.typeface = unstyled.typeface
+        out.letterSpacing = unstyled.letterSpacing
+        out.textSkewX = unstyled.textSkewX
+        out.textScaleX = unstyled.textScaleX
+        out.isFakeBoldText = unstyled.isFakeBoldText
+        out.baselineShift = unstyled.baselineShift
+        out.bgColor = 0
+        if (text == null) return
+        for (span in text.getSpans(from, to, CharacterStyle::class.java)) {
+            if (span is ReplacementSpan) continue
+            if (text.getSpanStart(span) > from || text.getSpanEnd(span) < to) continue
+            if (span is MetricAffectingSpan) {
+                if (draw) span.updateDrawState(out) else span.updateMeasureState(out)
+            } else if (draw) {
+                span.updateDrawState(out)
+            }
+        }
+    }
+
+    /** The innermost foreground colour over `start`, which a `ReplacementSpan`'s paint never receives. */
+    internal fun foregroundAt(text: CharSequence?, start: Int, end: Int, fallback: Int): Int {
+        if (text !is Spanned) return fallback
+        var color = fallback
+        for (span in text.getSpans(start, end, ForegroundColorSpan::class.java)) {
+            if (text.getSpanStart(span) <= start && text.getSpanEnd(span) > start) {
+                color = span.foregroundColor
+            }
+        }
+        return color
     }
 
     /**
@@ -382,5 +608,162 @@ internal class RunRowPaddingSpan(
             fm.bottom += paddingPx
             fm.descent += paddingPx
         }
+    }
+}
+
+/**
+ * A 'chip': reserves `paddingH` on each side (and `minWidth`'s shortfall,
+ * split evenly) so the chip never overlaps its neighbours, and draws the text
+ * centred. The fill and border are painted by the host behind the text
+ * (`SelectableRunHostView`), where its pressed state can paint over the fill.
+ * Atomic, so a chip never breaks across lines.
+ */
+internal class RunChipSpan(
+    private val paddingHPx: Float,
+    private val minWidthPx: Float,
+    unstyled: TextPaint,
+) : ReplacementSpan() {
+
+    /** The run's base paint before any span: per-run styling starts from its metric state. Read-only. */
+    private val unstyled = TextPaint(unstyled)
+
+    /** UI-thread only: `draw` never runs on the measure path. */
+    private val drawPaint = TextPaint(TextPaint.ANTI_ALIAS_FLAG)
+
+    override fun getSize(
+        paint: Paint,
+        text: CharSequence?,
+        start: Int,
+        end: Int,
+        fm: Paint.FontMetricsInt?,
+    ): Int {
+        if (fm != null) paint.getFontMetricsInt(fm)
+        val full = RunDecorations.replacementEnd(this, text, start, end)
+        if (full < 0) return 0
+        val textWidth = if (text == null) 0f else textWidth(paint, text, start, full, measurePaint.get()!!)
+        return ceil(maxOf(minWidthPx, textWidth + 2f * paddingHPx).toDouble()).toInt()
+    }
+
+    /** The chip's text measured run by run, so nested marks (a bold word, a size) keep their widths. */
+    private fun textWidth(base: Paint, text: CharSequence, start: Int, end: Int, scratch: TextPaint): Float {
+        val spanned = text as? Spanned
+        var width = 0f
+        var from = start
+        while (from < end) {
+            val to = spanned?.nextSpanTransition(from, end, CharacterStyle::class.java) ?: end
+            RunDecorations.styleRun(spanned, from, to, base, unstyled, scratch, draw = false)
+            width += scratch.measureText(text, from, to)
+            from = to
+        }
+        return width
+    }
+
+    override fun draw(
+        canvas: Canvas,
+        text: CharSequence?,
+        start: Int,
+        end: Int,
+        x: Float,
+        top: Int,
+        y: Int,
+        bottom: Int,
+        paint: Paint,
+    ) {
+        if (text == null) return
+        val full = RunDecorations.replacementEnd(this, text, start, end)
+        if (full < 0) return
+        val size = getSize(paint, text, start, end, null)
+        val textWidth = textWidth(paint, text, start, full, drawPaint)
+        val spanned = text as? Spanned
+        val rtl = TextDirectionHeuristics.FIRSTSTRONG_LTR.isRtl(text, start, full - start)
+        val left = x + (size - textWidth) / 2f
+        var edge = if (rtl) left + textWidth else left
+        var from = start
+        while (from < full) {
+            val to = spanned?.nextSpanTransition(from, full, CharacterStyle::class.java) ?: full
+            RunDecorations.styleRun(spanned, from, to, paint, unstyled, drawPaint, draw = true)
+            val width = drawPaint.measureText(text, from, to)
+            val runLeft = if (rtl) edge - width else edge
+            if (drawPaint.bgColor != 0) {
+                val foreground = drawPaint.color
+                drawPaint.color = drawPaint.bgColor
+                canvas.drawRect(runLeft, top.toFloat(), runLeft + width, bottom.toFloat(), drawPaint)
+                drawPaint.color = foreground
+            }
+            canvas.drawTextRun(text, from, to, from, to, runLeft, y.toFloat(), rtl, drawPaint)
+            edge = if (rtl) edge - width else edge + width
+            from = to
+        }
+    }
+
+    private companion object {
+        /** `getSize` runs on the measure thread(s) and the UI thread over the same cached span. */
+        val measurePaint = object : ThreadLocal<TextPaint>() {
+            override fun initialValue(): TextPaint = TextPaint(TextPaint.ANTI_ALIAS_FLAG)
+        }
+    }
+}
+
+/**
+ * A list marker column: the marker glyphs take at least `minWidth`, drawn at
+ * the leading edge, so an item's first-line text starts where its wrapped
+ * lines hang. With a dot, the dot is drawn there too; JS hides the glyphs by
+ * colour, so they still select and copy.
+ */
+internal class RunMarkerSpan(
+    private val minWidthPx: Float,
+    private val dotSizePx: Float,
+    private val dotColor: Int?,
+    private val rtl: Boolean,
+) : ReplacementSpan() {
+
+    private val drawPaint = TextPaint(TextPaint.ANTI_ALIAS_FLAG)
+    private val xBounds = Rect()
+
+    override fun getSize(
+        paint: Paint,
+        text: CharSequence?,
+        start: Int,
+        end: Int,
+        fm: Paint.FontMetricsInt?,
+    ): Int {
+        if (fm != null) paint.getFontMetricsInt(fm)
+        val full = RunDecorations.replacementEnd(this, text, start, end)
+        if (full < 0) return 0
+        val textWidth = if (text == null) 0f else paint.measureText(text, start, full)
+        return ceil(maxOf(minWidthPx, textWidth).toDouble()).toInt()
+    }
+
+    override fun draw(
+        canvas: Canvas,
+        text: CharSequence?,
+        start: Int,
+        end: Int,
+        x: Float,
+        top: Int,
+        y: Int,
+        bottom: Int,
+        paint: Paint,
+    ) {
+        if (text == null) return
+        val full = RunDecorations.replacementEnd(this, text, start, end)
+        if (full < 0) return
+        val size = getSize(paint, text, start, end, null).toFloat()
+        val textWidth = paint.measureText(text, start, full)
+        val foreground = RunDecorations.foregroundAt(text, start, full, paint.color)
+        RunDecorations.drawReplacementText(
+            canvas, text, start, full, if (rtl) x + size - textWidth else x, top, y, bottom, paint, drawPaint,
+        )
+        if (dotSizePx <= 0f) return
+        paint.getTextBounds("x", 0, 1, xBounds)
+        val radius = dotSizePx / 2f
+        drawPaint.color = dotColor ?: foreground
+        drawPaint.style = Paint.Style.FILL
+        canvas.drawCircle(
+            if (rtl) x + size - radius else x + radius,
+            y + xBounds.top / 2f,
+            radius,
+            drawPaint,
+        )
     }
 }

@@ -1,5 +1,6 @@
-import type { ProjectedRun } from '../selection/mapSelection';
+import type { ProjectedRun, RunMark } from '../selection/mapSelection';
 import type { MarkdownTheme } from './theme';
+import { bulletGlyph } from './theme';
 
 /**
  * Block chrome for the native selection host.
@@ -36,7 +37,7 @@ export interface RunDecoration {
    */
   start: number;
   end: number;
-  kind: 'box' | 'rule' | 'columns' | 'indent';
+  kind: 'box' | 'rule' | 'columns' | 'indent' | 'chip' | 'marker' | 'spacing';
   /** Box fill / rule colour. Any colour string React Native accepts. */
   color?: string;
   /** Box border. Absent = no border stroke. */
@@ -127,6 +128,16 @@ export interface RunDecoration {
    * older binary ignores it and rows abut as before.
    */
   rowPaddingV?: number;
+  /** 'chip' only: horizontal room reserved on each side of the range. Layout-affecting. */
+  paddingH?: number;
+  /**
+   * 'chip' and 'marker': the least advance the range takes. A narrower chip
+   * centres its text; a narrower marker keeps its glyphs at the leading edge,
+   * so the item's text starts at a fixed column. Layout-affecting.
+   */
+  minWidth?: number;
+  /** 'marker' only: diameter of the dot drawn in `color` in place of the (hidden) glyphs. */
+  dotSize?: number;
 }
 
 /**
@@ -243,29 +254,37 @@ export function resolveRunDecorations(
       case 'table': {
         const padH = theme.table.cellPaddingH;
         const base = quoteInset(mark.start, mark.end);
+        const hiddenHeaderEnd = emptyHeaderEnd(mark, projected.text, theme);
         const border: RunDecoration = {
           start: mark.start,
           end: mark.end,
           kind: 'box',
-          borderColor: theme.colors.border,
-          borderWidth: theme.table.borderWidth,
           borderRadius: theme.table.borderRadius,
           textInset: padH + base,
           paddingTop: theme.table.cellPaddingV,
           paddingBottom: theme.table.cellPaddingV,
         };
+        if (theme.table.frame) {
+          border.borderColor = theme.table.frameColor ?? theme.colors.border;
+          border.borderWidth = theme.table.borderWidth;
+        }
         if (base > 0) {
           border.inset = base;
         }
         out.push(border);
-        out.push({
-          start: mark.start,
-          end: mark.end,
-          kind: 'columns',
-          gap: padH * 2,
-          textInset: padH + base,
-          rowPaddingV: theme.table.cellPaddingV,
-        });
+        // A hidden header row stays out of the columns, so no row padding
+        // opens below it.
+        const columnsStart = hiddenHeaderEnd ?? mark.start;
+        if (columnsStart < mark.end) {
+          out.push({
+            start: columnsStart,
+            end: mark.end,
+            kind: 'columns',
+            gap: padH * 2,
+            textInset: padH + base,
+            rowPaddingV: theme.table.cellPaddingV,
+          });
+        }
         // One rule per row boundary. Every '\n' inside the table range is one:
         // rows are single projected lines (ROW_SEPARATOR in mapSelection.ts)
         // and cells cannot contain newlines — a literal newline ends a GFM
@@ -273,13 +292,14 @@ export function resolveRunDecorations(
         // Anchored to the first character AFTER the separator with
         // align 'top', so a row that wraps still gets its rule at the row
         // boundary rather than under every wrapped line.
-        for (let i = mark.start; i < mark.end; i += 1) {
+        const ruleColor = theme.table.ruleColor ?? theme.colors.border;
+        for (let i = columnsStart; i < mark.end; i += 1) {
           if (projected.text.charCodeAt(i) === 10 /* '\n' */) {
             const rule: RunDecoration = {
               start: i + 1,
               end: i + 1,
               kind: 'rule',
-              color: theme.colors.border,
+              color: ruleColor,
               thickness: theme.table.rowRuleThickness,
               align: 'top',
             };
@@ -294,6 +314,7 @@ export function resolveRunDecorations(
         break;
       }
       case 'tableHeader': {
+        if (isEmptyHeader(mark, projected.text, theme)) break;
         // The band's top padding matches the table box's so the two share a
         // top edge; its bottom padding is zero because the band must end
         // exactly where the first row rule sits — the bottom of the header
@@ -331,7 +352,7 @@ export function resolveRunDecorations(
           start: mark.start,
           end: mark.end,
           kind: 'rule',
-          color: theme.colors.border,
+          color: theme.rule.color ?? theme.colors.border,
           thickness: theme.rule.thickness,
           align: 'center',
           inset: theme.rule.inset + quoteInset(mark.start, mark.end),
@@ -344,10 +365,14 @@ export function resolveRunDecorations(
 
   // Paragraph insets, from the 'listItem' and 'blockquote' marks. One
   // 'indent' per flattened segment: a list item's first line at the marker
-  // column, wrapped lines hanging one `listIndent` deeper so they align
-  // under the item's text rather than under its bullet; every enclosing
-  // blockquote pushes the whole segment `quoteStep` further from the bar.
-  const step = theme.spacing.listIndent;
+  // column, wrapped lines hanging one step deeper so they align under the
+  // item's text rather than under its bullet; every enclosing blockquote
+  // pushes the whole segment `quoteStep` further from the bar.
+  const pinned = markerColumnWidth(theme);
+  const step = pinned ?? theme.spacing.listIndent;
+  if (pinned !== undefined) {
+    pushMarkerColumns(projected, theme, pinned, out);
+  }
   for (const segment of insetSegments(projected)) {
     const base = segment.quoteDepth * quoteStep;
     out.push({
@@ -357,6 +382,68 @@ export function resolveRunDecorations(
       textInset: base + (segment.level > 0 ? (segment.level - 1) * step : 0),
       hang: segment.level > 0 ? step : 0,
     });
+  }
+  return out;
+}
+
+/**
+ * The marker column width when the theme pins one: `list.hangingIndent`, or
+ * a dot marker's `size + gap`.
+ */
+export function markerColumnWidth(theme: MarkdownTheme): number | undefined {
+  const { hangingIndent, marker } = theme.list;
+  if (hangingIndent !== undefined) return hangingIndent;
+  if (marker?.kind === 'dot') return marker.size + marker.gap;
+  return undefined;
+}
+
+function pushMarkerColumns(
+  projected: ProjectedRun,
+  theme: MarkdownTheme,
+  width: number,
+  out: RunDecoration[],
+): void {
+  const marker = theme.list.marker;
+  const bullet = bulletGlyph(theme);
+  for (const mark of projected.marks) {
+    if (mark.kind !== 'listMarker') continue;
+    const column: RunDecoration = {
+      start: mark.start,
+      end: mark.end,
+      kind: 'marker',
+      minWidth: width,
+    };
+    if (marker?.kind === 'dot' && projected.text.slice(mark.start, mark.end) === bullet) {
+      column.dotSize = marker.size;
+      column.color = marker.color ?? theme.colors.listMarker ?? theme.colors.text;
+    }
+    out.push(column);
+  }
+}
+
+/** The header row's end (just past its '\n') when `hideEmptyHeader` collapses it. */
+function emptyHeaderEnd(table: RunMark, text: string, theme: MarkdownTheme): number | undefined {
+  if (!theme.table.hideEmptyHeader) return undefined;
+  const newline = text.indexOf('\n', table.start);
+  if (newline < 0 || newline >= table.end) return undefined;
+  return /^[\t ]*$/.test(text.slice(table.start, newline)) ? newline + 1 : undefined;
+}
+
+function isEmptyHeader(header: RunMark, text: string, theme: MarkdownTheme): boolean {
+  return theme.table.hideEmptyHeader && /^[\t ]*$/.test(text.slice(header.start, header.end));
+}
+
+/** Collapses a hidden header row to a hairline, for `resolveRunAttributes`' `extra`. */
+export function hiddenHeaderLines(
+  projected: ProjectedRun,
+  theme: MarkdownTheme,
+): { start: number; end: number; lineHeight: number }[] {
+  if (!theme.table.hideEmptyHeader) return [];
+  const out: { start: number; end: number; lineHeight: number }[] = [];
+  for (const mark of projected.marks) {
+    if (mark.kind !== 'table') continue;
+    const end = emptyHeaderEnd(mark, projected.text, theme);
+    if (end !== undefined) out.push({ start: mark.start, end, lineHeight: 0.01 });
   }
   return out;
 }

@@ -691,6 +691,43 @@ describe('projectRun', () => {
       null,
       { start: 26, end: 27 },
     ]);
+    // 'tableBody' covers the body rows only, so body typography cannot reach the header.
+    expect(
+      projected.marks.map((m) => [m.kind, projected.text.slice(m.start, m.end)]),
+    ).toEqual([
+      ['table', 'a\tb\nc\td'],
+      ['tableHeader', 'a\tb'],
+      ['tableBody', 'c\td'],
+    ]);
+  });
+
+  it('spans every body row with one tableBody mark, and emits none without rows', () => {
+    const source = '| a |\n| - |\n| b |\n| c |';
+    const row = (value: string): TableNode['header'] => ({
+      kind: 'tableRow',
+      span: spanOf(source, `| ${value} |`),
+      cells: [{ kind: 'tableCell', span: spanOf(source, value), children: [textNode(source, value)] }],
+    });
+    const table = (rows: TableNode['rows']): TableNode => ({
+      kind: 'table',
+      align: [null],
+      span: { start: 0, end: source.length },
+      header: row('a'),
+      rows,
+    });
+    const withRows = makeDoc(source, [table([row('b'), row('c')])]);
+    const projected = projectRun(segmentRuns(withRows)[0], withRows);
+    expect(projected.text).toBe('a\nb\nc');
+    expect(
+      projected.marks
+        .filter((m) => m.kind === 'tableBody')
+        .map((m) => projected.text.slice(m.start, m.end)),
+    ).toEqual(['b\nc']);
+
+    const headerOnly = makeDoc(source, [table([])]);
+    const bare = projectRun(segmentRuns(headerOnly)[0], headerOnly);
+    expect(bare.text).toBe('a');
+    expect(bare.marks.map((m) => m.kind).sort()).toEqual(['table', 'tableHeader']);
   });
 
   it('keeps a decoded entity as a whole-span piece and maps alt text into images', () => {

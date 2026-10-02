@@ -56,7 +56,8 @@ NS_ASSUME_NONNULL_BEGIN
  * gets drawn.
  *
  * `fontSizeMultiplier` is LayoutContext::fontSizeMultiplier, never a fresh
- * RCTFontSizeMultiplier() read; it scales font sizes and line heights only.
+ * RCTFontSizeMultiplier() read; it scales font sizes, line heights and letter
+ * spacing only, after `allowFontScaling` / `maxFontSizeMultiplier` resolve it.
  */
 + (NSAttributedString *)attributedStringWithProps:
     (const facebook::react::SelectableRunHostProps &)props

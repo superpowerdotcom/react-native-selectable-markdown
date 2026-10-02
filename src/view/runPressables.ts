@@ -43,6 +43,15 @@ export interface RunPressable {
    * `onLinkPress` ever sees it.
    */
   blocked?: true;
+  /** Announced instead of the range's text. */
+  accessibilityLabel?: string;
+  /** Default 'link'. 'text' stays tappable but is read as part of the prose. */
+  accessibilityRole?: 'link' | 'button' | 'text';
+  /** Fill painted behind the range (or its chip) while a touch is down on it. */
+  pressedColor?: string;
+  pressedRadius?: number;
+  /** Points added on every side of the tap target; selection is unaffected. */
+  hitSlop?: number;
 }
 
 /**

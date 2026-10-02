@@ -9,7 +9,8 @@ import type { EmbedLookup, RunSegment } from '../selection/runs';
 
 /**
  * Projects a growing run by extending its last projection with the appended
- * blocks. Hold one per run; a change of glyphs or `embed` reprojects in full.
+ * blocks. Hold one per run; a change of glyphs, `embed`, `softBreak` or
+ * `recordBlocks` reprojects in full.
  */
 export interface RunProjectionCache {
   project(
@@ -26,6 +27,9 @@ interface Entry {
   taskChecked: string | undefined;
   taskUnchecked: string | undefined;
   embed: EmbedLookup | undefined;
+  softBreak: ProjectRunOptions['softBreak'];
+  recordBlocks: boolean;
+  transformInline: ProjectRunOptions['transformInline'];
 }
 
 export function createRunProjectionCache(): RunProjectionCache {
@@ -38,6 +42,9 @@ export function createRunProjectionCache(): RunProjectionCache {
       const taskChecked = glyphs?.taskChecked;
       const taskUnchecked = glyphs?.taskUnchecked;
       const embed = options?.embed;
+      const softBreak = options?.softBreak;
+      const recordBlocks = options?.recordBlocks === true;
+      const transformInline = options?.transformInline;
       // Glyph values, not their object: `SelectableMarkdown` rebuilds it every render.
       let previous: PreviousProjection | undefined;
       if (
@@ -45,11 +52,21 @@ export function createRunProjectionCache(): RunProjectionCache {
         entry.bullet === bullet &&
         entry.taskChecked === taskChecked &&
         entry.taskUnchecked === taskUnchecked &&
-        entry.embed === embed
+        entry.embed === embed &&
+        entry.softBreak === softBreak &&
+        entry.recordBlocks === recordBlocks &&
+        entry.transformInline === transformInline
       ) {
         previous = { blocks: entry.blocks, projected: entry.projected };
       }
-      const projected = projectRun(run, doc, { glyphs, embed, previous });
+      const projected = projectRun(run, doc, {
+        glyphs,
+        embed,
+        previous,
+        softBreak,
+        recordBlocks,
+        transformInline,
+      });
       entry = {
         blocks: run.blocks,
         projected,
@@ -57,6 +74,9 @@ export function createRunProjectionCache(): RunProjectionCache {
         taskChecked,
         taskUnchecked,
         embed,
+        softBreak,
+        recordBlocks,
+        transformInline,
       };
       return projected;
     },

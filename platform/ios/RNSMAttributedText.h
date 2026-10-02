@@ -48,7 +48,8 @@ extern NSString *const RNSMSemanticRoleKey;
  *
  * `attributes` is an array of sparse dictionaries with `start`/`end` (UTF-16
  * offsets into `text`, end-exclusive) plus any of `fontFamily`, `fontSize`,
- * `lineHeight`, `fontWeight`, `fontStyle`, `textDecorationLine`, `color`,
+ * `lineHeight`, `fontWeight`, `fontStyle`, `textDecorationLine`,
+ * `textDecorationStyle`, `textDecorationColor`, `letterSpacing`, `color`,
  * `backgroundColor`. They are applied in array order, so a later entry
  * overriding an earlier one is how nesting is expressed — JS sends them
  * outermost-first. Each entry carries only what its construct changes and
@@ -69,7 +70,12 @@ extern NSString *const RNSMSemanticRoleKey;
  *     with tabs" into aligned table columns;
  *   - an 'indent' entry is a list item's indentation: first lines at
  *     `textInset`, wrapped lines `hang` deeper so they hang under the item's
- *     text rather than its bullet.
+ *     text rather than its bullet;
+ *   - a 'chip' reserves `paddingH` (plus `minWidth`'s shortfall) on each side
+ *     of its range as kern, and a 'marker' widens its range to `minWidth` the
+ *     same way;
+ *   - a 'spacing' entry adds `paddingBottom` of paragraph spacing after the
+ *     paragraph holding its last character.
  *
  * All of it moves where glyphs sit and never which glyphs exist, so the
  * UTF-16 offset contract is untouched.
@@ -110,6 +116,14 @@ extern NSString *const RNSMSemanticRoleKey;
  * box at the run's edge needs; the measurer adds it and the host offsets by `top`.
  */
 + (UIEdgeInsets)runEdgeInsetsOfAttributedString:(nullable NSAttributedString *)string;
+
+/**
+ * `[lead, trail, width]` of the 'chip' decoration covering `index`, exactly as
+ * the builder reserved them (natural text width, room before and after), or
+ * nil where no chip was built.
+ */
++ (nullable NSArray<NSNumber *> *)chipMetricsOfAttributedString:(nullable NSAttributedString *)string
+                                                          atIndex:(NSInteger)index;
 
 /**
  * Ranges JS gave a known screen-reader role, in document order. Level, row and

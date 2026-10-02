@@ -18,7 +18,6 @@ import android.text.style.UnderlineSpan
 import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.bridge.ReadableType
-import com.facebook.react.uimanager.PixelUtil
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.min
@@ -54,8 +53,14 @@ object RunAttributedText {
          * range says nothing about weight. */
         val fontWeight: Int?,
         val italic: Boolean,
-        val underline: Boolean,
-        val strikethrough: Boolean,
+        /** null inherits, "none" clears the enclosing line. */
+        val decorationLine: String?,
+        /** Underline / strike colour; null = the foreground colour. */
+        val decorationColor: Int?,
+        /** null inherits; 'solid' explicitly resets the pattern. */
+        val decorationStyle: String?,
+        /** Points (SP-scaled like `fontSizeSp`); null = none. */
+        val letterSpacingSp: Float?,
         val color: Int?,
         val backgroundColor: Int?,
         /** Screen-reader role from `RunSemanticRole` in src/view/runAttributes.ts; never becomes a span. */
@@ -84,7 +89,8 @@ object RunAttributedText {
         internal val layoutAttributes: List<Attribute> by lazy(LazyThreadSafetyMode.PUBLICATION) {
             attributes.filter { it.fontFamily != null || it.fontSizeSp != null ||
                 it.lineHeightSp != null || it.fontWeight != null || it.italic ||
-                it.underline || it.strikethrough || it.color != null || it.backgroundColor != null
+                it.decorationLine != null || it.color != null || it.backgroundColor != null ||
+                it.decorationColor != null || it.decorationStyle != null || it.letterSpacingSp != null
             }.map { it.copy(role = null, roleLevel = null, roleRow = null,
                 roleRowCount = null, roleColumn = null, roleColumnCount = null) }
         }
@@ -134,8 +140,16 @@ object RunAttributedText {
             },
             fontWeight = parseFontWeight(optString(entry, "fontWeight")),
             italic = optString(entry, "fontStyle") == "italic",
-            underline = decoration == "underline",
-            strikethrough = decoration == "line-through",
+            decorationLine = decoration?.takeIf { it == "underline" || it == "line-through" || it == "none" },
+            decorationColor = optInt(entry, "textDecorationColor"),
+            decorationStyle = optString(entry, "textDecorationStyle")
+                ?.takeIf { it == "solid" || it == "double" || it == "dotted" || it == "dashed" },
+            // 0 is the wire's absent sentinel.
+            letterSpacingSp = if (entry.hasKey("letterSpacing") && entry.getType("letterSpacing") == ReadableType.Number) {
+                entry.getDouble("letterSpacing").toFloat().takeIf { it != 0f && it.isFinite() }
+            } else {
+                null
+            },
             // JS ran these through processColor, so they arrive as packed
             // 0xAARRGGBB integers — which is what lets a consumer theme use
             // any colour format React Native accepts.
@@ -205,18 +219,24 @@ object RunAttributedText {
      * function follows. Block separation is what keeps that from leaking:
      * `mapSelection` joins blocks with '\n\n', so a heading is its own
      * paragraph and its span is not even offered to the paragraph below it.
+     *
+     * Internal because `RunFontScaling` is: a public signature may not expose it.
      */
-    fun build(
+    internal fun build(
         text: String,
         spec: Spec,
         decorations: RunDecorations.Spec = RunDecorations.Spec.EMPTY,
         embeds: RunEmbeds.Spec = RunEmbeds.Spec.EMPTY,
+        scaling: RunFontScaling = RunFontScaling.DEFAULT,
     ): Spannable {
         val out = SpannableString(text)
         if (text.isEmpty()) return out
         // JS emits properly nested ranges outermost-first, so popping by start leaves what still covers
         // an entry; only font-bearing entries join, since table-cell and embed entries arrive out of order.
         val fontStack = ArrayList<FontFrame>()
+        val lineStyles = RunLineStyles(text.length)
+        // Set after every size span: the span divides by the paint's final size, so an inner size range keeps the declared points.
+        val letterSpacing = ArrayList<Triple<RunLetterSpacingSpan, Int, Int>>(0)
         for (attribute in spec.attributes) {
             // Clamp: offsets were computed against the text JS sent, which
             // under prop skew can differ in length from the text in hand.
@@ -252,7 +272,7 @@ object RunAttributedText {
             }
             attribute.fontSizeSp?.let {
                 out.setSpan(
-                    AbsoluteSizeSpan(PixelUtil.toPixelFromSP(it).toInt()),
+                    AbsoluteSizeSpan(scaling.toPixel(it).toInt()),
                     start,
                     end,
                     flags,
@@ -260,7 +280,7 @@ object RunAttributedText {
             }
             attribute.lineHeightSp?.let {
                 out.setSpan(
-                    RunLineHeightSpan(PixelUtil.toPixelFromSP(it)),
+                    RunLineHeightSpan(scaling.toPixel(it)),
                     start,
                     end,
                     flags,
@@ -275,12 +295,24 @@ object RunAttributedText {
                 }
             }
             if (attribute.italic) out.setSpan(StyleSpan(Typeface.ITALIC), start, end, flags)
-            if (attribute.underline) out.setSpan(UnderlineSpan(), start, end, flags)
-            if (attribute.strikethrough) out.setSpan(StrikethroughSpan(), start, end, flags)
+            attribute.letterSpacingSp?.let {
+                letterSpacing.add(Triple(RunLetterSpacingSpan(scaling.toPixel(it)), start, end))
+            }
+            lineStyles.apply(start, end, attribute.decorationLine, attribute.decorationStyle, attribute.decorationColor)
             attribute.color?.let { out.setSpan(ForegroundColorSpan(it), start, end, flags) }
             attribute.backgroundColor?.let {
                 out.setSpan(BackgroundColorSpan(it), start, end, flags)
             }
+        }
+        for (range in lineStyles.ranges()) {
+            val strike = range.line == "line-through"
+            val span = if (range.color != null || (range.style != null && range.style != "solid")) {
+                RunDecorationLineSpan(strike, range.color, range.style)
+            } else if (strike) StrikethroughSpan() else UnderlineSpan()
+            out.setSpan(span, range.start, range.end, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        for ((span, start, end) in letterSpacing) {
+            out.setSpan(span, start, end, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
 
         // After the attribute line heights it may raise, before the decoration row padding that adjusts them.
@@ -294,7 +326,7 @@ object RunAttributedText {
         // here the width it lays out at there.
         if (decorations.decorations.isNotEmpty()) {
             val paint = TextPaint(TextPaint.ANTI_ALIAS_FLAG)
-            RunTextMeasure.configurePaint(paint, RunTextMeasure.baseTextSizeSp(text, spec))
+            RunTextMeasure.configurePaint(paint, RunTextMeasure.baseTextSizeSp(text, spec), scaling)
             RunDecorations.applyLayoutSpans(out, decorations, paint)
         }
 
@@ -373,6 +405,33 @@ internal class RunFontWeightSpan(private val weight: Int) : MetricAffectingSpan(
         paint.typeface = Typeface.create(base, weight, base.isItalic)
     }
 }
+
+/**
+ * `letterSpacing` in points, resolved to the paint's em unit against the size
+ * in force where this span applies (`build` sets these after every size span),
+ * as RN's `CustomLetterSpacingSpan` does. `Paint.letterSpacing` is API 21, under minSdk.
+ */
+internal class RunLetterSpacingSpan(private val spacingPx: Float) : MetricAffectingSpan() {
+
+    override fun updateMeasureState(paint: TextPaint) = update(paint)
+
+    override fun updateDrawState(paint: TextPaint) = update(paint)
+
+    private fun update(paint: TextPaint) {
+        if (paint.textSize > 0f) paint.letterSpacing = spacingPx / paint.textSize
+    }
+}
+
+/**
+ * An underline or strike line with a colour or a non-solid style: inert
+ * here, painted by `SelectableRunHostView` off the laid-out text, because
+ * Android's text stack draws only solid foreground-coloured lines.
+ */
+internal class RunDecorationLineSpan(
+    val strike: Boolean,
+    val color: Int?,
+    val style: String?,
+)
 
 /**
  * Absolute line height for the lines a range covers.

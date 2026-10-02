@@ -38,8 +38,12 @@ export interface EngineOptions {
    * resolves to false. Use {@link withOptions} to override one and keep the rest.
    */
   extensions?: Partial<ExtensionFlags>;
-  /** Default 'strip'. */
-  html?: 'strip' | 'raw';
+  /**
+   * Default 'strip'. The object form keeps an allow-list of tags as real
+   * nodes (`a`, `br`, `strong`, `b`, `em`, `i`, `s`, `del`, `strike`, `u`,
+   * `ins`, `code`) and treats every other tag as `other` (default 'strip').
+   */
+  html?: 'strip' | 'raw' | { allow: readonly string[]; other?: 'strip' | 'raw' };
   /** Default false. */
   smartPunctuation?: boolean;
   urlPolicy?: {
@@ -57,7 +61,12 @@ export interface EngineOptions {
 
 export interface ResolvedEngineOptions {
   extensions: ExtensionFlags;
+  /** What the engine is asked for: 'raw' whenever an allow-list is set. */
   html: 'strip' | 'raw';
+  /** Tags `parseDocument` turns into nodes after the engine; empty by default. */
+  htmlAllow: readonly string[];
+  /** The treatment of tags outside `htmlAllow` when it is set. */
+  htmlOther: 'strip' | 'raw';
   smartPunctuation: boolean;
   urlPolicy: {
     linkPrefixes: string[];
@@ -90,7 +99,9 @@ export const DEFAULT_IMAGE_PREFIXES: readonly string[] = ['https://'];
 export function resolveOptions(o?: EngineOptions): ResolvedEngineOptions {
   return {
     extensions: { ...NO_EXTENSIONS, ...o?.extensions },
-    html: o?.html ?? 'strip',
+    html: typeof o?.html === 'object' ? 'raw' : (o?.html ?? 'strip'),
+    htmlAllow: typeof o?.html === 'object' ? [...o.html.allow] : [],
+    htmlOther: typeof o?.html === 'object' ? (o.html.other ?? 'strip') : 'strip',
     smartPunctuation: o?.smartPunctuation ?? false,
     urlPolicy: {
       linkPrefixes: [

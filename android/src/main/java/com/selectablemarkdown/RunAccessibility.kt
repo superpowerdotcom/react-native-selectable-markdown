@@ -45,6 +45,8 @@ internal object RunAccessibility {
 
         val nodes = ArrayList<RunAccessibilityNode>(pressables.size + 1)
         for (pressable in pressables) {
+            // Role 'text': still tappable, but read as part of the prose around it.
+            if (pressable.accessibilityRole == "text") continue
             val start = pressable.start.coerceIn(0, length)
             val end = pressable.end.coerceIn(start, length)
             if (end <= start) continue
@@ -219,12 +221,17 @@ internal class RunAccessibilityHelper(
             node.setBoundsInParent(Rect(0, 0, 1, 1))
             return
         }
-        node.contentDescription = textOf(range)
+        node.contentDescription = range.pressable?.accessibilityLabel ?: textOf(range)
         bounds.offset(textView.scrollX, textView.scrollY)
         node.setBoundsInParent(bounds)
         if (range.pressable != null) {
-            node.className = "android.widget.TextView"
-            node.roleDescription = textView.context.getString(com.facebook.react.R.string.link_description)
+            if (range.pressable.accessibilityRole == "button") {
+                // The class name is what TalkBack announces as "Button"; no role description needed.
+                node.className = "android.widget.Button"
+            } else {
+                node.className = "android.widget.TextView"
+                node.roleDescription = textView.context.getString(com.facebook.react.R.string.link_description)
+            }
             node.isClickable = true
             node.addAction(AccessibilityNodeInfoCompat.ACTION_CLICK)
             return

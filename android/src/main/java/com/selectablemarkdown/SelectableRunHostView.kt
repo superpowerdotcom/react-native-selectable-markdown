@@ -10,6 +10,7 @@ import android.view.Menu
 import android.view.MenuItem
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.accessibility.AccessibilityManager
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -20,6 +21,7 @@ import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.bridge.ReadableType
 import com.facebook.react.uimanager.PixelUtil
+import com.facebook.react.uimanager.RootView
 import com.facebook.react.uimanager.UIManagerHelper
 
 /**
@@ -36,9 +38,11 @@ import com.facebook.react.uimanager.UIManagerHelper
  *           UTF-16 code-unit offsets into the CURRENT `text`,
  *           end-exclusive, clamped, start <= end; `action` names the menu
  *           item the user tapped.
- *           `onInlinePress({ start, end, pressableId })` — a single tap
- *           landed inside one of `pressables`; same offset guarantees, and
- *           `pressableId` is JS's identifier for the range, echoed verbatim.
+ *           `onInlinePress({ start, end, pressableId, x, y, width, height })`
+ *           — a single tap (or accessibility activation) landed inside one of
+ *           `pressables`; same offset guarantees, `pressableId` is JS's
+ *           identifier for the range, echoed verbatim, and the rect is the
+ *           range's bounds in dp, in the space of a touch's `pageX`/`pageY`.
  *           `onSelectionChange({ start, end })` — deduped; same offset
  *           guarantees, except that an EMPTY range means nothing is selected.
  *   commands: `clearSelection()`, `setSelection(start, end)`, in the same offsets.
@@ -99,9 +103,17 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
             if (!readyForEvents) return
             // Report before coordinating, so a hand-off reaches JS as the new range, then the old run's empty one.
             emitSelectionChange()
+            if (selEnd > selStart) setPressedPressable(null)
             if (selEnd > selStart && exclusiveSelection) {
                 becomeActiveSelectionHost()
             }
+        }
+
+        /** Over the text, as the platform's own lines are, so a `BackgroundColorSpan` cannot hide them. */
+        override fun onDraw(canvas: android.graphics.Canvas) {
+            super.onDraw(canvas)
+            val textLayout = layout ?: return
+            drawDecorationLines(canvas, textLayout, totalPaddingLeft.toFloat(), totalPaddingTop.toFloat())
         }
 
         // The feeds ExploreByTouchHelper cannot install for itself.
@@ -142,6 +154,9 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
     private var pendingAttributes: RunAttributedText.Spec = RunAttributedText.Spec.EMPTY
     private var pendingDecorations: RunDecorations.Spec = RunDecorations.Spec.EMPTY
     private var pendingEmbeds: RunEmbeds.Spec = RunEmbeds.Spec.EMPTY
+    private var allowFontScaling = true
+    private var maxFontSizeMultiplier = 0f
+    private var pendingScaling: RunFontScaling = RunFontScaling.DEFAULT
     private var textDirty = false
 
     /** Separate from `textDirty`: a pressables-only update changes the accessibility ranges, never the text. */
@@ -172,6 +187,17 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
     private val decorationRect = android.graphics.RectF()
     private val decorationPath = android.graphics.Path()
     private val decorationRadii = FloatArray(8)
+    private val decorationTextPaint = android.text.TextPaint(android.text.TextPaint.ANTI_ALIAS_FLAG)
+    private val decorationBounds = android.graphics.Rect()
+    private var cachedDashEffect: android.graphics.DashPathEffect? = null
+    private var dashEffectOn = 0f
+    private var dashEffectOff = 0f
+
+    /** The pressable a live touch began on, painted with its `pressedColor` until the touch ends. */
+    private var pressedPressable: Pressable? = null
+    private var pressDownX = 0f
+    private var pressDownY = 0f
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
 
     private var selectionActions: List<ResolvedAction> = defaultSelectionActions()
 
@@ -183,6 +209,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
      * Empty whenever JS has no listener, which is what keeps every touch
      * below on its stock path in the common no-links case. */
     private var pressables: List<Pressable> = emptyList()
+    private var bandPressables: List<Pressable> = emptyList()
 
     /**
      * Detects the single taps `pressables` is hit-tested against. It only
@@ -203,6 +230,9 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
                 // event stream already went to the platform regardless.
                 return false
             }
+
+            // A long press is the selection gesture, never a press.
+            override fun onLongPress(e: MotionEvent) = setPressedPressable(null)
         },
     )
 
@@ -347,6 +377,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
     fun setDecorations(spec: RunDecorations.Spec) {
         if (spec.decorations == pendingDecorations.decorations) return
         pendingDecorations = spec
+        updateBandPressables()
         textDirty = true
         invalidate()
     }
@@ -364,6 +395,24 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         if (spec.embeds == pendingEmbeds.embeds) return
         pendingEmbeds = spec
         lastEmbedRects.clear()
+        textDirty = true
+    }
+
+    fun setAllowFontScaling(value: Boolean) {
+        allowFontScaling = value
+        updateScaling()
+    }
+
+    fun setMaxFontSizeMultiplier(value: Float) {
+        maxFontSizeMultiplier = value
+        updateScaling()
+    }
+
+    /** Every SP conversion in the build reads it, so a change rebuilds the text, as a font-scale change would. */
+    private fun updateScaling() {
+        val scaling = RunFontScaling.of(allowFontScaling, maxFontSizeMultiplier)
+        if (scaling == pendingScaling) return
+        pendingScaling = scaling
         textDirty = true
     }
 
@@ -403,12 +452,12 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         // widget's layout from the paint, so a run is never laid out under
         // the previous run's base size. The measure paths derive the same
         // value from the same two props (RunTextMeasure.baseTextSizeSp).
-        RunTextMeasure.updateTextViewBaseSize(textView, pendingText, pendingAttributes)
+        RunTextMeasure.updateTextViewBaseSize(textView, pendingText, pendingAttributes, pendingScaling)
         // Padding, so every `totalPaddingTop` conversion here moves with it; `RunTextMeasure.measure` reserved the same pixels.
         val edge = RunDecorations.edgePaddingPx(pendingDecorations, pendingText.length)
         textView.setPadding(0, edge.top, 0, edge.bottom)
         textView.text = RunLayoutCache.styledText(
-            RunLayoutCache.key(pendingText, pendingAttributes, pendingDecorations, pendingEmbeds)
+            RunLayoutCache.key(pendingText, pendingAttributes, pendingDecorations, pendingEmbeds, pendingScaling)
         )
         // The chrome is positioned off the text layout, so this ViewGroup's
         // own display list is stale the moment the text moves — and a child
@@ -464,10 +513,20 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
      * would drop a live selection (see setAttributes above for why that guard
      * discipline exists).
      */
-    fun setPressables(value: List<Pressable>) {
+    /** Internal: `Pressable` is, and a public signature may not expose it. */
+    internal fun setPressables(value: List<Pressable>) {
         if (value == pressables) return
         pressables = value
+        updateBandPressables()
         accessibilityDirty = true
+        setPressedPressable(null)
+    }
+
+    private fun updateBandPressables() {
+        val chips = pendingDecorations.decorations.filter { it.kind == "chip" }
+        bandPressables = pressables.filter { pressable ->
+            pressable.hitSlop > 0f || chips.any { it.start == pressable.start && it.end == pressable.end }
+        }
     }
 
     /** Resolved on arrival because OEM skins call `onPrepareActionMode` repeatedly while a selection is live. */
@@ -623,6 +682,23 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         val layout = textView.layout ?: return null
         val x = viewX - textView.left - textView.totalPaddingLeft + textView.scrollX
         val y = viewY - textView.top - textView.totalPaddingTop + textView.scrollY
+        exactPressableAt(layout, x, y)?.let { return it }
+        // By band too: `getOffsetForHorizontal` answers a chip's (atomic
+        // ReplacementSpan's) trailing half with its end offset. `hitSlop`
+        // widens only the tap target, per line the range covers.
+        for (pressable in bandPressables) {
+            val slop = PixelUtil.toPixelFromDIP(pressable.hitSlop)
+            val hit = anyLineRect(layout, pressable.start, pressable.end) { _, rect ->
+                rect.inset(-slop, -slop)
+                rect.contains(x, y)
+            }
+            if (hit) return pressable
+        }
+        return null
+    }
+
+    /** `x`/`y` in layout coordinates. */
+    private fun exactPressableAt(layout: android.text.Layout, x: Float, y: Float): Pressable? {
         if (y < 0f || y > layout.height.toFloat()) return null
         val line = layout.getLineForVertical(y.toInt())
         if (y < layout.getLineTop(line).toFloat() || y >= layout.getLineBottom(line).toFloat()) {
@@ -634,6 +710,52 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         // spans at an insertion offset: JS's resolveRunPressables keeps the
         // ranges disjoint, so the first hit is the only hit.
         return pressables.firstOrNull { offset >= it.start && offset < it.end }
+    }
+
+    /**
+     * Calls `test` with each line's band of `[start, end)` in layout
+     * coordinates (into the shared `decorationRect`), stopping at the first
+     * true. An end at a wrapped line's break resolves to the next line, so
+     * that line's edge stands in for it.
+     */
+    private inline fun anyLineRect(
+        layout: android.text.Layout,
+        start: Int,
+        end: Int,
+        test: (Int, android.graphics.RectF) -> Boolean,
+    ): Boolean {
+        val length = layout.text.length
+        val from = start.coerceIn(0, length)
+        val to = end.coerceIn(from, length)
+        if (to <= from) return false
+        val rect = decorationRect
+        for (line in layout.getLineForOffset(from)..layout.getLineForOffset(to - 1)) {
+            val lineStart = maxOf(from, layout.getLineStart(line))
+            val lineEnd = minOf(to, layout.getLineVisibleEnd(line))
+            if (lineEnd <= lineStart) continue
+            val a = layout.getPrimaryHorizontal(lineStart)
+            val b = if (lineEnd < layout.getLineEnd(line) || line == layout.lineCount - 1) {
+                layout.getPrimaryHorizontal(lineEnd)
+            } else if (layout.getParagraphDirection(line) == android.text.Layout.DIR_RIGHT_TO_LEFT) {
+                layout.getLineLeft(line)
+            } else {
+                layout.getLineRight(line)
+            }
+            rect.set(
+                minOf(a, b),
+                layout.getLineTop(line).toFloat(),
+                maxOf(a, b),
+                layout.getLineBottom(line).toFloat(),
+            )
+            if (test(line, rect)) return true
+        }
+        return false
+    }
+
+    private fun setPressedPressable(value: Pressable?) {
+        if (value === pressedPressable) return
+        pressedPressable = value
+        invalidate()
     }
 
     private fun emitInlinePress(pressable: Pressable) {
@@ -648,6 +770,10 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
 
         val reactContext = context as ReactContext
         val dispatcher = UIManagerHelper.getEventDispatcherForReactTag(reactContext, id) ?: return
+        // Empty bounds (no layout yet) report as zeros rather than dropping the press.
+        val bounds = android.graphics.RectF()
+        textView.layout?.let { pressableBounds(it, pressable, start, end, bounds) }
+        val origin = rootOrigin()
         dispatcher.dispatchEvent(
             InlinePressEvent(
                 UIManagerHelper.getSurfaceId(this),
@@ -655,8 +781,71 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
                 start,
                 end,
                 pressable.id,
+                PixelUtil.toDIPFromPixel(bounds.left + origin[0]),
+                PixelUtil.toDIPFromPixel(bounds.top + origin[1]),
+                PixelUtil.toDIPFromPixel(bounds.width()),
+                PixelUtil.toDIPFromPixel(bounds.height()),
             )
         )
+    }
+
+    /**
+     * The pressed range's bounds in this view's px coordinates, into `out`:
+     * the chip rect when a 'chip' covers exactly the range (as drawPressed
+     * paints it), else the union of its per-line rects.
+     */
+    private fun pressableBounds(
+        layout: android.text.Layout,
+        pressable: Pressable,
+        start: Int,
+        end: Int,
+        out: android.graphics.RectF,
+    ) {
+        val chip = pendingDecorations.decorations.firstOrNull {
+            it.kind == "chip" && it.start == pressable.start && it.end == pressable.end
+        }
+        val radius = PixelUtil.toPixelFromDIP(
+            if (pressed.pressedRadius > 0f) pressed.pressedRadius else chip?.borderRadius ?: 0f,
+        )
+        val text = textView.text as? android.text.Spanned
+        if (chip != null && text != null &&
+            RunDecorations.chipRect(layout, text, chip, textView.paint, decorationTextPaint, decorationRect)
+        ) {
+            out.set(decorationRect)
+        } else {
+            out.setEmpty()
+            anyLineRect(layout, start, end) { _, rect ->
+                if (out.isEmpty) out.set(rect) else out.union(rect)
+                false
+            }
+        }
+        if (!out.isEmpty) out.offset(textOriginX(), textOriginY())
+    }
+
+    /**
+     * This view's px origin relative to its React root view (ReactSurfaceView,
+     * or a Modal's DialogRootViewGroup): RN's TouchesHelper reports `pageX`/
+     * `pageY` as the root's own MotionEvent coordinates, so the press bounds
+     * share that space. Window-location deltas fold in every ancestor's
+     * scroll, translation and inset; with no root found, window coordinates.
+     * Walked by hand: RootViewUtil.getRootView asserts on a non-View parent
+     * (ViewRootImpl) instead of returning null.
+     */
+    private fun rootOrigin(): FloatArray {
+        val here = IntArray(2)
+        getLocationInWindow(here)
+        var root: View? = null
+        var current: View? = this
+        while (current != null) {
+            if (current is RootView) {
+                root = current
+                break
+            }
+            current = current.parent as? View
+        }
+        val rootAt = IntArray(2)
+        root?.getLocationInWindow(rootAt)
+        return floatArrayOf((here[0] - rootAt[0]).toFloat(), (here[1] - rootAt[1]).toFloat())
     }
 
     // ---- Embed rect reporting ------------------------------------------------
@@ -768,22 +957,146 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
      */
     override fun onDraw(canvas: android.graphics.Canvas) {
         super.onDraw(canvas)
-        val decorations = pendingDecorations.decorations
-        if (decorations.isEmpty()) return
         val layout = textView.layout ?: return
         val length = textView.text?.length ?: 0
         if (length == 0) return
+        val decorations = pendingDecorations.decorations
 
         for (pass in 0..2) {
             for (decoration in decorations) {
                 when (decoration.kind) {
                     "box" -> drawBox(canvas, layout, decoration, length, pass)
                     "rule" -> if (pass == 2) drawRule(canvas, layout, decoration, length)
-                    // 'columns' and 'indent' are layout-only; unknown kinds
-                    // are newer JS.
+                    "chip" -> if (pass != 1) drawChip(canvas, layout, decoration, pass == 2)
+                    // 'columns', 'indent', 'marker' and 'spacing' are
+                    // layout-only (a marker's dot draws in its span); unknown
+                    // kinds are newer JS.
                 }
             }
+            if (pass == 1) drawPressed(canvas, layout)
         }
+    }
+
+    private fun textOriginX(): Float = (textView.left + textView.totalPaddingLeft - textView.scrollX).toFloat()
+
+    private fun textOriginY(): Float = (textView.top + textView.totalPaddingTop - textView.scrollY).toFloat()
+
+    /** Behind the text the span draws; pass 0 fills, the stroke pass borders. */
+    private fun drawChip(
+        canvas: android.graphics.Canvas,
+        layout: android.text.Layout,
+        decoration: RunDecorations.Decoration,
+        stroke: Boolean,
+    ) {
+        val color = (if (stroke) decoration.borderColor else decoration.color) ?: return
+        val strokeWidth = PixelUtil.toPixelFromDIP(decoration.borderWidth)
+        if (stroke && strokeWidth <= 0f) return
+        val text = textView.text as? android.text.Spanned ?: return
+        if (!RunDecorations.chipRect(
+                layout, text, decoration, textView.paint, decorationTextPaint, decorationRect,
+            )
+        ) {
+            return
+        }
+        decorationRect.offset(textOriginX(), textOriginY())
+        decorationPaint.color = color
+        if (stroke) {
+            decorationPaint.style = android.graphics.Paint.Style.STROKE
+            decorationPaint.strokeWidth = strokeWidth
+            decorationRect.inset(strokeWidth / 2f, strokeWidth / 2f)
+        } else {
+            decorationPaint.style = android.graphics.Paint.Style.FILL
+        }
+        val radius = PixelUtil.toPixelFromDIP(decoration.borderRadius)
+        canvas.drawRoundRect(decorationRect, radius, radius, decorationPaint)
+    }
+
+    /** Over the fills (a chip's included), under the text. */
+    private fun drawPressed(canvas: android.graphics.Canvas, layout: android.text.Layout) {
+        val pressed = pressedPressable ?: return
+        val color = pressed.pressedColor ?: return
+        decorationPaint.style = android.graphics.Paint.Style.FILL
+        decorationPaint.color = color
+        val chip = pendingDecorations.decorations.firstOrNull {
+            it.kind == "chip" && it.start == pressed.start && it.end == pressed.end
+        }
+        val radius = PixelUtil.toPixelFromDIP(
+            if (pressed.pressedRadius > 0f) pressed.pressedRadius else chip?.borderRadius ?: 0f,
+        )
+        val text = textView.text as? android.text.Spanned
+        if (chip != null && text != null &&
+            RunDecorations.chipRect(layout, text, chip, textView.paint, decorationTextPaint, decorationRect)
+        ) {
+            decorationRect.offset(textOriginX(), textOriginY())
+            canvas.drawRoundRect(decorationRect, radius, radius, decorationPaint)
+            return
+        }
+        val dx = textOriginX()
+        val dy = textOriginY()
+        anyLineRect(layout, pressed.start, pressed.end) { _, rect ->
+            rect.offset(dx, dy)
+            canvas.drawRoundRect(rect, radius, radius, decorationPaint)
+            false
+        }
+    }
+
+    /**
+     * Underlines and strike lines with a colour or a non-solid style
+     * (`RunDecorationLineSpan`), which the text stack cannot draw. Sized off
+     * the range's own text size. Called from the TextView's own `onDraw`, so
+     * `dx`/`dy` are the layout's origin in that view's (scrolled) canvas.
+     */
+    private fun drawDecorationLines(
+        canvas: android.graphics.Canvas,
+        layout: android.text.Layout,
+        dx: Float,
+        dy: Float,
+    ) {
+        val text = layout.text as? android.text.Spanned ?: return
+        val spans = text.getSpans(0, text.length, RunDecorationLineSpan::class.java)
+        if (spans.isEmpty()) return
+        for (span in spans) {
+            val start = text.getSpanStart(span)
+            val end = text.getSpanEnd(span)
+            if (end <= start) continue
+            RunDecorations.styleLike(text, start, end, textView.paint, decorationTextPaint)
+            val textSize = decorationTextPaint.textSize
+            val thickness = maxOf(1f, textSize / 18f)
+            decorationTextPaint.getTextBounds("x", 0, 1, decorationBounds)
+            val offset = if (span.strike) decorationBounds.top / 2f else maxOf(1f, textSize * 0.11f)
+            decorationPaint.color =
+                span.color ?: RunDecorations.foregroundAt(text, start, end, textView.currentTextColor)
+            decorationPaint.style = android.graphics.Paint.Style.STROKE
+            decorationPaint.strokeWidth = thickness
+            decorationPaint.pathEffect = when (span.style) {
+                "dashed" -> dashEffect(thickness * 3f, thickness * 2f)
+                "dotted" -> dashEffect(thickness, thickness * 1.5f)
+                else -> null
+            }
+            anyLineRect(layout, start, end) { line, rect ->
+                val y = dy + layout.getLineBaseline(line) + offset
+                val left = dx + rect.left
+                val right = dx + rect.right
+                if (span.style == "double") {
+                    canvas.drawLine(left, y, right, y, decorationPaint)
+                    canvas.drawLine(left, y + thickness * 2f, right, y + thickness * 2f, decorationPaint)
+                } else {
+                    canvas.drawLine(left, y, right, y, decorationPaint)
+                }
+                false
+            }
+            decorationPaint.pathEffect = null
+        }
+    }
+
+    /** Reused across frames: the thickness is stable per run, and onDraw must not allocate per frame. */
+    private fun dashEffect(on: Float, off: Float): android.graphics.DashPathEffect {
+        cachedDashEffect?.let { if (dashEffectOn == on && dashEffectOff == off) return it }
+        val effect = android.graphics.DashPathEffect(floatArrayOf(on, off), 0f)
+        cachedDashEffect = effect
+        dashEffectOn = on
+        dashEffectOff = off
+        return effect
     }
 
     /** Pass 0 paints the box's fill, pass 1 its blockquote bar, pass 2 its
@@ -958,6 +1271,11 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         // into links — the pressable cousin of the stale-selection failure
         // this method exists to prevent.
         pressables = emptyList()
+        bandPressables = emptyList()
+        pressedPressable = null
+        allowFontScaling = true
+        maxFontSizeMultiplier = 0f
+        pendingScaling = RunFontScaling.DEFAULT
         accessibilityDirty = false
         accessibilityHelper?.setNodes(emptyList())
         if (activeHost?.get() === this) {
@@ -1004,6 +1322,7 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         // pressables at all. Gated on the list so the common no-links run
         // does not pay for gesture bookkeeping per touch.
         if (pressables.isNotEmpty()) {
+            trackPressed(event)
             inlineTapDetector.onTouchEvent(event)
         }
         // Selection-handle touches inside TextView/Editor throw
@@ -1027,12 +1346,43 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
             pressableAt(event.x, event.y) != null
     }
 
+    /** Pressed feedback follows only a touch that began on a pressable, and drops once it moves past the slop. */
+    private fun trackPressed(event: MotionEvent) {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                pressDownX = event.x
+                pressDownY = event.y
+                setPressedPressable(pressableAt(event.x, event.y)?.takeIf { it.pressedColor != null })
+            }
+            MotionEvent.ACTION_MOVE -> if (pressedPressable != null &&
+                (kotlin.math.abs(event.x - pressDownX) > touchSlop ||
+                    kotlin.math.abs(event.y - pressDownY) > touchSlop)
+            ) {
+                setPressedPressable(null)
+            }
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_CANCEL,
+            MotionEvent.ACTION_POINTER_DOWN -> setPressedPressable(null)
+        }
+    }
+
     /**
      * One tappable range: UTF-16 offsets into the projected text, plus JS's
      * identifier for the range (its index into the `pressables` prop as
-     * sent), echoed back verbatim in the event.
+     * sent), echoed back verbatim in the event, and its presentation.
+     * Lengths in dp.
      */
-    internal data class Pressable(val start: Int, val end: Int, val id: Int)
+    internal data class Pressable(
+        val start: Int,
+        val end: Int,
+        val id: Int,
+        val accessibilityLabel: String? = null,
+        /** "button", "text" (tappable, no accessibility node), or null for a link. */
+        val accessibilityRole: String? = null,
+        val pressedColor: Int? = null,
+        val pressedRadius: Float = 0f,
+        val hitSlop: Float = 0f,
+    )
 
     /** A data class: `setSelectionActions` compares lists by value to skip invalidating an open menu. */
     internal data class ResolvedAction(val id: String, val title: String)
@@ -1066,7 +1416,25 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
                 val end = optInt(entry, "end") ?: continue
                 val id = optInt(entry, "pressableId") ?: continue
                 if (start < 0 || end <= start) continue
-                parsed.add(Pressable(start, end, id))
+                parsed.add(
+                    Pressable(
+                        start,
+                        end,
+                        id,
+                        accessibilityLabel = optString(entry, "accessibilityLabel")?.takeIf { it.isNotEmpty() },
+                        accessibilityRole = optString(entry, "accessibilityRole")?.takeIf { it == "button" || it == "text" },
+                        // Through Long: a packed colour arrives as the signed 32-bit pattern.
+                        pressedColor = if (entry.hasKey("pressedColor") &&
+                            entry.getType("pressedColor") == ReadableType.Number
+                        ) {
+                            entry.getDouble("pressedColor").toLong().toInt()
+                        } else {
+                            null
+                        },
+                        pressedRadius = optFloat(entry, "pressedRadius"),
+                        hitSlop = optFloat(entry, "hitSlop"),
+                    )
+                )
             }
             return parsed
         }
@@ -1076,6 +1444,21 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
                 entry.getDouble(key).toInt()
             } else {
                 null
+            }
+
+        private fun optString(entry: ReadableMap, key: String): String? =
+            if (entry.hasKey(key) && entry.getType(key) == ReadableType.String) {
+                entry.getString(key)
+            } else {
+                null
+            }
+
+        /** Non-finite and negative values read as absent. */
+        private fun optFloat(entry: ReadableMap, key: String): Float =
+            if (entry.hasKey(key) && entry.getType(key) == ReadableType.Number) {
+                entry.getDouble(key).toFloat().takeIf { it.isFinite() && it > 0f } ?: 0f
+            } else {
+                0f
             }
 
         /** "SM" + index: clear of the small OEM and ACTION_PROCESS_TEXT ids and of android.R.id's 0x0102xxxx. */

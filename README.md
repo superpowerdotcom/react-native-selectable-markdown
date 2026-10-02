@@ -157,7 +157,7 @@ const theme: PartialTheme = {
 <SelectableMarkdown source={md} theme={theme} colorScheme="auto" />
 ```
 
-Overrides merge one level deep over a base theme. The groups are `colors`, `fonts`, `spacing`, `code`, `quote`, `table`, `headings`, `rule` and `glyphs`. `colorScheme` is `'light'`, `'dark'` or `'auto'` (the default; follows the system). `mergeTheme(overrides, base)` computes a theme ahead of render. `glyphs` (bullet and task markers) are part of the projected text, so changing them shifts selection offsets; the library handles that. The font keys are `body`, `mono`, `baseSize`, `lineHeight`, `strongWeight` and the optional `strongFamily`; an unknown token is ignored, with a DEV warning. Four tokens also cross groups, each only when the token it feeds is not itself overridden: `code.borderRadius` feeds `table.borderRadius` (squaring your code blocks squares your tables), and the deprecated `spacing.quoteIndent`, `spacing.tableCellPadding` and `colors.quoteBar` feed `quote.indent`, `table.cellPaddingH`/`cellPaddingV` and `quote.barColor`.
+Overrides merge one level deep over a base theme. The groups are `colors`, `fonts`, `spacing`, `code`, `quote`, `table`, `headings`, `rule`, `glyphs`, `blocks`, `list` and `link`. `colorScheme` is `'light'`, `'dark'` or `'auto'` (the default; follows the system). `mergeTheme(overrides, base)` computes a theme ahead of render. `glyphs` (bullet and task markers) are part of the projected text, so changing them shifts selection offsets; the library handles that. The font keys are `body`, `mono`, `baseSize`, `lineHeight`, `strongWeight` and the optional `strongFamily`; an unknown token is ignored, with a DEV warning. Four tokens also cross groups, each only when the token it feeds is not itself overridden: `code.borderRadius` feeds `table.borderRadius` (squaring your code blocks squares your tables), and the deprecated `spacing.quoteIndent`, `spacing.tableCellPadding` and `colors.quoteBar` feed `quote.indent`, `table.cellPaddingH`/`cellPaddingV` and `quote.barColor`.
 
 To style one mark rather than a construct (a heading ramp, a bold face instead of a weight bump), pass `attributeForMark`. Give it a stable identity; it takes part in the per-run memo.
 
@@ -170,7 +170,78 @@ const attributeForMark: MarkAttribute = (mark) =>
     : undefined; // fall through to the theme
 ```
 
-Known divergence: standalone blocks approximate list indentation with spaces inside `<Text>` and ignore `spacing.listIndent`. Native runs get a real hanging indent.
+### Designed documents
+
+Every token below reaches both render paths, native runs and standalone blocks:
+
+```tsx
+const theme: PartialTheme = {
+  // Web-style margins, collapsed between neighbours and measured from box
+  // edges. Unset, a run keeps its one blank line between blocks.
+  blocks: {
+    paragraph: { before: 10, after: 10 },
+    heading: { before: 24, after: 8 },
+    list: { before: 8, after: 8 },
+    rule: { before: 16, after: 16 },
+    // true, false, or the kinds that keep their margin as the first block.
+    firstBlockLead: ['heading'],
+  },
+  headings: {
+    levels: [
+      { fontSize: 24, lineHeight: 32, fontFamily: 'Display-Medium', letterSpacing: -0.6, before: 0 },
+      { fontSize: 20, lineHeight: 28, letterSpacing: -0.48 },
+    ],
+  },
+  list: { marker: { kind: 'dot', size: 5, gap: 10 }, itemGap: 8 },
+  link: { underline: 'dashed', underlineColor: '#D4D4D8' },
+  table: {
+    frame: false,
+    ruleColor: '#F4F4F5',
+    header: { fontSize: 14, lineHeight: 21, color: '#71717A' },
+    body: { fontSize: 14, lineHeight: 21 },
+    hideEmptyHeader: true,
+  },
+};
+```
+
+Component props for the rest:
+
+- `allowFontScaling` / `maxFontSizeMultiplier` apply to native runs and the standalone `<Text>` alike.
+- `highlights` paints `{ query, matchTokens? }` matches or source spans with `colors.highlight` inside the native run, without reprojecting or leaving it.
+- `softBreak="newline"` renders a soft break as a line break.
+- `images` takes `'none'`, or `{ width: 'container', height: 'intrinsic', maxHeight }` to size embedded images to the column at their own aspect ratio. Container width is measured before image-bearing runs mount; use numeric container padding, since percentage padding falls back to the theme's padding.
+- `accessibilityForPressable`, `pressedStyle`, `pressableHitSlop` and `chipForMark` turn an inline range such as a citation marker into a labelled, pressable pill:
+
+```tsx
+<SelectableMarkdown
+  chipForMark={(mark) =>
+    mark.kind === 'blockedLink' && isCitation(mark.href)
+      ? { backgroundColor: '#FFF1EB', borderRadius: 6, paddingHorizontal: 4, minWidth: 18, fontSize: 12 }
+      : undefined
+  }
+  accessibilityForPressable={({ href, text }) =>
+    // 'text': tappable but read as prose; 'none': not tappable at all.
+    isCitation(href) ? { label: `Open citation ${text}`, role: 'button' } : undefined
+  }
+  pressedStyle={{ backgroundColor: '#FFD9C9' }}
+  pressableHitSlop={8}
+  …
+/>
+```
+
+  `chipForMark`, `attributeForMark` and `accessibilityForPressable` also apply to standalone blocks, where a chip is an inline box around the mark's text.
+- `transformInline` can put a coloured glyph before a node, such as a status dot before a citation. The glyph is display-only and is left out of copy-as-markdown:
+
+```tsx
+transformInline={(node) =>
+  node.kind === 'link' && isBiomarker(node.href)
+    ? { prefix: { text: '\u25CF\u2009', style: { color: statusColor(node.href), fontSize: 10 } } }
+    : undefined
+}
+```
+
+- `codeBlocks="card"` draws top-level code blocks as cards with a language label, a Copy button and sideways scrolling, while keeping them inside the run's selection. Copy goes to `onCodeCopy` if you pass one, and to the system clipboard otherwise. Add `streamingEmbeds` to show the cards while a message streams.
+- `embed` claims may set `width: 'container'` to fill the column.
 
 ## Defaults for model output
 
@@ -245,6 +316,8 @@ A block-level embed may be any height; an inline one shares a line with prose, s
 `images` decides how pictures ride along. The default `'embed'` claims a sole image in a top-level paragraph, reserves `spacing.imageWidth` × `spacing.imageHeight` (280 × 200 points) and overlays `renderers.image` on it, so an isolated picture keeps the sweep. Inline and container images keep normal layout; `'standalone'` sends the containing block to the renderer path instead, which is what you want for full-bleed or intrinsically sized pictures, or when a streamed image must draw before its run settles.
 
 `classifyBlock` marks a block `'standalone'` so it gets its own selection scope and renderer. Use it for blocks that own a competing gesture and should end the sweep rather than flow through it. A block holding a spoiler, or an image no claim covered, is standalone already. Give it a stable identity; the document is resegmented when it changes.
+
+Standalone lists and blockquotes use separate text blocks. Selection cannot span their items or paragraphs, and list markers are outside selectable text, so they are not copied. This also applies when the native run host is unavailable.
 
 ```tsx
 import type { ClassifyBlock } from 'react-native-selectable-markdown';

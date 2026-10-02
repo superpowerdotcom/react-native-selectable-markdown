@@ -193,4 +193,5 @@ dependencies {
     implementation 'com.facebook.react:react-android'
     // Also transitive through appcompat; named because RunAccessibility.kt imports it directly.
     implementation 'androidx.customview:customview:1.1.0'
+    testImplementation 'junit:junit:4.13.2'
 }

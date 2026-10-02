@@ -6,12 +6,13 @@ import {
   useImperativeHandle,
   useLayoutEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   useSyncExternalStore,
 } from 'react';
 import type { ReactNode, Ref } from 'react';
-import { Platform, View, useColorScheme } from 'react-native';
+import { Image, Platform, StyleSheet, View, useColorScheme } from 'react-native';
 import type {
   LayoutChangeEvent,
   StyleProp,
@@ -23,10 +24,12 @@ import { parseDocument } from '../engine/Engine';
 import type { Engine } from '../engine/Engine';
 import { resolveOptions } from '../engine/options';
 import type { EngineOptions } from '../engine/options';
-import type { ProjectedRun } from '../selection/mapSelection';
+import { mapSelectionToSource } from '../selection/mapSelection';
+import type { InlineTransform, ProjectedRun, RunMark } from '../selection/mapSelection';
 import { segmentRuns } from '../selection/runs';
 import type {
   ClassifyBlock,
+  EmbedLookup,
   EmbedClaimContext,
   EmbedContent,
   RunSegment,
@@ -42,8 +45,31 @@ import type {
   SelectionActionEvent,
   SelectionChangeEvent,
 } from './RunHost';
-import { withImageEmbeds } from './imageEmbeds';
-import type { ImageMode } from './imageEmbeds';
+import { withImageEmbeds, withoutImages } from './imageEmbeds';
+import { withCodeBlockCards } from './codeBlocks';
+import type { CodeBlockMode, CodeBlockOptions, CodeCardContext, CodeCopyEvent } from './codeBlocks';
+import type { ImageBox, ImageMode, ImageOptions } from './imageEmbeds';
+import {
+  itemGap,
+  leadMargin,
+  marginBetween,
+  resolveRunSpacing,
+  spacingManaged,
+  trailMargin,
+} from './blockSpacing';
+import {
+  presentPressables,
+  resolveChips,
+  resolveRunHighlights,
+} from './runPresentation';
+import type {
+  ChipStyle,
+  Highlights,
+  PressableAccessibility,
+  PressableInfo,
+  PressedStyle,
+} from './runPresentation';
+import { hiddenHeaderLines } from './runDecorations';
 import { createRunProjectionCache } from './projectionCache';
 import type { RunProjectionCache } from './projectionCache';
 import { openUrl, renderBlocks, resolveRenderers } from './renderers';
@@ -82,7 +108,7 @@ import type {
   SelectionTrackingState,
 } from './selectionTracking';
 import type { RunSelectionCandidate } from './selectionRange';
-import { defaultDarkTheme, defaultTheme, mergeTheme } from './theme';
+import { bulletGlyph, defaultDarkTheme, defaultTheme, mergeTheme } from './theme';
 import type { MarkdownTheme, PartialTheme } from './theme';
 
 // Named rather than `export *`, so the wire codec stays out of the package root.
@@ -204,8 +230,8 @@ export interface SelectableMarkdownProps extends SelectableMarkdownAccessibility
    * image or blocked link flows too. Return `undefined` to leave a node
    * alone. Synthetic and still-streaming (`incomplete`) nodes are never
    * embedded regardless of a claim, and while a run is the unsettled
-   * streaming tail its overlays are not mounted (the space is still
-   * reserved, so nothing reflows when they appear).
+   * streaming tail its overlays are not mounted unless `streamingEmbeds` is
+   * set (the space is still reserved, so nothing reflows when they appear).
    *
    * Sizing is declared, not measured: `height` becomes the placeholder
    * line's height through the attribute channel, which is what makes the
@@ -223,15 +249,83 @@ export interface SelectableMarkdownProps extends SelectableMarkdownAccessibility
    */
   embed?: EmbedRenderer;
   /**
+   * Mount embed overlays on the unsettled streaming tail too, so a card shows
+   * while the message is still arriving. Default false: the tail reserves the
+   * space and the card appears when its run settles. An `'auto'` height is
+   * then measured mid-stream, so its line can re-reserve while streaming.
+   */
+  streamingEmbeds?: boolean;
+  /**
    * How an image participates in selection. Default `'embed'`: a top-level
    * paragraph's sole image reserves `spacing.imageWidth` × `spacing.imageHeight`
    * and the `image` renderer is overlaid. `'standalone'` sends the image's block
    * to `renderers`, and it draws even while streaming.
    *
    * An `embed` claim beats `classifyBlock` on the same node, so this prop, not
-   * `classifyBlock`, is what forces an image out of the run.
+   * `classifyBlock`, is what forces an image out of the run. `'none'` drops
+   * images entirely.
+   *
+   * The object form sizes embedded images: `{ width: 'container', height:
+   * 'intrinsic' }` fills the column at each image's own aspect ratio. Keep
+   * an object's identity stable.
    */
-  images?: ImageMode;
+  images?: ImageMode | ImageOptions;
+  /**
+   * `'card'` draws each top-level closed code block as a card with a language
+   * label, a Copy button and sideways scrolling; see `CodeBlockMode`. Default
+   * `'text'`. A block still streaming stays text until its fence closes, and
+   * a card on the streaming tail mounts only with `streamingEmbeds`.
+   * Keep an object's identity stable.
+   */
+  codeBlocks?: CodeBlockMode | CodeBlockOptions;
+  /**
+   * A card's Copy button. Without it the card writes the code to the system
+   * clipboard itself. Identity does not matter.
+   */
+  onCodeCopy?: (event: CodeCopyEvent) => void;
+  /** What a soft line break shows as: `'space'` (default, CommonMark) or `'newline'`. */
+  softBreak?: 'space' | 'newline';
+  /**
+   * Rewrites or hides inline nodes at render time instead of in the source —
+   * renumber a citation, hide one — on both render paths. The node keeps its
+   * source span, so selection and copy-as-markdown stay exact. Pure and
+   * referentially stable: a new function reprojects every run.
+   */
+  transformInline?: InlineTransform;
+  /**
+   * `'headings'`: a markdown copy that starts inside a heading and runs past
+   * its end includes the whole heading, `## ` and all. Default `'none'`.
+   */
+  copySnapping?: 'none' | 'headings';
+  /**
+   * Ranges painted with `colors.highlight` (and `colors.highlightText`)
+   * without leaving the native run: source spans, or a display-text query.
+   * Changing it restyles; nothing reprojects. Keep its identity stable.
+   */
+  highlights?: Highlights;
+  /**
+   * Default true. False ignores the system text-size setting on both render
+   * paths: native runs and the standalone renderers' `<Text>`.
+   */
+  allowFontScaling?: boolean;
+  /** Caps the system text-size multiplier on both paths; unset or 0 is no cap. */
+  maxFontSizeMultiplier?: number;
+  /**
+   * The screen-reader label and role of each link-shaped range in a run.
+   * Return `{ role: 'none' }` for a range that only looks like a link: it
+   * stops being a tap target and an accessibility element. Keep it stable.
+   */
+  accessibilityForPressable?: (pressable: PressableInfo) => PressableAccessibility | undefined;
+  /** Fill shown behind a link-shaped range while it is pressed. Keep it stable. */
+  pressedStyle?: PressedStyle | ((pressable: PressableInfo) => PressedStyle | undefined);
+  /** Points added around every link-shaped range's tap target. */
+  pressableHitSlop?: number;
+  /**
+   * Draws a chip (a rounded fill with reserved padding) behind a mark's
+   * range — a citation marker, say. On the standalone path the chip is an
+   * inline box around the mark's text. Keep it stable.
+   */
+  chipForMark?: (mark: RunMark) => ChipStyle | undefined;
   /**
    * Which custom actions the platform selection menu offers, in order.
    * Default: both built-ins; the system Copy item always remains. An entry is
@@ -341,8 +435,18 @@ export type SelectableMarkdownAccessibilityProps = RunHostAccessibilityProps;
 export interface InlineLinkPress {
   href: string;
   blocked: boolean;
-  start: number;
-  end: number;
+  /** Display offsets into the run's projected text. Absent for a press on a standalone block. */
+  start?: number;
+  end?: number;
+  /** The link's source span, on both paths. */
+  span?: SourceSpan;
+  /**
+   * Where the press landed, for anchoring a tooltip or sheet: the pressed
+   * range's bounds in a run, the touch point (zero size) on a standalone
+   * block. Same space as a touch's `pageX` / `pageY`. Absent from a native
+   * binary that predates it.
+   */
+  rect?: { x: number; y: number; width: number; height: number };
 }
 
 /**
@@ -356,8 +460,76 @@ export interface InlineLinkPress {
  * `render` is placed as an element, so hooks work; its component type is built
  * per function, so keep it stable or the card remounts on every reprojection.
  */
-export interface EmbedSpec extends EmbedContent {
+export interface EmbedSpec extends Omit<EmbedContent, 'width' | 'height'> {
+  /**
+   * Points, or `'container'` for the document's measured width less its
+   * horizontal padding. Hosts holding a `'container'` claim mount once that
+   * width is known. Claim it only where `context.topLevel` holds: an
+   * indented line is narrower than the column.
+   */
+  width: number | 'container';
+  /**
+   * Points, or `'auto'` to size to the rendered element: `estimatedHeight`
+   * is reserved first, the overlay is laid out at `width`, and the host
+   * re-reserves once at the measured height. Not measured while the run is
+   * the streaming tail (its overlays are not mounted), so the estimate holds
+   * until it settles.
+   */
+  height: number | 'auto';
+  /** Reserved for an `'auto'` embed until it is measured. Default 44. */
+  estimatedHeight?: number;
   render: (node: AnyNode, ctx: RenderContext) => ReactNode;
+}
+
+/** An `EmbedSpec` with its height resolved, which is what segmentation sees. */
+interface ResolvedEmbedSpec extends EmbedContent {
+  render: EmbedSpec['render'];
+  /** Set when the height is a measurement of the overlay, not a declaration. */
+  measured?: true;
+}
+
+const DEFAULT_ESTIMATED_HEIGHT = 44;
+const NO_EMBED_HEIGHTS: ReadonlyMap<string, number> = new Map();
+
+/** Identity of a claimed node across reprojections. */
+function embedMeasureKey(node: AnyNode): string {
+  return `${node.span.start}:${node.span.end}`;
+}
+
+/** Resolves `height: 'auto'` claims to their measured height, else the estimate. */
+/** Set by `resolveEmbedSizes` when a claim asked for the container width. */
+interface ContainerClaims {
+  seen: boolean;
+}
+
+/**
+ * The `embed` prop with every size resolved: `'auto'` heights to their
+ * measurement or estimate, `'container'` widths to `width` (`fallbackWidth`
+ * until the container is measured, which `claims` records).
+ */
+function resolveEmbedSizes(
+  embed: EmbedRenderer | undefined,
+  heights: ReadonlyMap<string, number>,
+  width: number | null,
+  fallbackWidth: number,
+  claims: ContainerClaims,
+): ((node: AnyNode, context: EmbedClaimContext) => ResolvedEmbedSpec | undefined) | undefined {
+  if (embed === undefined) return undefined;
+  return (node, context) => {
+    const spec = embed(node, context);
+    if (spec === undefined) return undefined;
+    if (spec.width === 'container') claims.seen = true;
+    const resolved: ResolvedEmbedSpec = {
+      ...spec,
+      width: spec.width === 'container' ? (width ?? fallbackWidth) : spec.width,
+      height:
+        spec.height === 'auto'
+          ? heights.get(embedMeasureKey(node)) ?? spec.estimatedHeight ?? DEFAULT_ESTIMATED_HEIGHT
+          : spec.height,
+    };
+    if (spec.height === 'auto') resolved.measured = true;
+    return resolved;
+  };
 }
 
 /** The `embed` prop's shape. Structurally an `EmbedLookup` — every
@@ -478,11 +650,14 @@ interface RunViewProps {
    * `SelectableMarkdown`). */
   gap: number;
   unsettledTail: boolean;
+  /** Mount overlays even while `unsettledTail`. */
+  streamingEmbeds: boolean;
+  codeCard?: CodeCardContext;
   selectionActions: readonly SelectionActionInput[];
   onSelectionCopy?: (payload: SelectionCopyEvent) => void;
   onLinkPress?: (press: InlineLinkPress) => void;
   attributeForMark?: MarkAttribute;
-  embed?: EmbedRenderer;
+  embed?: EmbedLookup;
   /** Re-checked at press time; see `openUrl`. */
   linkPrefixes: readonly string[];
   exclusiveSelection: boolean;
@@ -492,6 +667,19 @@ interface RunViewProps {
   registry: RunSelectionRegistry;
   /** Undefined when nobody watches selection. Stable identity. */
   onSelectionChange?: (report: RunSelectionReport, runKey: string) => void;
+  /** Space above the run, for `blocks.firstBlockLead` on the first one. */
+  lead: number;
+  onEmbedMeasure: (key: string, height: number) => void;
+  softBreak: 'space' | 'newline';
+  transformInline?: InlineTransform;
+  copySnapping: 'none' | 'headings';
+  highlights?: Highlights;
+  allowFontScaling: boolean;
+  maxFontSizeMultiplier: number;
+  accessibilityForPressable?: SelectableMarkdownProps['accessibilityForPressable'];
+  pressedStyle?: SelectableMarkdownProps['pressedStyle'];
+  pressableHitSlop?: number;
+  chipForMark?: SelectableMarkdownProps['chipForMark'];
 }
 
 function RunView(props: RunViewProps): ReactNode {
@@ -502,6 +690,8 @@ function RunView(props: RunViewProps): ReactNode {
     renderers,
     gap,
     unsettledTail,
+    streamingEmbeds,
+    codeCard,
     selectionActions,
     onSelectionCopy,
     onLinkPress,
@@ -512,22 +702,67 @@ function RunView(props: RunViewProps): ReactNode {
     runKey: selfKey,
     registry,
     onSelectionChange,
+    lead,
+    onEmbedMeasure,
+    softBreak,
+    transformInline,
+    copySnapping,
+    highlights,
+    allowFontScaling,
+    maxFontSizeMultiplier,
+    accessibilityForPressable,
+    pressedStyle,
+    pressableHitSlop,
+    chipForMark,
   } = props;
 
   // The same tail policy as `effectiveSelectable` in `RunHost`, applied to
   // standalone renderers.
   const selectable = unsettledTail ? Platform.OS === 'ios' : run.selectable;
 
+  const highlightQuery =
+    highlights !== undefined && !Array.isArray(highlights)
+      ? (highlights as Exclude<Highlights, readonly SourceSpan[]>)
+      : undefined;
   const ctx: RenderContext = useMemo(
-    () => ({
+    () => {
+      const context: RenderContext = {
+        theme,
+        renderers,
+        source: doc.source,
+        listDepth: 0,
+        selectable,
+        linkPrefixes,
+      };
+      if (softBreak === 'newline') context.softBreak = 'newline';
+      if (!allowFontScaling) context.allowFontScaling = false;
+      if (maxFontSizeMultiplier > 0) context.maxFontSizeMultiplier = maxFontSizeMultiplier;
+      if (highlightQuery !== undefined) context.highlight = highlightQuery;
+      if (onLinkPress) context.onLinkPress = onLinkPress;
+      if (transformInline) context.transformInline = transformInline;
+      if (attributeForMark) context.attributeForMark = attributeForMark;
+      if (chipForMark) context.chipForMark = chipForMark;
+      if (accessibilityForPressable) context.accessibilityForPressable = accessibilityForPressable;
+      if (codeCard) context.codeCard = codeCard;
+      return context;
+    },
+    [
       theme,
       renderers,
-      source: doc.source,
-      listDepth: 0,
+      doc.source,
       selectable,
       linkPrefixes,
-    }),
-    [theme, renderers, doc.source, selectable, linkPrefixes],
+      softBreak,
+      allowFontScaling,
+      maxFontSizeMultiplier,
+      highlightQuery,
+      onLinkPress,
+      transformInline,
+      attributeForMark,
+      chipForMark,
+      accessibilityForPressable,
+      codeCard,
+    ],
   );
 
   // Keyed on the glyph VALUES, not the theme object: the marker glyphs are
@@ -545,7 +780,11 @@ function RunView(props: RunViewProps): ReactNode {
   const cacheRef = useRef<RunProjectionCache | null>(null);
   cacheRef.current ??= createRunProjectionCache();
   const cache = cacheRef.current;
-  const { bullet, taskChecked, taskUnchecked } = theme.glyphs;
+  const { taskChecked, taskUnchecked } = theme.glyphs;
+  const bullet = bulletGlyph(theme);
+  // Block spacing reads the separators off the block log, so only a theme
+  // that spaces blocks pays for recording it.
+  const recordBlocks = spacingManaged(theme) || itemGap(theme) !== undefined;
   const projected = useMemo(
     () =>
       run.standalone
@@ -553,34 +792,65 @@ function RunView(props: RunViewProps): ReactNode {
         : cache.project(run, doc, {
             glyphs: { bullet, taskChecked, taskUnchecked },
             embed,
+            softBreak,
+            recordBlocks,
+            transformInline,
           }),
-    [cache, run, doc, bullet, taskChecked, taskUnchecked, embed],
+    [cache, run, doc, bullet, taskChecked, taskUnchecked, embed, softBreak, recordBlocks, transformInline],
+  );
+
+  const spacing = useMemo(
+    () => (projected ? resolveRunSpacing(projected, theme) : undefined),
+    [projected, theme],
   );
 
   // Theme resolution for the native host. Memoized separately from the
   // projection because a theme change has to restyle without reprojecting,
   // and a content change must not rebuild the theme lookup.
-  const attributes = useMemo(
-    () =>
-      projected
-        ? resolveRunAttributes(projected, theme, attributeForMark)
-        : undefined,
-    [projected, theme, attributeForMark],
+  const chips = useMemo(
+    () => (projected && chipForMark ? resolveChips(projected, chipForMark) : undefined),
+    [projected, chipForMark],
   );
+
+  const attributes = useMemo(() => {
+    if (!projected) return undefined;
+    const extra = [
+      ...(chips?.attributes ?? []),
+      ...(spacing?.attributes ?? []),
+      ...hiddenHeaderLines(projected, theme),
+      ...resolveRunHighlights(projected, highlights, theme),
+    ];
+    return resolveRunAttributes(
+      projected,
+      theme,
+      attributeForMark,
+      extra.length > 0 ? extra : undefined,
+    );
+  }, [projected, theme, attributeForMark, spacing, highlights, chips]);
 
   // The run's block chrome (code boxes, table borders and rules, thematic
   // breaks) for the native host. Memoized like `attributes` — a theme change
   // restyles it without reprojecting, a content change rebuilds it.
-  const decorations = useMemo(
-    () => (projected ? resolveRunDecorations(projected, theme) : undefined),
-    [projected, theme],
-  );
+  const decorations = useMemo(() => {
+    if (!projected) return undefined;
+    const base = resolveRunDecorations(projected, theme);
+    const chipped = chips?.decorations ?? [];
+    const spaced = spacing?.decorations ?? [];
+    return chipped.length === 0 && spaced.length === 0 ? base : [...base, ...spaced, ...chipped];
+  }, [projected, theme, chips, spacing]);
 
   // The run's tappable link ranges, for the native host. Theme-independent —
   // derived from the projection alone — so a theme change never rebuilds it.
   const pressables = useMemo(
-    () => (projected ? resolveRunPressables(projected) : undefined),
-    [projected],
+    () =>
+      projected
+        ? presentPressables(resolveRunPressables(projected), projected.text, {
+            accessibilityForPressable,
+            pressedStyle,
+            hitSlop: pressableHitSlop,
+          })
+        : undefined,
+    [projected, accessibilityForPressable, pressedStyle, pressableHitSlop],
   );
 
   // The run's embedded ranges, for the native host and the overlay below.
@@ -679,17 +949,28 @@ function RunView(props: RunViewProps): ReactNode {
       const target = pressables?.[event.pressableId];
       if (!target) return;
       if (onLinkPress) {
-        onLinkPress({
+        const press: InlineLinkPress = {
           href: target.href,
           blocked: target.blocked === true,
           start: target.start,
           end: target.end,
-        });
+        };
+        const span = projected ? mapSelectionToSource(projected, target) : null;
+        if (span !== null) press.span = span;
+        if (
+          event.x !== undefined &&
+          event.y !== undefined &&
+          event.width !== undefined &&
+          event.height !== undefined
+        ) {
+          press.rect = { x: event.x, y: event.y, width: event.width, height: event.height };
+        }
+        onLinkPress(press);
         return;
       }
       if (!target.blocked) openUrl(target.href, linkPrefixes);
     },
-    [pressables, onLinkPress, linkPrefixes],
+    [pressables, onLinkPress, linkPrefixes, projected],
   );
 
   const onNativeSelectionAction = useCallback(
@@ -704,17 +985,33 @@ function RunView(props: RunViewProps): ReactNode {
         actions: selectionActions,
         // The same glyphs `projected` was built with, so the payload's
         // `plain` shows the markers the user saw on screen.
-        glyphs: theme.glyphs,
+        glyphs: { bullet, taskChecked, taskUnchecked },
         // And the same embed lookup, for the same reason — `projected` is
         // supplied so the fallback reprojection should never run, but if it
         // ever does it must not run with different offsets.
         embed,
+        softBreak,
+        transformInline,
+        snapHeadings: copySnapping === 'headings',
       });
       if (payload) {
         onSelectionCopy(payload);
       }
     },
-    [onSelectionCopy, projected, doc, run, theme.glyphs, embed, selectionActions],
+    [
+      onSelectionCopy,
+      projected,
+      doc,
+      run,
+      bullet,
+      taskChecked,
+      taskUnchecked,
+      embed,
+      selectionActions,
+      softBreak,
+      transformInline,
+      copySnapping,
+    ],
   );
 
   const onNativeSelectionChange = useCallback(
@@ -734,8 +1031,14 @@ function RunView(props: RunViewProps): ReactNode {
     [onSelectionChange, projected, selfKey],
   );
 
-  const marginStyle = useMemo(() => ({ marginBottom: gap }), [gap]);
-  const embedContainerStyle = useMemo(() => ({ position: 'relative' as const, marginBottom: gap }), [gap]);
+  const marginStyle = useMemo(
+    () => (lead > 0 ? { marginTop: lead, marginBottom: gap } : { marginBottom: gap }),
+    [gap, lead],
+  );
+  const embedContainerStyle = useMemo(
+    () => ({ position: 'relative' as const, ...marginStyle }),
+    [marginStyle],
+  );
 
   if (run.standalone) {
     return (
@@ -745,10 +1048,12 @@ function RunView(props: RunViewProps): ReactNode {
 
   const host = (
     <RunHost
+      allowFontScaling={allowFontScaling}
       attributes={attributes}
       decorations={decorations}
       embeds={runEmbeds}
       exclusiveSelection={exclusiveSelection}
+      maxFontSizeMultiplier={maxFontSizeMultiplier}
       onEmbedLayout={runEmbeds?.length ? onNativeEmbedLayout : undefined}
       onInlinePress={pressables?.length ? onNativeInlinePress : undefined}
       onSelectionAction={onSelectionCopy ? onNativeSelectionAction : undefined}
@@ -766,14 +1071,14 @@ function RunView(props: RunViewProps): ReactNode {
   return (
     <View style={embedContainerStyle}>
       {host}
-      {!unsettledTail &&
+      {(!unsettledTail || streamingEmbeds) &&
         projected?.embeds?.map((entry) => {
           const key = embedRectKey(entry);
           const rect = rects.get(key);
           if (!rect) {
             return null;
           }
-          const spec = entry.content as Partial<EmbedSpec>;
+          const spec = entry.content as Partial<ResolvedEmbedSpec>;
           if (typeof spec.render !== 'function') {
             return null;
           }
@@ -782,7 +1087,9 @@ function RunView(props: RunViewProps): ReactNode {
             <Overlay
               ctx={ctx}
               key={`embed:${key}`}
+              measureKey={spec.measured ? embedMeasureKey(entry.node) : undefined}
               node={entry.node}
+              onMeasure={onEmbedMeasure}
               rect={rect}
               render={spec.render}
             />
@@ -804,6 +1111,9 @@ type EmbedOverlayProps = {
   node: AnyNode;
   ctx: RenderContext;
   rect: EmbedRect;
+  /** Set for a `height: 'auto'` embed: the overlay sizes to its content and reports it. */
+  measureKey?: string;
+  onMeasure: (key: string, height: number) => void;
 };
 
 type EmbedOverlayType = ((props: EmbedOverlayProps) => ReactNode) & {
@@ -818,16 +1128,30 @@ function embedOverlayFor(render: EmbedRender): EmbedOverlayType {
     return cached;
   }
   function EmbedOverlay(props: EmbedOverlayProps): ReactNode {
-    const { render: draw, node, ctx, rect } = props;
+    const { render: draw, node, ctx: runCtx, rect, measureKey, onMeasure } = props;
+    const { width, height } = rect;
+    // The reserved box, so an embedded image can fill it.
+    const ctx = useMemo(
+      () => ({ ...runCtx, embedBox: { width, height } }),
+      [runCtx, width, height],
+    );
+    const onLayout = useCallback(
+      (event: LayoutChangeEvent) => {
+        if (measureKey !== undefined) onMeasure(measureKey, event.nativeEvent.layout.height);
+      },
+      [measureKey, onMeasure],
+    );
     return (
       <View
+        onLayout={measureKey !== undefined ? onLayout : undefined}
         pointerEvents="box-none"
         style={{
           position: 'absolute',
           left: rect.x,
           top: rect.y,
           width: rect.width,
-          height: rect.height,
+          // Unconstrained, so the measurement is the content's own height.
+          ...(measureKey !== undefined ? null : { height: rect.height }),
         }}
       >
         {draw(node, ctx)}
@@ -873,7 +1197,21 @@ function runPropsEqual(prev: RunViewProps, next: RunViewProps): boolean {
     prev.run.standalone === next.run.standalone &&
     sameBlockIdentity(prev.run.blocks, next.run.blocks) &&
     prev.gap === next.gap &&
+    prev.lead === next.lead &&
+    prev.onEmbedMeasure === next.onEmbedMeasure &&
+    prev.softBreak === next.softBreak &&
+    prev.transformInline === next.transformInline &&
+    prev.copySnapping === next.copySnapping &&
+    prev.highlights === next.highlights &&
+    prev.allowFontScaling === next.allowFontScaling &&
+    prev.maxFontSizeMultiplier === next.maxFontSizeMultiplier &&
+    prev.accessibilityForPressable === next.accessibilityForPressable &&
+    prev.pressedStyle === next.pressedStyle &&
+    prev.pressableHitSlop === next.pressableHitSlop &&
+    prev.chipForMark === next.chipForMark &&
     prev.unsettledTail === next.unsettledTail &&
+    prev.streamingEmbeds === next.streamingEmbeds &&
+    prev.codeCard === next.codeCard &&
     prev.theme === next.theme &&
     prev.renderers === next.renderers &&
     sameSelectionActionList(prev.selectionActions, next.selectionActions) &&
@@ -984,7 +1322,20 @@ function SelectableMarkdownWithRef(
     classifyBlock,
     maxRunChars,
     embed,
+    streamingEmbeds = false,
     images,
+    codeBlocks,
+    onCodeCopy,
+    softBreak = 'space',
+    transformInline,
+    copySnapping = 'none',
+    highlights,
+    allowFontScaling = true,
+    maxFontSizeMultiplier,
+    accessibilityForPressable,
+    pressedStyle,
+    pressableHitSlop,
+    chipForMark,
     selectionActions,
     onSelectionCopy,
     onLinkPress,
@@ -1016,6 +1367,21 @@ function SelectableMarkdownWithRef(
   // exist, and `onLinkPress` whether built-in routing is taken over.
   const runSelectionCopy = onSelectionCopy ? stableSelectionCopy : undefined;
   const runLinkPress = onLinkPress ? stableLinkPress : undefined;
+  const latestCodeCopy = useLatest(onCodeCopy);
+  const hasCodeCopy = onCodeCopy !== undefined;
+  const codeOptions: CodeBlockOptions | undefined =
+    typeof codeBlocks === 'object' && codeBlocks !== null ? codeBlocks : undefined;
+  const codeMode: CodeBlockMode =
+    typeof codeBlocks === 'string' ? codeBlocks : codeOptions !== undefined ? (codeOptions.mode ?? 'card') : 'text';
+  const codeCards = codeMode === 'card';
+  const copyLabel = codeOptions?.copyLabel ?? 'Copy';
+  const copiedLabel = codeOptions?.copiedLabel ?? 'Copied';
+  const codeCard = useMemo((): CodeCardContext | undefined => {
+    if (!codeCards) return undefined;
+    const card: CodeCardContext = { copyLabel, copiedLabel };
+    if (hasCodeCopy) card.onCodeCopy = (event) => latestCodeCopy.current?.(event);
+    return card;
+  }, [codeCards, copyLabel, copiedLabel, hasCodeCopy, latestCodeCopy]);
 
   const registryRef = useRef<RunSelectionRegistry | null>(null);
   registryRef.current ??= new Map();
@@ -1091,11 +1457,15 @@ function SelectableMarkdownWithRef(
   const scheme = colorScheme ?? 'auto';
   const dark =
     scheme === 'dark' || (scheme === 'auto' && systemScheme === 'dark');
+  // Compared by value, so an inline theme literal or a renderer map rebuilt
+  // around the same functions does not re-render every run.
+  const stableTheme = useStructural(theme, sameThemeValue);
+  const stableRenderers = useStructural(renderers, sameShallow);
   const mergedTheme = useMemo(
-    () => mergeTheme(theme, dark ? defaultDarkTheme : defaultTheme),
-    [theme, dark],
+    () => mergeTheme(stableTheme, dark ? defaultDarkTheme : defaultTheme),
+    [stableTheme, dark],
   );
-  const rendererMap = useMemo(() => resolveRenderers(renderers), [renderers]);
+  const rendererMap = useMemo(() => resolveRenderers(stableRenderers), [stableRenderers]);
 
   // `parseContext` allocates its wrapper per call, so the memo keys on the
   // options inside it.
@@ -1135,26 +1505,105 @@ function SelectableMarkdownWithRef(
   const settledUntil =
     streaming && snapshot ? snapshot.settledUntil : doc.source.length;
 
+  const imageOptions: ImageOptions | undefined =
+    typeof images === 'object' && images !== null ? images : undefined;
+  const imageMode: ImageMode =
+    (typeof images === 'string' ? images : imageOptions?.mode) ?? 'embed';
+
   const visibleDoc = useMemo(() => {
-    if (!streaming) {
-      return doc;
-    }
-    const trimmed = trimTrailingPlaceholders(doc.blocks);
-    return trimmed === doc.blocks
-      ? doc
-      : { source: doc.source, blocks: trimmed };
-  }, [doc, streaming]);
+    let blocks = streaming ? trimTrailingPlaceholders(doc.blocks) : doc.blocks;
+    if (imageMode === 'none') blocks = withoutImages(blocks);
+    return blocks === doc.blocks ? doc : { source: doc.source, blocks };
+  }, [doc, streaming, imageMode]);
+
+  // Keep the measured width when image sizing or padding changes without a new layout event.
+  const [containerWidth, setContainerWidth] = useState<number | null>(null);
+  const wantsContainerWidth = imageOptions?.width === 'container';
+  const hasImageEmbeds = useMemo(
+    () => imageMode === 'embed' && visibleDoc.blocks.some((block) =>
+      block.kind === 'paragraph' && block.children.length === 1 && block.children[0].kind === 'image'),
+    [imageMode, visibleDoc],
+  );
+  // Measure the container before mounting hosts with image reservations.
+  const awaitingImageWidth = wantsContainerWidth && hasImageEmbeds && containerWidth === null;
+  const horizontalPadding = useMemo(() => {
+    if (!wantsContainerWidth && embed === undefined && !codeCards) return 0;
+    const flat = StyleSheet.flatten(style) ?? {};
+    const pad = (value: unknown, fallback: number): number =>
+      typeof value === 'number' ? value : fallback;
+    const all = pad(flat.padding, mergedTheme.spacing.containerPadding);
+    const horizontal = pad(flat.paddingHorizontal, all);
+    return (
+      pad(flat.paddingStart ?? flat.paddingLeft, horizontal) +
+      pad(flat.paddingEnd ?? flat.paddingRight, horizontal)
+    );
+  }, [wantsContainerWidth, embed, codeCards, style, mergedTheme.spacing.containerPadding]);
+  const contentWidth = containerWidth === null ? null : Math.max(0, Math.round(containerWidth - horizontalPadding));
+  const handleLayout = useCallback(
+    (event: LayoutChangeEvent) => {
+      const next = event.nativeEvent.layout.width;
+      setContainerWidth((previous) => (previous === next ? previous : next));
+      onLayout?.(event);
+    },
+    [onLayout],
+  );
+
+  const intrinsic = imageOptions?.height === 'intrinsic';
+  const ratioVersion = useImageRatios(intrinsic && imageMode === 'embed' ? visibleDoc : null);
 
   // Keyed on the box tokens, not the theme: the lookup is part of the
   // projection key, and a colour change must not reproject every run.
   const { imageWidth, imageHeight } = mergedTheme.spacing;
-  const embedLookup = useMemo(
-    () =>
-      images === 'standalone'
-        ? embed
-        : withImageEmbeds(embed, { width: imageWidth, height: imageHeight }),
-    [embed, images, imageWidth, imageHeight],
+  const optionWidth = imageOptions?.width;
+  const resolvedImageWidth = optionWidth === 'container' ? (contentWidth ?? imageWidth) : (optionWidth ?? imageWidth);
+  const optionHeight = imageOptions?.height;
+  const maxImageHeight = imageOptions?.maxHeight;
+  // Measured heights of `height: 'auto'` embeds, keyed by source span.
+  const [embedHeights, setEmbedHeights] = useState<ReadonlyMap<string, number>>(NO_EMBED_HEIGHTS);
+  const onEmbedMeasure = useCallback((key: string, height: number) => {
+    const rounded = Math.ceil(height);
+    if (!(rounded > 0)) return;
+    setEmbedHeights((previous) =>
+      previous.get(key) === rounded ? previous : new Map(previous).set(key, rounded),
+    );
+  }, []);
+  // The width joins the lookup only once a claim has asked for it, so a
+  // layout pass does not reproject a document whose embeds are all sized.
+  const containerClaims = useRef<ContainerClaims>({ seen: false }).current;
+  const embedWidth = containerClaims.seen ? contentWidth : null;
+  const claimingEmbed = useMemo(() => (codeCards ? withCodeBlockCards(embed) : embed), [codeCards, embed]);
+  const sizedEmbed = useMemo(
+    () => resolveEmbedSizes(claimingEmbed, embedHeights, embedWidth, imageWidth, containerClaims),
+    [claimingEmbed, embedHeights, embedWidth, imageWidth, containerClaims],
   );
+
+  const embedLookup = useMemo((): EmbedLookup | undefined => {
+    const embed = sizedEmbed;
+    // Every size is resolved by `resolveEmbedSizes`.
+    if (!hasImageEmbeds) return embed as EmbedLookup | undefined;
+    const width = resolvedImageWidth;
+    if (optionHeight !== 'intrinsic') {
+      return withImageEmbeds(embed, { width, height: optionHeight ?? imageHeight });
+    }
+    // `ratioVersion` changes this function's identity when a ratio lands.
+    void ratioVersion;
+    return withImageEmbeds(embed, (image): ImageBox => {
+      const ratio = imageRatios.get(image.src);
+      let height = ratio !== undefined ? width / ratio : imageHeight;
+      if (maxImageHeight !== undefined && maxImageHeight > 0) {
+        height = Math.min(height, maxImageHeight);
+      }
+      return { width, height: Math.round(height) };
+    });
+  }, [
+    sizedEmbed,
+    hasImageEmbeds,
+    resolvedImageWidth,
+    optionHeight,
+    maxImageHeight,
+    imageHeight,
+    ratioVersion,
+  ]);
 
   const runs = useMemo(
     () =>
@@ -1177,6 +1626,15 @@ function SelectableMarkdownWithRef(
     ],
   );
 
+  // Segmentation just consulted the claims. One that asked for the container
+  // width while it was not yet in the lookup resolves before paint.
+  const [, refreshEmbedWidth] = useReducer((n: number) => n + 1, 0);
+  const staleEmbedWidth = containerClaims.seen && embedWidth === null && contentWidth !== null;
+  useLayoutEffect(() => {
+    if (staleEmbedWidth) refreshEmbedWidth();
+  }, [staleEmbedWidth]);
+  const awaitingWidth = awaitingImageWidth || (containerClaims.seen && contentWidth === null);
+
   // The gap below a PROSE run that abuts another PROSE run is the height of
   // the blank line the '\n\n' block separator would render between them —
   // NOT `spacing.blockGap`. Two flowing runs are only ever adjacent because
@@ -1187,6 +1645,15 @@ function SelectableMarkdownWithRef(
   const proseGap = Math.round(
     mergedTheme.fonts.baseSize * mergedTheme.fonts.lineHeight,
   );
+  // With `theme.blocks` set, the gap below a run is the collapsed margin
+  // between the blocks either side of it, box edge to box edge (a run's host
+  // already holds its edge boxes' padding).
+  const managedSpacing = spacingManaged(mergedTheme);
+  const lead = managedSpacing ? leadMargin(mergedTheme, runs[0]?.blocks[0]) : 0;
+  const lastRun = runs[runs.length - 1];
+  const trail = managedSpacing
+    ? trailMargin(mergedTheme, lastRun?.blocks[lastRun.blocks.length - 1])
+    : 0;
 
   const containerPadding = useMemo(
     () => ({ padding: mergedTheme.spacing.containerPadding }),
@@ -1200,16 +1667,22 @@ function SelectableMarkdownWithRef(
   return (
     <View
       {...accessibility}
-      onLayout={onLayout}
+      onLayout={handleLayout}
       style={containerStyle}
       testID={testID}
     >
-      {runs.map((run, index) => {
+      {!awaitingWidth && runs.map((run, index) => {
         const next = runs[index + 1];
+        const last = run.blocks[run.blocks.length - 1];
+        const following = next?.blocks[0];
         const gap =
-          !run.standalone && next !== undefined && !next.standalone
-            ? proseGap
-            : mergedTheme.spacing.blockGap;
+          managedSpacing && last !== undefined && following !== undefined
+            ? marginBetween(mergedTheme, last, following)
+            : next === undefined && managedSpacing
+              ? trail
+              : !run.standalone && next !== undefined && !next.standalone
+                ? proseGap
+                : mergedTheme.spacing.blockGap;
         const unsettledTail = streaming && run.span.end > settledUntil;
         // The tail is not keyed by start: a moved key remounts the host under a
         // live selection. `streamed`, not `unsettledTail`, so the tail keeps
@@ -1217,22 +1690,40 @@ function SelectableMarkdownWithRef(
         const key = runKey(run, index, runs.length, streamed);
         return (
           <MemoRunView
+            accessibilityForPressable={accessibilityForPressable}
+            allowFontScaling={allowFontScaling}
             attributeForMark={attributeForMark}
+            chipForMark={chipForMark}
             doc={visibleDoc}
+            codeCard={codeCard}
             embed={embedLookup}
+            onEmbedMeasure={onEmbedMeasure}
             exclusiveSelection={exclusiveSelection}
             gap={gap}
+            highlights={highlights}
             key={key}
+            lead={index === 0 ? lead : 0}
             linkPrefixes={linkPrefixes}
+            maxFontSizeMultiplier={
+              maxFontSizeMultiplier !== undefined && maxFontSizeMultiplier > 0
+                ? maxFontSizeMultiplier
+                : 0
+            }
             onLinkPress={runLinkPress}
             onSelectionChange={runSelectionChange}
             onSelectionCopy={runSelectionCopy}
+            pressableHitSlop={pressableHitSlop}
+            pressedStyle={pressedStyle}
             registry={registry}
             renderers={rendererMap}
             run={run}
             runKey={key}
             selectionActions={selectionActions ?? DEFAULT_SELECTION_ACTIONS}
+            softBreak={softBreak}
             theme={mergedTheme}
+            transformInline={transformInline}
+            copySnapping={copySnapping}
+            streamingEmbeds={streamingEmbeds}
             unsettledTail={unsettledTail}
           />
         );
@@ -1240,6 +1731,119 @@ function SelectableMarkdownWithRef(
     </View>
   );
 }
+
+/** The previous value while `same` says the new one is equal, so memos keyed on it hold. */
+function useStructural<T>(value: T, same: (a: T, b: T) => boolean): T {
+  const ref = useRef(value);
+  if (ref.current !== value && !same(ref.current, value)) {
+    ref.current = value;
+  }
+  return ref.current;
+}
+
+/** Themes are plain data: groups of primitives, a few arrays and small objects. */
+function sameThemeValue(a: unknown, b: unknown, depth = 0): boolean {
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (depth > 6 || Array.isArray(a) !== Array.isArray(b)) return false;
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => sameThemeValue(left[key], right[key], depth + 1));
+}
+
+function sameShallow(a: object | undefined, b: object | undefined): boolean {
+  if (a === b) return true;
+  if (a === undefined || b === undefined) return false;
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length && keys.every((key) => left[key] === right[key]);
+}
+
+/** Width / height per image URL, shared across documents; bounded, oldest out. */
+const imageRatios = new Map<string, number>();
+const pendingRatios = new Set<string>();
+/**
+ * Everyone waiting on a URL. The request is shared, so its answer goes to every
+ * current subscriber, not only the effect that started it: a second view of the
+ * same URL, a StrictMode remount, or an effect that re-ran mid-load would
+ * otherwise wait at the fallback height forever.
+ */
+const ratioListeners = new Map<string, Set<() => void>>();
+const MAX_IMAGE_RATIOS = 256;
+
+function settleRatio(src: string): void {
+  pendingRatios.delete(src);
+  const listeners = ratioListeners.get(src);
+  if (listeners === undefined) return;
+  for (const listener of [...listeners]) listener();
+}
+
+function requestRatio(src: string): void {
+  if (pendingRatios.has(src) || imageRatios.has(src)) return;
+  pendingRatios.add(src);
+  Image.getSize(
+    src,
+    (width, height) => {
+      if (width > 0 && height > 0) {
+        if (imageRatios.size >= MAX_IMAGE_RATIOS) {
+          const oldest = imageRatios.keys().next().value;
+          if (oldest !== undefined) imageRatios.delete(oldest);
+        }
+        imageRatios.set(src, width / height);
+      }
+      settleRatio(src);
+    },
+    () => settleRatio(src),
+  );
+}
+
+/**
+ * Fetches the aspect ratio of every sole-paragraph image in `doc` it has not
+ * seen, and returns a counter that moves when one lands.
+ */
+function useImageRatios(doc: ParsedDocument | null): number {
+  const [version, setVersion] = useState(0);
+  const sources = useMemo(() => {
+    if (doc === null) return [];
+    const out: string[] = [];
+    for (const block of doc.blocks) {
+      if (block.kind !== 'paragraph' || block.children.length !== 1) continue;
+      const only = block.children[0];
+      if (only.kind === 'image' && !imageRatios.has(only.src)) out.push(only.src);
+    }
+    return out;
+  }, [doc]);
+  useLayoutEffect(() => {
+    if (sources.length === 0) return undefined;
+    const bump = (): void => setVersion((value) => value + 1);
+    let landedEarly = false;
+    for (const src of sources) {
+      let listeners = ratioListeners.get(src);
+      if (listeners === undefined) {
+        listeners = new Set();
+        ratioListeners.set(src, listeners);
+      }
+      listeners.add(bump);
+      // Resolved between this render and the subscription: nothing will call back.
+      if (imageRatios.has(src)) landedEarly = true;
+      else requestRatio(src);
+    }
+    if (landedEarly) bump();
+    return () => {
+      for (const src of sources) {
+        const listeners = ratioListeners.get(src);
+        if (listeners === undefined) continue;
+        listeners.delete(bump);
+        if (listeners.size === 0) ratioListeners.delete(src);
+      }
+    };
+  }, [sources]);
+  return version;
+}
+
 
 /**
  * Attaching a ref subscribes to selection changes, since `getSelection()` has

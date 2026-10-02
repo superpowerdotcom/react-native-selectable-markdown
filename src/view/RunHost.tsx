@@ -46,6 +46,11 @@ export interface InlinePressEvent {
   /** The identifier `RunHost` sent with the range: its index into the
    * `pressables` prop as passed, echoed back verbatim by the host. */
   pressableId: number;
+  /** The pressed range's bounds in `pageX`/`pageY` space; absent from older binaries. */
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
 }
 
 export interface SelectionActionEvent {
@@ -90,9 +95,11 @@ export interface RunHostHandle {
  * rather than in `resolveRunAttributes` keeps that module free of React
  * Native, so the styling rules stay unit-testable in plain Node.
  */
-interface NativeTextAttribute extends Omit<RunTextAttribute, 'color' | 'backgroundColor'> {
+interface NativeTextAttribute
+  extends Omit<RunTextAttribute, 'color' | 'backgroundColor' | 'textDecorationColor'> {
   color?: ReturnType<typeof processColor>;
   backgroundColor?: ReturnType<typeof processColor>;
+  textDecorationColor?: ReturnType<typeof processColor>;
 }
 
 /** `RunDecoration` with its colours converted, exactly like the attributes. */
@@ -115,6 +122,11 @@ interface NativePressableRange {
   end: number;
   /** Index into the `pressables` prop this component was given. */
   pressableId: number;
+  accessibilityLabel?: string;
+  accessibilityRole?: string;
+  pressedColor?: ReturnType<typeof processColor>;
+  pressedRadius?: number;
+  hitSlop?: number;
 }
 
 /**
@@ -163,6 +175,8 @@ interface NativeRunHostProps extends RunHostAccessibilityProps {
   embeds: readonly NativeRunEmbedRange[];
   selectable: boolean;
   exclusiveSelection: boolean;
+  allowFontScaling: boolean;
+  maxFontSizeMultiplier: number;
   /** Wire form from `encodeSelectionActions`. */
   selectionActions: readonly string[];
   onSelectionAction?: (e: NativeSyntheticEvent<SelectionActionEvent>) => void;
@@ -222,7 +236,7 @@ const NO_PRESSABLES: readonly never[] = Object.freeze([]);
 const NO_EMBEDS: readonly never[] = Object.freeze([]);
 
 function toNativeAttribute(attribute: RunTextAttribute): NativeTextAttribute {
-  const { color, backgroundColor, ...rest } = attribute;
+  const { color, backgroundColor, textDecorationColor, ...rest } = attribute;
   const native: NativeTextAttribute = { ...rest };
   // Only set the keys that were present: every entry is sparse, and a
   // `color: null` from processColor would read on the native side as "this
@@ -233,6 +247,31 @@ function toNativeAttribute(attribute: RunTextAttribute): NativeTextAttribute {
     const processed = memoizedProcessColor(backgroundColor);
     if (processed != null) native.backgroundColor = processed;
   }
+  if (textDecorationColor !== undefined) {
+    const processed = memoizedProcessColor(textDecorationColor);
+    if (processed != null) native.textDecorationColor = processed;
+  }
+  return native;
+}
+
+function toNativePressable(pressable: RunPressable, index: number): NativePressableRange {
+  const native: NativePressableRange = {
+    start: pressable.start,
+    end: pressable.end,
+    pressableId: index,
+  };
+  if (pressable.accessibilityLabel !== undefined) {
+    native.accessibilityLabel = pressable.accessibilityLabel;
+  }
+  if (pressable.accessibilityRole !== undefined) {
+    native.accessibilityRole = pressable.accessibilityRole;
+  }
+  if (pressable.pressedColor !== undefined) {
+    const processed = memoizedProcessColor(pressable.pressedColor);
+    if (processed != null) native.pressedColor = processed;
+  }
+  if (pressable.pressedRadius !== undefined) native.pressedRadius = pressable.pressedRadius;
+  if (pressable.hitSlop !== undefined) native.hitSlop = pressable.hitSlop;
   return native;
 }
 
@@ -431,6 +470,10 @@ export interface RunHostProps extends RunHostAccessibilityProps {
    * but with no visible highlight, so the consumer must draw one.
    */
   exclusiveSelection?: boolean;
+  /** Default true. False ignores the system text-size setting. */
+  allowFontScaling?: boolean;
+  /** Caps the system text-size multiplier; 0 or unset is no cap. */
+  maxFontSizeMultiplier?: number;
   onSelectionAction?: (e: SelectionActionEvent) => void;
   /**
    * Also reports empty selections. An unchanged range is not re-announced,
@@ -498,6 +541,8 @@ function RunHostWithRef(
     embeds = NO_EMBEDS,
     selectable,
     exclusiveSelection = true,
+    allowFontScaling = true,
+    maxFontSizeMultiplier = 0,
     selectionActions = DEFAULT_SELECTION_ACTIONS,
     unsettledTail = false,
     onSelectionAction,
@@ -591,12 +636,7 @@ function RunHostWithRef(
   // is memoized anyway because the array is re-sent on every streamed
   // snapshot, like `attributes` above.
   const nativePressables = useMemo<readonly NativePressableRange[]>(
-    () =>
-      pressables.map((pressable, index) => ({
-        start: pressable.start,
-        end: pressable.end,
-        pressableId: index,
-      })),
+    () => pressables.map(toNativePressable),
     [pressables],
   );
 
@@ -675,6 +715,7 @@ function RunHostWithRef(
   return (
     <Native
       {...accessibility}
+      allowFontScaling={allowFontScaling}
       attributes={nativeAttributes}
       decorations={nativeDecorations}
       // Always sent, unlike pressables: the reservation is layout-affecting,
@@ -683,6 +724,11 @@ function RunHostWithRef(
       embeds={nativeEmbeds}
       // Not listener-gated: it switches coordination off, not a feature on.
       exclusiveSelection={exclusiveSelection}
+      maxFontSizeMultiplier={
+        Number.isFinite(maxFontSizeMultiplier) && maxFontSizeMultiplier > 0
+          ? maxFontSizeMultiplier
+          : 0
+      }
       onEmbedLayout={onEmbedLayout ? onEmbedLayoutEvent : undefined}
       onInlinePress={onInlinePress ? onInlinePressEvent : undefined}
       onSelectionAction={onSelectionAction ? onSelectionActionEvent : undefined}

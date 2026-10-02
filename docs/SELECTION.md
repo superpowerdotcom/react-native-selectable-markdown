@@ -338,12 +338,14 @@ works.
 | Prop | Type | Meaning |
 | --- | --- | --- |
 | `text` | `string` | `ProjectedRun.text`. Rendered verbatim. |
-| `attributes` | `object[]` | Styled ranges `{ start, end }` plus any of `fontFamily`, `fontSize`, `lineHeight`, `fontWeight`, `fontStyle`, `textDecorationLine`, `color`, `backgroundColor`, and the six semantic fields: `role` (`'heading' \| 'listItem' \| 'tableCell'`), `roleLevel`, `roleRow`, `roleRowCount`, `roleColumn`, `roleColumnCount` — every count and index an int, one-based, 0 the absent sentinel. A `listItem` entry covers the item's OWN text and stops where a nested sublist or table begins, so each item is exactly one element on both hosts. Sparse, ordered outermost-first so the innermost wins. Colours are `processColor` integers. `role` is not reachable from `attributeForMark`: a styling hook may restyle a heading and may not stop it being one. The semantics cost one extra entry per list item and per table cell on every streamed snapshot, each carrying a role and two or four small integers and no styling — which is why the role set stays this small. |
+| `attributes` | `object[]` | Styled ranges `{ start, end }` plus any of `fontFamily`, `fontSize`, `lineHeight`, `fontWeight`, `fontStyle`, `textDecorationLine`, `textDecorationColor`, `textDecorationStyle` (`'solid' \| 'double' \| 'dotted' \| 'dashed'`), `letterSpacing` (points, scaled like `fontSize`), `color`, `backgroundColor`, and the six semantic fields: `role` (`'heading' \| 'listItem' \| 'tableCell'`), `roleLevel`, `roleRow`, `roleRowCount`, `roleColumn`, `roleColumnCount` — every count and index an int, one-based, 0 the absent sentinel. A `listItem` entry covers the item's OWN text and stops where a nested sublist or table begins, so each item is exactly one element on both hosts. Sparse, ordered outermost-first so the innermost wins. Colours are `processColor` integers. `role` is not reachable from `attributeForMark`: a styling hook may restyle a heading and may not stop it being one. The semantics cost one extra entry per list item and per table cell on every streamed snapshot, each carrying a role and two or four small integers and no styling — which is why the role set stays this small. |
 | `decorations` | `object[]` | Block chrome `{ start, end, kind }` plus styling, from `resolveRunDecorations`. Geometric kinds, never moves a character. Older binaries ignore it. |
-| `pressables` | `object[]` | Tappable ranges `{ start, end, pressableId }`, non-overlapping. The non-overlap is ENFORCED, not assumed: overlapping link marks do occur — md4c parses `[<https://a.com>](https://b.com)` as a link whose text is an autolink, and the projection emits a mark for each — and `resolveRunPressables` drops a range starting inside one already kept, so the first in mark order survives, which is also what both hosts' "first containing range" hit test would have chosen. `[]` when no `onInlinePress` listener exists. Older binaries ignore it. |
+| `pressables` | `object[]` | Tappable ranges `{ start, end, pressableId }` plus optional `accessibilityLabel`, `accessibilityRole` (`'link'` default, `'button'`, or `'text'`: still tappable, but no accessibility element, so it is read with the prose around it), `pressedColor` / `pressedRadius` (a fill painted behind the range, or its chip, while a touch that began on it is down) and `hitSlop` (points added around each line rect for tap hit-testing only), non-overlapping. The non-overlap is ENFORCED, not assumed: overlapping link marks do occur — md4c parses `[<https://a.com>](https://b.com)` as a link whose text is an autolink, and the projection emits a mark for each — and `resolveRunPressables` drops a range starting inside one already kept, so the first in mark order survives, which is also what both hosts' "first containing range" hit test would have chosen. `[]` when no `onInlinePress` listener exists. Older binaries ignore it. |
 | `embeds` | `object[]` | Embedded ranges `{ start, end, embedId, width, height }`, each the single U+FFFC placeholder an `embed` claim projected (`end === start + 1`). The host reserves `width` × `height` points there — an `NSTextAttachment` on iOS, a `ReplacementSpan` on Android, both applied inside the shared string builder so measurement and drawing agree — and reports the rect through `onEmbedLayout`. The height also rides `attributes` as a `lineHeight` over the placeholder, never smaller than the covering attributes already give the line; the Android host re-decodes that height in DIP (the box's unit) rather than SP and applies `max(height, tallest covering line height)` in pixels, so the reserved band and the reported rect keep their size under a system font scale other than 1.0. iOS is points on both halves. Host guards: positive AND FINITE size, 1-unit range, the character really is U+FFFC; a stale entry reserves nothing. JS drops a claim whose declared size is not positive and finite before sending, and a dropped claim does not renumber the others — `embedId` is the entry's index into `ProjectedRun.embeds`, not its index in the array on the wire. Layout-affecting, so sent whenever embeds exist, not gated on a listener. Older binaries ignore it: the placeholder is an invisible one-character gap (transparent colour via `attributes`), no overlay mounts, mapping stays exact. |
 | `selectable` | `boolean` | Whether platform selection UI is enabled. Driven by the tail policy. |
 | `exclusiveSelection` | `boolean` | Whether this host takes part in the process-wide one-active-selection coordination. Defaults to true on the wire (`WithDefault<boolean, true>`), which is the behaviour that predates the prop. See "Tail policy". |
+| `allowFontScaling` | `boolean` | False pins font sizes, line heights and letter spacing to their declared points regardless of the system text size. Default true. |
+| `maxFontSizeMultiplier` | `number` | Caps the system text-size multiplier when ≥ 1; 0 (default) is no cap. Ignored when `allowFontScaling` is false. |
 | `selectionActions` | `string[]` | The custom menu items, in menu order — the order IS the menu order. On the wire each entry is `id` or `id + U+001F + title`; at the `SelectableMarkdown`/`RunHost` level the prop takes `(string \| { id, title? })[]`. Default: both built-ins. `[]` when no `onSelectionAction` listener exists. A bare id takes the host's own localised title, which exists for `'copy-text'` and `'copy-markdown'` only; an id the host cannot title — unrecognised, and no title sent — is dropped rather than rendered blank, which is also the forward-compatibility rule for a newer JS bundle on an older binary. The encoder drops an entry whose id is empty or contains U+001F. |
 | `testID` | `string?` | Standard RN test handle. |
 
@@ -371,12 +373,34 @@ Decoration kinds:
   from the list term, and `hang` is one `listIndent` inside a list and 0
   outside it. Emitted for a blockquote body at `level === 0` too, so the body
   clears the bar. Ranges are disjoint because Android margin spans sum where
-  iOS paragraph styles assign.
+  iOS paragraph styles assign. With `list.hangingIndent` (or a dot marker)
+  the step is that width instead of `listIndent`.
+- **`'chip'`.** A rounded fill behind an inline range (`color`,
+  `borderRadius`, optional border), `paddingH` wider on each side and
+  `paddingTop` / `paddingBottom` taller than the glyph box. The horizontal
+  room, plus any `minWidth` shortfall split evenly, is reserved in the
+  string builder (kern on iOS, a `ReplacementSpan` on Android); the
+  vertical padding only paints. A chip does not break across lines.
+- **`'marker'`.** A list marker column over the marker glyphs: its advance is
+  pinned to at least `minWidth`, glyphs at the leading edge, so first-line
+  text starts where wrapped lines hang. With `dotSize` the host draws a dot
+  in `color` centred on the x-height; JS hides the glyphs itself.
+- **`'spacing'`.** `paddingBottom` points of paragraph spacing after the
+  range's last paragraph — the gap between list items, and between blocks
+  inside one item. Inside an item a configured gap (`list.itemGap`, else
+  `blocks.listItem`) wins, else the blocks' own collapsed `theme.blocks`
+  margins; the standalone renderers apply the same rule. Never sent for the
+  run's last paragraph.
 
-Paint order is fills, blockquote bars, strokes, all behind the text and the
-selection highlight. Layout-affecting parts (`textInset`, tab stops,
-`'indent'`) are applied in the shared string builder, so measurement sees
-what drawing does.
+Block margins (`theme.blocks`) need no kind of their own: the blank line a
+'\n\n' separator projects becomes the margin through a `lineHeight`
+attribute over its one character, so no offset moves.
+
+Paint order is fills (boxes, chips, marker dots), blockquote bars, the
+pressed fill, strokes, all behind the text and the selection highlight.
+Layout-affecting parts (`textInset`, tab stops, `'indent'`, `'chip'` and
+`'marker'` widths, `'spacing'`) are applied in the shared string builder, so
+measurement sees what drawing does.
 
 `RunHostProps.style` is a `ViewStyle`. Text properties there do nothing;
 typography comes from `attributes`. `lineHeight` is on the wire because the
@@ -569,8 +593,9 @@ The overlay is a **sibling** of the host, absolutely positioned by
 the native component is a leaf on both platforms. So a card appears one
 frame after its run first lays out, into space that was reserved natively
 from the first frame — no reflow. While the run is the unsettled streaming
-tail no overlay mounts at all; the reservation still does, so the card
-appears without a reflow when the run settles. A long-press on the card
+tail no overlay mounts at all unless `streamingEmbeds` is set; the
+reservation still does, so the card appears without a reflow when the run
+settles. A long-press on the card
 starts no selection; the sweep starts on the prose around it.
 
 ## Event: `onSelectionChange`
@@ -1038,6 +1063,18 @@ those renderers runs at all — `RunHost` mounts one childless native host
 built from `text` plus `attributes`, and `renderBlocks` is reached only
 through the `run.standalone` branch — so a renderer's `selectable` can never
 argue with the tail policy.
+
+A standalone list is ONE `<Text selectable>`, nested lists included, and a
+standalone quote is one `<Text selectable>` inside its bar and box, so a
+selection runs across items, paragraphs and nested items, and markers copy
+with the text. The characters match what the run projects (items and an
+item's blocks one '\n' apart, a quote's blocks '\n\n' apart), except that a
+non-zero item gap or block margin is an extra empty line sized to the gap. The
+cost is the layout: nested text cannot hang-indent, so wrapped lines return
+to the list's leading edge, a nested list's items are inset by an inline
+spacer view, and a dot marker draws as the bullet glyph in the dot's colour
+with no pinned column. A child that needs a view of its own (a code block,
+table, rule, nested quote, image) nests as an inline view, as it always did.
 
 | | Prose run | Embedded node | Standalone prose block | Code block (claimed) | Table (claimed) |
 | --- | --- | --- | --- | --- | --- |

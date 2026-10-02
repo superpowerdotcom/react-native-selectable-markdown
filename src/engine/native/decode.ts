@@ -972,7 +972,9 @@ function buildFrame(frame: Frame, parent: Frame, ctx: DecodeContext): void {
         return;
       }
       if (autolink) {
-        push(parent, { kind: 'autolink', span: widened, href });
+        const typed = source.slice(widened.start, widened.end);
+        const text = typed.startsWith('<') && typed.endsWith('>') ? typed.slice(1, -1) : typed;
+        push(parent, { kind: 'autolink', span: widened, href, text: text || href });
         return;
       }
       const title = frame.stringB >= 0 ? ctx.strings.get(frame.stringB) : '';

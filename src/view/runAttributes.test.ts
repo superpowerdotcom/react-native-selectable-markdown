@@ -612,6 +612,30 @@ describeNative('semantic roles', () => {
     expect(rows).toEqual(['1 of 2', '2 of 2', '1 of 1']);
   });
 
+  test('table body typography stays off the header row', () => {
+    const run = project('| H |\n| - |\n| b |\n', EVERYTHING, ALWAYS_FLOWING);
+    const theme = mergeTheme({
+      table: {
+        header: { fontSize: 13 },
+        body: { fontSize: 17, lineHeight: 24, color: '#123456', fontFamily: 'Body', letterSpacing: 0.5 },
+      },
+    });
+    const attributes = resolveRunAttributes(run, theme);
+    const header = styleAt(attributes, run.text.indexOf('H'));
+    expect(header.fontSize).toBe(13);
+    expect(header.lineHeight).not.toBe(24);
+    expect(header.color).not.toBe('#123456');
+    expect(header.fontFamily).not.toBe('Body');
+    expect(header.letterSpacing).not.toBe(0.5);
+    expect(styleAt(attributes, run.text.indexOf('b'))).toMatchObject({
+      fontSize: 17,
+      lineHeight: 24,
+      color: '#123456',
+      fontFamily: 'Body',
+      letterSpacing: 0.5,
+    });
+  });
+
   test('a flowed table gives every cell its row and column', () => {
     const run = project('| a | b |\n| - | - |\n| c | d |\n', EVERYTHING, ALWAYS_FLOWING);
     expect(

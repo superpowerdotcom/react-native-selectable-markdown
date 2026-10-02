@@ -69,6 +69,8 @@ export {
 } from './engine/options';
 
 export type { Engine } from './engine/Engine';
+export { extractLinks } from './engine/links';
+export type { ExtractedLink } from './engine/links';
 export { parseDocument } from './engine/Engine';
 
 // `ParseToBuffer` is public because `createNativeEngine` takes one; the rest of `engine/native` is not.
@@ -148,6 +150,7 @@ export {
 export type {
   ProjectedRun,
   ProjectedExtent,
+  ProjectedBlock,
   ProjectedRunEmbed,
   RunPiece,
   RunMark,
@@ -155,6 +158,11 @@ export type {
   ProjectionGlyphs,
   ProjectRunOptions,
   PreviousProjection,
+  ProjectedPrefix,
+  InlineTransform,
+  InlineTransformResult,
+  InlinePrefix,
+  InlinePrefixStyle,
 } from './selection/mapSelection';
 export {
   projectRun,
@@ -192,16 +200,32 @@ export type {
   ThemeFontWeight,
   MarkdownTheme,
   PartialTheme,
+  BlockSpacing,
+  BlockSpacingKind,
+  HeadingLevelStyle,
+  ListMarkerStyle,
+  ResolvedHeadingStyle,
+  TableCellTextStyle,
+  UnderlineStyle,
 } from './view/theme';
 export {
   defaultTheme,
   defaultDarkTheme,
   mergeTheme,
   headingFontSize,
+  headingStyle,
 } from './view/theme';
+export type {
+  ChipStyle,
+  Highlights,
+  PressableAccessibility,
+  PressableInfo,
+  PressedStyle,
+} from './view/runPresentation';
 
 export type {
   RenderContext,
+  InlineScope,
   NodeKind,
   NodeRenderer,
   RendererMap,
@@ -215,11 +239,13 @@ export {
   renderBlocks,
   openUrl,
   textContentOf,
+  withMark,
   MAX_RENDER_DEPTH,
 } from './view/renderers';
 
 // `withImageEmbeds` implements the `images` prop for consumers driving `segmentRuns`/`RunHost` directly.
-export type { ImageMode } from './view/imageEmbeds';
+export type { ImageMode, ImageOptions } from './view/imageEmbeds';
+export type { CodeBlockMode, CodeBlockOptions, CodeCopyEvent } from './view/codeBlocks';
 export { withImageEmbeds } from './view/imageEmbeds';
 
 // `RunHostProps.attributes` is public API and its element type was previously
@@ -234,6 +260,10 @@ export type {
   MarkAttribute,
 } from './view/runAttributes';
 export { resolveRunAttributes } from './view/runAttributes';
+export type { RunSpacing } from './view/blockSpacing';
+export { resolveRunSpacing } from './view/blockSpacing';
+export type { PressablePresentation, RunChips } from './view/runPresentation';
+export { presentPressables, resolveChips, resolveRunHighlights } from './view/runPresentation';
 
 // Same reasoning as runAttributes: `RunHostProps.pressables` is public API,
 // so its element type must be nameable from the package entry.
@@ -243,7 +273,7 @@ export { resolveRunPressables } from './view/runPressables';
 // And again for `RunHostProps.decorations` — `RunDecoration` is what
 // `NativeRunDecoration` in the codegen spec mirrors, field for field.
 export type { RunDecoration } from './view/runDecorations';
-export { resolveRunDecorations } from './view/runDecorations';
+export { resolveRunDecorations, hiddenHeaderLines } from './view/runDecorations';
 
 // And for `RunHostProps.embeds` — `RunEmbed` is what `NativeRunEmbed` in the
 // codegen spec mirrors, minus the JS-only `node`/`text` fields that never

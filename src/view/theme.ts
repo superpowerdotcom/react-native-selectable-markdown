@@ -22,14 +22,71 @@ export type ThemeFontWeight =
   | '800'
   | '900';
 
+/** Vertical margins around one block, in points. */
+export interface BlockSpacing {
+  before?: number;
+  after?: number;
+}
+
+/** One heading level's typography; every field overrides the group-wide token. */
+export interface HeadingLevelStyle extends BlockSpacing {
+  fontSize?: number;
+  /** Absolute, in points. */
+  lineHeight?: number;
+  fontFamily?: string;
+  color?: string;
+  weight?: ThemeFontWeight;
+  letterSpacing?: number;
+}
+
+/** Typography for one kind of table cell (header or body). */
+export interface TableCellTextStyle {
+  fontFamily?: string;
+  fontSize?: number;
+  /** Absolute, in points. */
+  lineHeight?: number;
+  color?: string;
+  weight?: ThemeFontWeight;
+  letterSpacing?: number;
+}
+
+/**
+ * How a bullet is drawn. Ordered numbers and task boxes always render as
+ * text; only the bullet glyph becomes a dot.
+ */
+export type ListMarkerStyle =
+  | {
+      kind: 'dot';
+      /** Diameter, in points. */
+      size: number;
+      /** Space between the dot and the item's text. */
+      gap: number;
+      /** Unset: `colors.listMarker`, else the text colour. */
+      color?: string;
+    }
+  | {
+      kind: 'glyph';
+      /** Replaces `glyphs.bullet`. */
+      glyph?: string;
+      color?: string;
+      fontFamily?: string;
+      fontSize?: number;
+      weight?: ThemeFontWeight;
+    };
+
+export type UnderlineStyle = 'solid' | 'double' | 'dotted' | 'dashed' | 'none';
+
 /**
  * Flat token object; consumer overrides are deep-merged over the defaults
  * one group deep (`colors`, `fonts`, `spacing`, `code`, `quote`, `table`,
- * `headings`, `rule`, `glyphs`).
+ * `headings`, `rule`, `glyphs`, `blocks`, `list`, `html`, `link`).
  *
  * One group deep is not the whole rule: four tokens also feed a token in
  * another group when that one is not itself overridden. See `mergeTheme`.
  */
+/** A `theme.blocks` margin kind, as `blocks.firstBlockLead` lists them. */
+export type BlockSpacingKind = 'paragraph' | 'heading' | 'list' | 'listItem' | 'quote' | 'code' | 'table' | 'rule';
+
 export interface MarkdownTheme {
   colors: {
     text: string;
@@ -65,6 +122,8 @@ export interface MarkdownTheme {
      * distinct face in a distinct shade rather than a weight bump.
      */
     strong?: string;
+    /** Colour for emphasis (italic) text; unset inherits, like `strong`. */
+    emphasis?: string;
     muted: string;
     codeText: string;
     codeBackground: string;
@@ -77,6 +136,10 @@ export interface MarkdownTheme {
     tableHeaderBackground: string;
     spoilerMask: string;
     spoilerRevealedBackground: string;
+    /** Background of a `highlights` match. */
+    highlight: string;
+    /** Text colour of a `highlights` match; unset keeps the text's own. */
+    highlightText?: string;
   };
   fonts: {
     body: string;
@@ -174,6 +237,18 @@ export interface MarkdownTheme {
     cellPaddingV: number;
     rowRuleThickness: number;
     headerWeight: ThemeFontWeight;
+    /** Draw the outer border. Default true; false keeps only the row rules. */
+    frame: boolean;
+    /** Outer border colour; unset: `colors.border`. */
+    frameColor?: string;
+    /** Row rule colour; unset: `colors.border`. */
+    ruleColor?: string;
+    /** Header-row typography; `weight` here beats `headerWeight`. */
+    header?: TableCellTextStyle;
+    /** Body-row typography. */
+    body?: TableCellTextStyle;
+    /** Collapse a header row whose cells are all empty, with its band and rule. */
+    hideEmptyHeader: boolean;
   };
   headings: {
     /** Multipliers over `fonts.baseSize` for h1..h6. */
@@ -191,12 +266,22 @@ export interface MarkdownTheme {
      * then had to restate size, colour and weight the theme already knew.
      */
     lineHeight?: number;
+    /** Family for every level; unset: `fonts.body`. */
+    fontFamily?: string;
+    letterSpacing?: number;
+    /**
+     * Per-level overrides, index 0 = h1. A level's `fontSize` replaces its
+     * `scale`; its `before` / `after` replace `blocks.heading`.
+     */
+    levels?: readonly (HeadingLevelStyle | undefined)[];
   };
   /** Thematic break (horizontal rule). */
   rule: {
     thickness: number;
     /** Horizontal inset from each edge. */
     inset: number;
+    /** Unset: `colors.border`, which tables share. */
+    color?: string;
   };
   /**
    * Marker strings prepended to list items. The defaults match the
@@ -210,6 +295,58 @@ export interface MarkdownTheme {
     bullet: string;
     taskChecked: string;
     taskUnchecked: string;
+  };
+  /**
+   * Per-kind vertical margins, collapsed web-style: two adjacent blocks sit
+   * `max(first.after, second.before)` apart, measured from the edge of any
+   * box (code, table, quote) rather than its text. EMPTY BY DEFAULT, which
+   * keeps the old spacing: one blank line inside a run, `spacing.blockGap`
+   * between a run and a standalone block. Setting any key switches the whole
+   * document to these margins, an unset side counting as 0.
+   */
+  blocks: {
+    paragraph?: BlockSpacing;
+    /** All levels; `headings.levels[n].before/after` override per level. */
+    heading?: BlockSpacing;
+    list?: BlockSpacing;
+    /** Between the items of one list, and between blocks inside an item. */
+    listItem?: BlockSpacing;
+    quote?: BlockSpacing;
+    code?: BlockSpacing;
+    table?: BlockSpacing;
+    rule?: BlockSpacing;
+    /**
+     * Apply the first block's `before` above it. Default false: it collapses
+     * into the container. A list of kinds applies it only when the first
+     * block is one of them: `['heading']` keeps an opening heading's margin
+     * and lets an opening paragraph sit flush.
+     */
+    firstBlockLead?: boolean | readonly BlockSpacingKind[];
+    /** Apply the last block's `after` below it. Default false. */
+    lastBlockTrail?: boolean;
+  };
+  list: {
+    marker?: ListMarkerStyle;
+    /** Shorthand for the gap between items; beats `blocks.listItem`. */
+    itemGap?: number;
+    /**
+     * Width of the marker column. Set (or implied by a dot marker's
+     * `size + gap`), the marker is pinned to it so first-line text starts
+     * exactly where wrapped lines hang. Unset: wrapped lines hang
+     * `spacing.listIndent` deep and the marker keeps its natural width.
+     */
+    hangingIndent?: number;
+  };
+  /** Raw HTML that reaches the screen (`html: 'raw'`). */
+  html: {
+    /** 'code' (default): muted mono. 'text': body text. */
+    display: 'code' | 'text';
+  };
+  link: {
+    /** Default 'solid'. */
+    underline: UnderlineStyle;
+    /** Unset: the link colour. */
+    underlineColor?: string;
   };
 }
 
@@ -253,10 +390,20 @@ const baseTokens = {
     cellPaddingV: 6,
     rowRuleThickness: 1,
     headerWeight: '700',
+    frame: true,
+    hideEmptyHeader: false,
   },
   headings: {
     scale: [1.6, 1.4, 1.25, 1.1, 1.0, 0.9],
     weight: '700',
+  },
+  blocks: {},
+  list: {},
+  html: {
+    display: 'code',
+  },
+  link: {
+    underline: 'solid',
   },
   rule: {
     thickness: 1,
@@ -283,6 +430,7 @@ export const defaultTheme: MarkdownTheme = {
     tableHeaderBackground: '#f0f2f5',
     spoilerMask: '#40454c',
     spoilerRevealedBackground: '#e9ebee',
+    highlight: '#fff3a3',
   },
   quote: {
     background: '#6e77810d',
@@ -310,6 +458,7 @@ export const defaultDarkTheme: MarkdownTheme = {
     tableHeaderBackground: '#161b22',
     spoilerMask: '#484f58',
     spoilerRevealedBackground: '#21262d',
+    highlight: '#6e5a0f',
   },
   quote: {
     background: '#ffffff0d',
@@ -322,7 +471,44 @@ export function headingFontSize(
   theme: MarkdownTheme,
   level: HeadingLevel,
 ): number {
+  const pinned = theme.headings.levels?.[level - 1]?.fontSize;
+  if (pinned !== undefined) return pinned;
   return Math.round(theme.fonts.baseSize * (theme.headings.scale[level - 1] ?? 1));
+}
+
+/** The glyph unordered items project with: `list.marker.glyph`, else `glyphs.bullet`. */
+export function bulletGlyph(theme: MarkdownTheme): string {
+  const marker = theme.list.marker;
+  return marker?.kind === 'glyph' && marker.glyph !== undefined ? marker.glyph : theme.glyphs.bullet;
+}
+
+/** A heading level's resolved typography, shared by both render paths. */
+export interface ResolvedHeadingStyle {
+  fontSize: number;
+  lineHeight: number;
+  fontFamily: string;
+  color: string;
+  fontWeight: ThemeFontWeight;
+  letterSpacing?: number;
+}
+
+export function headingStyle(
+  theme: MarkdownTheme,
+  level: HeadingLevel,
+): ResolvedHeadingStyle {
+  const { headings } = theme;
+  const own = headings.levels?.[level - 1];
+  const fontSize = headingFontSize(theme, level);
+  const style: ResolvedHeadingStyle = {
+    fontSize,
+    lineHeight: own?.lineHeight ?? headings.lineHeight ?? fontSize * theme.fonts.lineHeight,
+    fontFamily: own?.fontFamily ?? headings.fontFamily ?? theme.fonts.body,
+    color: own?.color ?? theme.colors.heading,
+    fontWeight: own?.weight ?? headings.weight,
+  };
+  const letterSpacing = own?.letterSpacing ?? headings.letterSpacing;
+  if (letterSpacing !== undefined) style.letterSpacing = letterSpacing;
+  return style;
 }
 
 
@@ -336,6 +522,7 @@ const THEME_KEYS = {
     'blockedLink',
     'listMarker',
     'strong',
+    'emphasis',
     'muted',
     'codeText',
     'codeBackground',
@@ -345,6 +532,8 @@ const THEME_KEYS = {
     'tableHeaderBackground',
     'spoilerMask',
     'spoilerRevealedBackground',
+    'highlight',
+    'highlightText',
   ],
   fonts: ['body', 'mono', 'baseSize', 'lineHeight', 'strongWeight', 'strongFamily'],
   spacing: [
@@ -373,10 +562,31 @@ const THEME_KEYS = {
     'cellPaddingV',
     'rowRuleThickness',
     'headerWeight',
+    'frame',
+    'frameColor',
+    'ruleColor',
+    'header',
+    'body',
+    'hideEmptyHeader',
   ],
-  headings: ['scale', 'weight', 'lineHeight'],
-  rule: ['thickness', 'inset'],
+  headings: ['scale', 'weight', 'lineHeight', 'fontFamily', 'letterSpacing', 'levels'],
+  rule: ['thickness', 'inset', 'color'],
   glyphs: ['bullet', 'taskChecked', 'taskUnchecked'],
+  blocks: [
+    'paragraph',
+    'heading',
+    'list',
+    'listItem',
+    'quote',
+    'code',
+    'table',
+    'rule',
+    'firstBlockLead',
+    'lastBlockTrail',
+  ],
+  list: ['marker', 'itemGap', 'hangingIndent'],
+  html: ['display'],
+  link: ['underline', 'underlineColor'],
 } as const satisfies {
   [K in keyof MarkdownTheme]: readonly (keyof MarkdownTheme[K])[];
 };
@@ -509,5 +719,9 @@ export function mergeTheme(
     headings: mergeGroup(base.headings, overrides.headings),
     rule: mergeGroup(base.rule, overrides.rule),
     glyphs: mergeGroup(base.glyphs, overrides.glyphs),
+    blocks: mergeGroup(base.blocks, overrides.blocks),
+    list: mergeGroup(base.list, overrides.list),
+    html: mergeGroup(base.html, overrides.html),
+    link: mergeGroup(base.link, overrides.link),
   };
 }

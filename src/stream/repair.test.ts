@@ -921,7 +921,7 @@ const cases: Case[] = [
     appended: '`',
   },
   { name: 'hide: escaped bracket never a link', tail: 'see \\[fhir://Obs', repair: hideAll, text: 'see \\[fhir://Obs', appended: '', touched: 0 },
-  { name: 'hide: task box unaffected', tail: '- [x]', repair: hideAll, text: '- x', appended: '' },
+  { name: 'hide: task box unaffected', tail: '- [x]', repair: hideAll, text: '', appended: '' },
   {
     name: 'hide: URI label after CRLF line break hidden',
     tail: 'line one\r\nsee [fhir://Obs](fhir://O',
@@ -1371,6 +1371,23 @@ describe('repairTail corpus', () => {
       expect(result.touched).toHaveLength(c.touched);
     }
     expect(result.text.endsWith(result.appended)).toBe(true);
+  });
+
+  test('a task box arriving char by char never flashes as item text', () => {
+    for (const tail of ['- [', '- [x', '- [X', '- [ ]', '- [x]', '- [x] ', '1. [x', '* [ ]']) {
+      expect(repairTail(tail, SEED, base).text).toBe('');
+    }
+    expect(repairTail('- a\n- [x', SEED, base).text).toBe('- a');
+    expect(repairTail('- [x] do', SEED, base).text).toBe('- [x] do');
+    // A link label is not a task box.
+    expect(repairTail('- [ab', SEED, base).text).toBe('- ab');
+  });
+
+  test('a long quote-marker line is scanned in linear time', () => {
+    const started = Date.now();
+    repairTail('> '.repeat(5000) + 'x', SEED, base);
+    repairTail('> '.repeat(5000) + '- [x', SEED, base);
+    expect(Date.now() - started).toBeLessThan(1000);
   });
 
   test('setext/hr underline arriving char by char never flashes', () => {

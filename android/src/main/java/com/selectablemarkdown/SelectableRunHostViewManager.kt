@@ -130,6 +130,16 @@ class SelectableRunHostViewManager :
         view.setExclusiveSelection(exclusive)
     }
 
+    @ReactProp(name = "allowFontScaling", defaultBoolean = true)
+    override fun setAllowFontScaling(view: SelectableRunHostView, value: Boolean) {
+        view.setAllowFontScaling(value)
+    }
+
+    @ReactProp(name = "maxFontSizeMultiplier", defaultFloat = 0f)
+    override fun setMaxFontSizeMultiplier(view: SelectableRunHostView, value: Float) {
+        view.setMaxFontSizeMultiplier(value)
+    }
+
     /** No `receiveCommand` override: `ViewManager` already forwards commands to the codegen delegate. */
     override fun clearSelection(view: SelectableRunHostView) {
         view.clearSelection()
@@ -244,7 +254,17 @@ class SelectableRunHostViewManager :
             RunEmbeds.Spec.EMPTY
         }
         val measured =
-            RunTextMeasure.measure(text, attributes, decorations, embeds, width, widthMode, height, heightMode)
+            RunTextMeasure.measure(
+                text,
+                attributes,
+                decorations,
+                embeds,
+                width,
+                widthMode,
+                height,
+                heightMode,
+                RunFontScaling.fromProps(props),
+            )
         return YogaMeasureOutput.make(
             PixelUtil.toDIPFromPixel(YogaMeasureOutput.getWidth(measured)),
             PixelUtil.toDIPFromPixel(YogaMeasureOutput.getHeight(measured)),

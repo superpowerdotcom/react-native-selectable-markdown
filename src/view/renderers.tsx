@@ -2,10 +2,11 @@ import { IS_DEV } from '../dev';
 import { Fragment, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Image, Linking, Text, View } from 'react-native';
-import type { TextStyle } from 'react-native';
+import type { TextProps, TextStyle } from 'react-native';
 import type {
   AnyNode,
   Block,
+  HeadingLevel,
   Inline,
   SpoilerNode,
   TableAlignment,
@@ -14,8 +15,17 @@ import { sliceSpan } from '../document/span';
 import { childrenOf } from '../document/visit';
 import { DEFAULT_LINK_PREFIXES } from '../engine/options';
 import { isUrlAllowed, sanitizeUrl } from '../engine/urlPolicy';
-import type { MarkdownTheme } from './theme';
-import { headingFontSize } from './theme';
+import { innerItemGap, itemGap, marginBetween, spacingManaged } from './blockSpacing';
+import { markerColumnWidth } from './runDecorations';
+import { queryRanges } from './runPresentation';
+import { startsWithWord } from '../selection/mapSelection';
+import type { InlinePrefix, InlineTransform, MarkKind, RunMark } from '../selection/mapSelection';
+import type { MarkAttribute } from './runAttributes';
+import type { ChipStyle, PressableAccessibility, PressableInfo } from './runPresentation';
+import type { CodeCardContext } from './codeBlocks';
+import type { InlineLinkPress } from './SelectableMarkdown';
+import type { MarkdownTheme, TableCellTextStyle } from './theme';
+import { bulletGlyph, headingStyle } from './theme';
 
 // Native Image forwards View props, although ImageProps omits pointerEvents.
 const NONINTERACTIVE_IMAGE_PROPS = { pointerEvents: 'none' as const };
@@ -39,10 +49,90 @@ export interface RenderContext {
    * Absent means `DEFAULT_LINK_PREFIXES`.
    */
   linkPrefixes?: readonly string[];
+  /** `'newline'` renders a soft break as a line break. Absent means a space. */
+  softBreak?: 'space' | 'newline';
+  /** False opts every built-in `<Text>` out of the system text size. Absent means true. */
+  allowFontScaling?: boolean;
+  /** Caps the system text-size multiplier on built-in `<Text>`. */
+  maxFontSizeMultiplier?: number;
+  /** Display-text query the built-in `text` renderer highlights. */
+  highlight?: { query: string; caseSensitive?: boolean; matchTokens?: boolean };
+  /**
+   * The document's `onLinkPress`. The built-in `link` and `autolink`
+   * renderers route through it when set, exactly as native runs do, and
+   * fall back to `openUrl` otherwise.
+   */
+  onLinkPress?: (press: InlineLinkPress) => void;
+  /**
+   * The inline constructs enclosing this node, outermost first — a link
+   * inside a bold heading sees `heading` then `strong`. Maintained by the
+   * built-in renderers; an override that renders children should pass
+   * `withMark(ctx, …)` on to keep it.
+   */
+  marks?: readonly InlineScope[];
+  /** The document's `transformInline`; `renderInlines` applies it. */
+  transformInline?: InlineTransform;
+  /**
+   * The document's `attributeForMark`, `chipForMark` and
+   * `accessibilityForPressable`, which the built-in inline renderers apply as
+   * a run does. The mark they are given has `start` and `end` 0: a standalone
+   * block has no run text to index.
+   */
+  attributeForMark?: MarkAttribute;
+  chipForMark?: (mark: RunMark) => ChipStyle | undefined;
+  accessibilityForPressable?: (pressable: PressableInfo) => PressableAccessibility | undefined;
+  /** Set under `codeBlocks: 'card'`: the card's labels and copy handler. */
+  codeCard?: CodeCardContext;
+  /** Set while rendering inside an embed: the box the host reserved. */
+  embedBox?: { width: number; height: number };
   /** Set while rendering a table's cells. */
   tableAlign?: readonly TableAlignment[];
   tableHeader?: boolean;
+  /** The first body row of a table whose header is hidden: no rule above it. */
+  tableFirstRow?: boolean;
   tableCellIndex?: number;
+}
+
+/** One enclosing construct in `RenderContext.marks`. */
+export interface InlineScope {
+  kind: 'heading' | 'strong' | 'emphasis' | 'strikethrough' | 'underline' | 'link' | 'blockquote';
+  /** Heading level. */
+  level?: number;
+}
+
+const scopedContexts = new WeakMap<RenderContext, Map<string, RenderContext>>();
+
+/** `ctx` with one more enclosing construct, cached so siblings share it. */
+export function withMark(ctx: RenderContext, scope: InlineScope): RenderContext {
+  const key = scope.level === undefined ? scope.kind : `${scope.kind}:${scope.level}`;
+  let byKey = scopedContexts.get(ctx);
+  if (byKey === undefined) {
+    byKey = new Map();
+    scopedContexts.set(ctx, byKey);
+  }
+  const cached = byKey.get(key);
+  if (cached !== undefined) return cached;
+  const next: RenderContext = { ...ctx, marks: [...(ctx.marks ?? []), scope] };
+  byKey.set(key, next);
+  return next;
+}
+
+/** A link press on a standalone block: the document's handler, else `openUrl`. */
+function pressLink(
+  ctx: RenderContext,
+  node: { href: string; span: { start: number; end: number } },
+  blocked: boolean,
+  event?: { nativeEvent?: { pageX?: number; pageY?: number } },
+): void {
+  if (ctx.onLinkPress) {
+    const press: InlineLinkPress = { href: node.href, blocked, span: node.span };
+    const x = event?.nativeEvent?.pageX;
+    const y = event?.nativeEvent?.pageY;
+    if (typeof x === 'number' && typeof y === 'number') press.rect = { x, y, width: 0, height: 0 };
+    ctx.onLinkPress(press);
+    return;
+  }
+  if (!blocked) openUrl(node.href, ctx.linkPrefixes);
 }
 
 export type NodeKind = AnyNode['kind'];
@@ -61,6 +151,67 @@ export type RendererOverrides = {
 
 
 
+/** The font-scaling props every built-in block-level `<Text>` carries. */
+export function scaling(ctx: RenderContext): { allowFontScaling?: boolean; maxFontSizeMultiplier?: number } {
+  if (ctx.allowFontScaling === undefined && ctx.maxFontSizeMultiplier === undefined) {
+    return NO_SCALING;
+  }
+  const out: { allowFontScaling?: boolean; maxFontSizeMultiplier?: number } = {};
+  if (ctx.allowFontScaling !== undefined) out.allowFontScaling = ctx.allowFontScaling;
+  if (ctx.maxFontSizeMultiplier !== undefined) out.maxFontSizeMultiplier = ctx.maxFontSizeMultiplier;
+  return out;
+}
+
+const NO_SCALING = Object.freeze({});
+
+/** Space above `block` when `previous` precedes it in the same container. */
+function gapBefore(previous: Block, block: Block, theme: MarkdownTheme, fallback: number): number {
+  return spacingManaged(theme) ? marginBetween(theme, previous, block) : fallback;
+}
+
+const quoteThemes = new WeakMap<MarkdownTheme, MarkdownTheme>();
+
+/** The theme a quote's children render with: body text in the quote colour. */
+function quoteTheme(theme: MarkdownTheme): MarkdownTheme {
+  const cached = quoteThemes.get(theme);
+  if (cached !== undefined) return cached;
+  const next: MarkdownTheme = { ...theme, colors: { ...theme.colors, text: theme.colors.quoteText } };
+  quoteThemes.set(theme, next);
+  return next;
+}
+
+function cellStyle(cell: TableCellTextStyle | undefined): TextStyle {
+  if (cell === undefined) return {};
+  const style: TextStyle = {};
+  if (cell.fontFamily !== undefined) style.fontFamily = cell.fontFamily;
+  if (cell.fontSize !== undefined) style.fontSize = cell.fontSize;
+  if (cell.lineHeight !== undefined) style.lineHeight = cell.lineHeight;
+  if (cell.color !== undefined) style.color = cell.color;
+  if (cell.weight !== undefined) style.fontWeight = cell.weight;
+  if (cell.letterSpacing !== undefined) style.letterSpacing = cell.letterSpacing;
+  return style;
+}
+
+function isEmptyRow(row: Extract<Block, { kind: 'tableRow' }>): boolean {
+  return row.cells.every((cell) =>
+    cell.children.every((child) => child.kind === 'text' && child.value.trim() === ''),
+  );
+}
+
+/** Shared with the `heading` mark in `runAttributes.ts`. */
+function headingTextStyle(theme: MarkdownTheme, level: HeadingLevel): TextStyle {
+  const resolved = headingStyle(theme, level);
+  const style: TextStyle = {
+    color: resolved.color,
+    fontFamily: resolved.fontFamily,
+    fontSize: resolved.fontSize,
+    fontWeight: resolved.fontWeight,
+    lineHeight: resolved.lineHeight,
+  };
+  if (resolved.letterSpacing !== undefined) style.letterSpacing = resolved.letterSpacing;
+  return style;
+}
+
 function bodyTextStyle(theme: MarkdownTheme): TextStyle {
   return {
     color: theme.colors.text,
@@ -70,7 +221,14 @@ function bodyTextStyle(theme: MarkdownTheme): TextStyle {
   };
 }
 
-function codeTextStyle(theme: MarkdownTheme): TextStyle {
+/** Raw HTML: muted mono, or body text under `html.display: 'text'`. */
+function htmlTextStyle(theme: MarkdownTheme): TextStyle {
+  return theme.html.display === 'text'
+    ? bodyTextStyle(theme)
+    : { ...codeTextStyle(theme), color: theme.colors.muted };
+}
+
+export function codeTextStyle(theme: MarkdownTheme): TextStyle {
   return {
     color: theme.colors.codeText,
     fontFamily: theme.fonts.mono,
@@ -79,17 +237,53 @@ function codeTextStyle(theme: MarkdownTheme): TextStyle {
 }
 
 /**
- * List bullet/number/task glyph. `colors.listMarker` unset (the default)
- * renders the bare string so the marker inherits the surrounding text colour —
- * the pre-existing behaviour, and what the native path does with the
- * `listMarker` mark.
+ * List bullet/number/task glyph, nested text so it lands in copied text the
+ * way the projection's marker does. `colors.listMarker` unset (the default)
+ * and no marker style renders the bare string, inheriting the text colour.
+ * A dot marker becomes the bullet glyph in the dot's colour: nested text
+ * cannot draw a shape or pin a column.
  */
-function renderListMarker(marker: string, ctx: RenderContext): ReactNode {
-  if (marker === '') {
-    return null;
+function renderListMarker(marker: string, ctx: RenderContext, bullet: boolean): ReactNode {
+  const { theme } = ctx;
+  const style = theme.list.marker;
+  if (bullet && style?.kind === 'dot') {
+    return <Text style={{ color: style.color ?? theme.colors.listMarker ?? theme.colors.text }}>{marker}</Text>;
   }
-  const color = ctx.theme.colors.listMarker;
-  return color ? <Text style={{ color }}>{marker}</Text> : marker;
+  const glyph = style?.kind === 'glyph' ? style : undefined;
+  const color = glyph?.color ?? theme.colors.listMarker;
+  const marked: TextStyle = {};
+  if (color) marked.color = color;
+  if (glyph?.fontFamily !== undefined) marked.fontFamily = glyph.fontFamily;
+  if (glyph?.fontSize !== undefined) marked.fontSize = glyph.fontSize;
+  if (glyph?.weight !== undefined) marked.fontWeight = glyph.weight;
+  return Object.keys(marked).length > 0 ? <Text style={marked}>{marker}</Text> : marker;
+}
+
+/**
+ * A line break inside one `<Text>`, `gap` points of empty line after it. The
+ * gap is a second '\n' whose line is `gap` tall, the way a run sizes its
+ * blank separator line; 0 is a plain '\n'.
+ */
+function lineBreak(gap: number): ReactNode {
+  if (gap <= 0) return '\n';
+  return (
+    <>
+      {'\n'}
+      <Text style={{ lineHeight: gap }}>{'\n'}</Text>
+    </>
+  );
+}
+
+/** Blocks inside one `<Text>`, each `separate(previous, block)` apart. */
+function joinBlocks(
+  blocks: Block[], ctx: RenderContext, separate: (previous: Block, block: Block) => ReactNode,
+): ReactNode {
+  return blocks.map((block, index) => (
+    <Fragment key={`${block.kind}:${block.span.start}:${index}`}>
+      {index > 0 ? separate(blocks[index - 1], block) : null}
+      {renderNode(block, ctx)}
+    </Fragment>
+  ));
 }
 
 /**
@@ -219,32 +413,25 @@ const typedDefaults: RendererMap = {
   // drops it and the outermost `<Text>` decides.
 
   paragraph: (node, ctx) => (
-    <Text selectable={ctx.selectable ?? true} style={bodyTextStyle(ctx.theme)}>
+    <Text {...scaling(ctx)} selectable={ctx.selectable ?? true} style={bodyTextStyle(ctx.theme)}>
       {renderInlines(node.children, ctx)}
     </Text>
   ),
 
-  heading: (node, ctx) => {
-    const size = headingFontSize(ctx.theme, node.level);
-    return (
-      <Text
-        accessibilityRole="header"
-        selectable={ctx.selectable ?? true}
-        style={{
-          color: ctx.theme.colors.heading,
-          fontFamily: ctx.theme.fonts.body,
-          fontSize: size,
-          fontWeight: ctx.theme.headings.weight,
-          // Absolute when `headings.lineHeight` pins it, multiplier otherwise
-          // — mirrored in the `heading` mark in `runAttributes.ts`.
-          lineHeight:
-            ctx.theme.headings.lineHeight ?? size * ctx.theme.fonts.lineHeight,
-        }}
-      >
-        {renderInlines(node.children, ctx)}
-      </Text>
-    );
-  },
+  heading: (node, ctx) => (
+    <Text
+      {...scaling(ctx)}
+      accessibilityRole="header"
+      selectable={ctx.selectable ?? true}
+      style={markStyle(
+        ctx,
+        fallbackMark('heading', { level: node.level }),
+        headingTextStyle(ctx.theme, node.level),
+      )}
+    >
+      {renderInlines(node.children, withMark(ctx, { kind: 'heading', level: node.level }))}
+    </Text>
+  ),
 
   codeBlock: (node, ctx) => {
     const { theme } = ctx;
@@ -263,7 +450,7 @@ const typedDefaults: RendererMap = {
           paddingVertical: theme.code.paddingVertical,
         }}
       >
-        <Text selectable={ctx.selectable ?? true} style={codeTextStyle(theme)}>
+        <Text {...scaling(ctx)} selectable={ctx.selectable ?? true} style={codeTextStyle(theme)}>
           {literal}
         </Text>
       </View>
@@ -272,6 +459,7 @@ const typedDefaults: RendererMap = {
 
   blockquote: (node, ctx) => {
     const { quote } = ctx.theme;
+    const inner: RenderContext = { ...withMark(ctx, { kind: 'blockquote' }), theme: quoteTheme(ctx.theme) };
     return (
       <View
         style={{
@@ -286,10 +474,7 @@ const typedDefaults: RendererMap = {
             borderLeft: a left border takes square ends and bends around the
             box's rounded corners (radius 4 > barWidth 3 by default), while
             the native host draws a straight capsule of radius barWidth/2
-            unclipped by the box — this matches it. Nested quotes still step
-            their bars inward here (each level's bar sits at its own leading
-            edge) where the native contract pins every level's bar at x=0;
-            that residual divergence is accepted. */}
+            unclipped by the box — this matches it. */}
         <View
           pointerEvents="none"
           style={{
@@ -302,37 +487,54 @@ const typedDefaults: RendererMap = {
             width: quote.barWidth,
           }}
         />
-        <Text
-          selectable={ctx.selectable ?? true}
-          style={{ ...bodyTextStyle(ctx.theme), color: ctx.theme.colors.quoteText }}
-        >
-          {/* '\n\n' because that is BLOCK_SEPARATOR: `projectRun` separates the
-              children of a blockquote with a blank line exactly as it separates
-              top-level siblings, so joining them with a single '\n' here made
-              the fallback and the native host show a different number of
-              characters for the same quote. Fallback-only, so no offset moves. */}
-          {joinBlockChildren(node.children, ctx, '\n\n')}
+        {/* One <Text> so a selection runs across the quote's children.
+            They sit a blank line apart, as `projectRun`'s '\n\n'
+            BLOCK_SEPARATOR puts them, or `theme.blocks` apart when set. A
+            child that needs a view (a code block, table, nested quote)
+            nests as an inline view. */}
+        <Text {...scaling(ctx)} selectable={ctx.selectable ?? true} style={bodyTextStyle(inner.theme)}>
+          {joinBlocks(node.children, inner, (previous, block) =>
+            spacingManaged(ctx.theme) ? lineBreak(marginBetween(ctx.theme, previous, block)) : '\n\n',
+          )}
         </Text>
       </View>
     );
   },
 
+  // One <Text> for the whole list, nested lists included, so a selection
+  // runs across items and copies their markers, as in a run. Nested text
+  // cannot hang-indent, so wrapped lines return to the list's leading edge;
+  // a nested list's items are inset by an inline spacer, not by spaces that
+  // would land in the copy.
   list: (node, ctx) => {
+    const { theme } = ctx;
     const itemCtx: RenderContext = { ...ctx, listDepth: ctx.listDepth + 1 };
-    const indent = '   '.repeat(ctx.listDepth);
+    const inset = ctx.listDepth * (markerColumnWidth(theme) ?? theme.spacing.listIndent);
+    const gap = itemGap(theme) ?? 0;
+    const bullet = bulletGlyph(theme);
     return (
-      <Text selectable={ctx.selectable ?? true} style={bodyTextStyle(ctx.theme)}>
+      <Text {...scaling(ctx)} selectable={ctx.selectable ?? true} style={bodyTextStyle(theme)}>
         {node.items.map((item, index) => {
-          const marker = item.task
-            ? ''
-            : node.ordered
-              ? `${(node.start ?? 1) + index}. `
-              : ctx.theme.glyphs.bullet;
+          const marker =
+            item.task === 'checked'
+              ? theme.glyphs.taskChecked
+              : item.task === 'unchecked'
+                ? theme.glyphs.taskUnchecked
+                : node.ordered
+                  ? `${(node.start ?? 1) + index}. `
+                  : bullet;
           return (
             <Fragment key={`${item.span.start}:${index}`}>
-              {index > 0 ? '\n' : null}
-              {indent}
-              {renderListMarker(marker, ctx)}
+              {index > 0 ? lineBreak(gap) : null}
+              {inset > 0 ? (
+                <View
+                  accessible={false}
+                  importantForAccessibility="no-hide-descendants"
+                  pointerEvents="none"
+                  style={{ height: 1, width: inset }}
+                />
+              ) : null}
+              {renderListMarker(marker, ctx, !item.task && !node.ordered)}
               {renderNode(item, itemCtx)}
             </Fragment>
           );
@@ -341,21 +543,13 @@ const typedDefaults: RendererMap = {
     );
   },
 
+  // The marker belongs to the `list`; an item is its blocks, one line apart
+  // as `projectRun`'s '\n' ITEM_SEPARATOR puts them, plus any item gap.
   listItem: (node, ctx) => (
     <Text>
-      {node.task
-        ? renderListMarker(
-            node.task === 'checked'
-              ? ctx.theme.glyphs.taskChecked
-              : ctx.theme.glyphs.taskUnchecked,
-            ctx,
-          )
-        : null}
-      {/* '\n\n' for the same reason as blockquote: a list item's children are
-          sibling blocks, and `projectRun` puts BLOCK_SEPARATOR between them.
-          The '\n' between list *items* is a different separator and stays a
-          single newline (see the `list` renderer above). */}
-      {joinBlockChildren(node.children, ctx, '\n\n')}
+      {joinBlocks(node.children, ctx, (previous, block) =>
+        lineBreak(innerItemGap(ctx.theme, previous, block) ?? 0),
+      )}
     </Text>
   ),
 
@@ -371,19 +565,20 @@ const typedDefaults: RendererMap = {
       tableAlign: node.align,
       tableHeader: false,
     };
+    const showHeader = !(theme.table.hideEmptyHeader && isEmptyRow(node.header));
     return (
       <View
         style={{
-          borderColor: theme.colors.border,
+          borderColor: theme.table.frameColor ?? theme.colors.border,
           borderRadius: theme.table.borderRadius,
-          borderWidth: theme.table.borderWidth,
+          borderWidth: theme.table.frame ? theme.table.borderWidth : 0,
           overflow: 'hidden',
         }}
       >
-        {renderNode(node.header, headerCtx)}
+        {showHeader ? renderNode(node.header, headerCtx) : null}
         {node.rows.map((row, index) => (
           <Fragment key={`${row.span.start}:${index}`}>
-            {renderNode(row, rowCtx)}
+            {renderNode(row, index === 0 && !showHeader ? { ...rowCtx, tableFirstRow: true } : rowCtx)}
           </Fragment>
         ))}
       </View>
@@ -392,14 +587,15 @@ const typedDefaults: RendererMap = {
 
   tableRow: (node, ctx) => {
     const { theme } = ctx;
+    const ruled = !ctx.tableHeader && ctx.tableFirstRow !== true;
     return (
       <View
         style={{
           backgroundColor: ctx.tableHeader
             ? theme.colors.tableHeaderBackground
             : undefined,
-          borderTopWidth: ctx.tableHeader ? 0 : theme.table.rowRuleThickness,
-          borderTopColor: theme.colors.border,
+          borderTopWidth: ruled ? theme.table.rowRuleThickness : 0,
+          borderTopColor: theme.table.ruleColor ?? theme.colors.border,
           flexDirection: 'row',
         }}
       >
@@ -415,6 +611,7 @@ const typedDefaults: RendererMap = {
   tableCell: (node, ctx) => {
     const { theme } = ctx;
     const align = ctx.tableAlign?.[ctx.tableCellIndex ?? 0] ?? null;
+    const typed = cellStyle(ctx.tableHeader ? theme.table.header : theme.table.body);
     return (
       <View
         style={{
@@ -424,15 +621,16 @@ const typedDefaults: RendererMap = {
         }}
       >
         <Text
+          {...scaling(ctx)}
           // A table is a flex layout of per-cell <Text>, not one text view,
-          // so each cell has to opt in to selection itself. Without this the
-          // cells were the one piece of rendered content in the library that
-          // could not be selected or copied at all — including by the system
-          // Copy that every other standalone block already offered.
+          // so each cell has to opt in to selection itself.
           selectable={ctx.selectable ?? true}
           style={{
             ...bodyTextStyle(theme),
-            fontWeight: ctx.tableHeader ? theme.table.headerWeight : 'normal',
+            fontWeight: ctx.tableHeader
+              ? (theme.table.header?.weight ?? theme.table.headerWeight)
+              : 'normal',
+            ...typed,
             // `'auto'`, not `'left'`: an undeclared column follows the text direction.
             textAlign: align ?? 'auto',
           }}
@@ -446,18 +644,20 @@ const typedDefaults: RendererMap = {
   thematicBreak: (node, ctx) => (
     <View
       style={{
-        backgroundColor: ctx.theme.colors.border,
+        backgroundColor: ctx.theme.rule.color ?? ctx.theme.colors.border,
         height: ctx.theme.rule.thickness,
         marginHorizontal: ctx.theme.rule.inset,
-        marginVertical: ctx.theme.spacing.blockGap / 2,
+        // `theme.blocks.rule` spaces it instead when the theme spaces blocks.
+        marginVertical: spacingManaged(ctx.theme) ? 0 : ctx.theme.spacing.blockGap / 2,
       }}
     />
   ),
 
   htmlBlock: (node, ctx) => (
     <Text
+      {...scaling(ctx)}
       selectable={ctx.selectable ?? true}
-      style={{ ...codeTextStyle(ctx.theme), color: ctx.theme.colors.muted }}
+      style={htmlTextStyle(ctx.theme)}
     >
       {node.literal}
     </Text>
@@ -465,20 +665,26 @@ const typedDefaults: RendererMap = {
 
   // -- Inlines --------------------------------------------------------------
 
-  text: (node) => node.value,
+  text: (node, ctx) => (ctx.highlight ? highlighted(node.value, ctx) : node.value),
 
-  emphasis: (node, ctx) => (
-    <Text style={{ fontStyle: 'italic' }}>
-      {renderInlines(node.children, ctx)}
-    </Text>
-  ),
+  emphasis: (node, ctx) =>
+    markText(
+      ctx,
+      fallbackMark('emphasis'),
+      ctx.theme.colors.emphasis !== undefined
+        ? { fontStyle: 'italic', color: ctx.theme.colors.emphasis }
+        : { fontStyle: 'italic' },
+      renderInlines(node.children, withMark(ctx, { kind: 'emphasis' })),
+    ),
 
   // `strongFamily` / `colors.strong` apply only when set — same opt-in
   // contract as the `strong` mark in `runAttributes.ts`, so the fallback and
   // the native host draw the same bold.
-  strong: (node, ctx) => (
-    <Text
-      style={{
+  strong: (node, ctx) =>
+    markText(
+      ctx,
+      fallbackMark('strong'),
+      {
         fontWeight: ctx.theme.fonts.strongWeight,
         ...(ctx.theme.fonts.strongFamily !== undefined
           ? { fontFamily: ctx.theme.fonts.strongFamily }
@@ -486,72 +692,66 @@ const typedDefaults: RendererMap = {
         ...(ctx.theme.colors.strong !== undefined
           ? { color: ctx.theme.colors.strong }
           : null),
-      }}
-    >
-      {renderInlines(node.children, ctx)}
-    </Text>
-  ),
+      },
+      renderInlines(node.children, withMark(ctx, { kind: 'strong' })),
+    ),
 
-  strikethrough: (node, ctx) => (
-    <Text style={{ textDecorationLine: 'line-through' }}>
-      {renderInlines(node.children, ctx)}
-    </Text>
-  ),
+  strikethrough: (node, ctx) =>
+    markText(
+      ctx,
+      fallbackMark('strikethrough'),
+      { textDecorationLine: 'line-through' },
+      renderInlines(node.children, withMark(ctx, { kind: 'strikethrough' })),
+    ),
 
-  underline: (node, ctx) => (
-    <Text style={{ textDecorationLine: 'underline' }}>
-      {renderInlines(node.children, ctx)}
-    </Text>
-  ),
+  underline: (node, ctx) =>
+    markText(
+      ctx,
+      fallbackMark('underline'),
+      { textDecorationLine: 'underline' },
+      renderInlines(node.children, withMark(ctx, { kind: 'underline' })),
+    ),
 
-  codeSpan: (node, ctx) => (
-    <Text
-      style={{
-        ...codeTextStyle(ctx.theme),
-        backgroundColor: ctx.theme.colors.codeBackground,
-      }}
-    >
-      {node.value}
-    </Text>
-  ),
+  codeSpan: (node, ctx) =>
+    markText(
+      ctx,
+      fallbackMark('code'),
+      { ...codeTextStyle(ctx.theme), backgroundColor: ctx.theme.colors.codeBackground },
+      node.value,
+    ),
 
   link: (node, ctx) => {
     // Only a standalone block reaches here; in a run a blocked link is a `blockedLink` mark.
     // Drawn as its label with no press, coloured like `styleForMark` does when the token is set.
+    const inner = withMark(ctx, { kind: 'link' });
     if (node.blocked) {
       const blockedColor = ctx.theme.colors.blockedLink;
-      return blockedColor ? (
-        <Text style={{ color: blockedColor }}>
-          {renderInlines(node.children, ctx)}
-        </Text>
-      ) : (
-        renderInlines(node.children, ctx)
+      // Pressable only for a document `onLinkPress`, as in a run.
+      return markText(
+        ctx,
+        fallbackMark('blockedLink', { href: node.href }),
+        blockedColor ? { color: blockedColor } : undefined,
+        renderInlines(node.children, inner),
+        pressableProps(ctx, node, true, ctx.onLinkPress !== undefined),
       );
     }
+    if (!node.incomplete) {
+      return markText(
+        ctx,
+        fallbackMark('link', { href: node.href }),
+        { ...linkDecoration(ctx.theme), color: ctx.theme.colors.link },
+        renderInlines(node.children, inner),
+        pressableProps(ctx, node, false, true),
+      );
+    }
+    // `incomplete` means the stream has not delivered the closing paren yet,
+    // so this is a `[label](https://…` that repair turned into a link node.
+    // No colour, press or underline: `projectRun` emits no `link` mark for
+    // one, and painting it here would flash blue until the paren arrives.
+    // The surrounding text tree keeps supplying the style.
     return (
-      <Text
-        accessibilityRole={node.incomplete ? undefined : 'link'}
-        onPress={
-          node.incomplete
-            ? undefined
-            : () => openUrl(node.href, ctx.linkPrefixes)
-        }
-        style={{
-          // `incomplete` means the stream has not delivered the closing paren
-          // yet, so this is a `[label](https://…` that repair turned into a
-          // link node. It gets no link colour, for the same reason it gets no
-          // press and no underline: `projectRun` deliberately emits no `link`
-          // mark for one (see the `link` case there), so painting it blue here
-          // would make the two paths disagree about what looks tappable — and
-          // during streaming it makes the text flash blue and settle to black
-          // the instant the paren arrives. Undefined rather than the body
-          // colour so the surrounding text tree keeps supplying the style,
-          // exactly like the `blocked` branch above.
-          color: node.incomplete ? undefined : ctx.theme.colors.link,
-          textDecorationLine: node.incomplete ? 'none' : 'underline',
-        }}
-      >
-        {renderInlines(node.children, ctx)}
+      <Text style={{ textDecorationLine: 'none' }}>
+        {renderInlines(node.children, inner)}
       </Text>
     );
   },
@@ -564,26 +764,26 @@ const typedDefaults: RendererMap = {
       accessibilityRole="image"
       resizeMode="contain"
       source={{ uri: node.src }}
-      style={{ height: ctx.theme.spacing.imageHeight, width: '100%' }}
+      style={
+        ctx.embedBox
+          ? { height: ctx.embedBox.height, width: ctx.embedBox.width }
+          : { height: ctx.theme.spacing.imageHeight, width: '100%' }
+      }
     />
   ),
 
-  autolink: (node, ctx) => (
-    <Text
-      accessibilityRole="link"
-      onPress={() => openUrl(node.href, ctx.linkPrefixes)}
-      style={{
-        color: ctx.theme.colors.link,
-        textDecorationLine: 'underline',
-      }}
-    >
-      {node.href}
-    </Text>
-  ),
+  autolink: (node, ctx) =>
+    markText(
+      ctx,
+      fallbackMark('link', { href: node.href }),
+      { color: ctx.theme.colors.link, ...linkDecoration(ctx.theme) },
+      node.text ?? autolinkLabel(node.href, sliceSpan(ctx.source, node.span)),
+      pressableProps(ctx, node, false, true),
+    ),
 
   hardBreak: () => '\n',
 
-  softBreak: () => ' ',
+  softBreak: (_node, ctx) => (ctx.softBreak === 'newline' ? '\n' : ' '),
 
   // No math typesetting in v0: raw TeX in mono italic (display math on its
   // own line via the run's block separators).
@@ -596,7 +796,7 @@ const typedDefaults: RendererMap = {
   spoiler: (node, ctx) => <SpoilerSpan ctx={ctx} node={node} />,
 
   htmlSpan: (node, ctx) => (
-    <Text style={{ ...codeTextStyle(ctx.theme), color: ctx.theme.colors.muted }}>
+    <Text style={ctx.theme.html.display === 'text' ? undefined : htmlTextStyle(ctx.theme)}>
       {node.literal}
     </Text>
   ),
@@ -691,7 +891,7 @@ export function renderNode(node: AnyNode, ctx: RenderContext): ReactNode {
       );
     }
     return (
-      <Text selectable={ctx.selectable ?? true} style={bodyTextStyle(ctx.theme)}>
+      <Text {...scaling(ctx)} selectable={ctx.selectable ?? true} style={bodyTextStyle(ctx.theme)}>
         {textContentOf(node, ctx.source)}
       </Text>
     );
@@ -721,24 +921,217 @@ export function renderNode(node: AnyNode, ctx: RenderContext): ReactNode {
 }
 
 export function renderInlines(children: Inline[], ctx: RenderContext): ReactNode {
-  return children.map((child, index) => (
-    <Fragment key={`${child.kind}:${child.span.start}:${index}`}>
-      {renderNode(child, ctx)}
-    </Fragment>
-  ));
+  const shown = ctx.transformInline ? transformedInlines(children, ctx.transformInline) : children;
+  return shown.map((child, index) => {
+    const prefix = prefixStyles.get(child);
+    return (
+      <Fragment key={`${child.kind}:${child.span.start}:${index}`}>
+        {prefix === undefined ? renderNode(child, ctx) : <Text style={prefix}>{(child as { value: string }).value}</Text>}
+      </Fragment>
+    );
+  });
 }
 
-function joinBlockChildren(
-  blocks: Block[],
+/** The style of each prefix's stand-in text node; see `prefixNode`. */
+const prefixStyles = new WeakMap<Inline, TextStyle>();
+
+/** A `transformInline` prefix as a zero-width text node before `node`, drawn in its style. */
+function prefixNode(node: Inline, prefix: InlinePrefix): Inline {
+  const out: Inline = { kind: 'text', span: { start: node.span.start, end: node.span.start }, value: prefix.text };
+  prefixStyles.set(out, prefix.style ?? {});
+  return out;
+}
+
+const transformedLists = new WeakMap<Inline[], { transform: InlineTransform; out: Inline[] }>();
+
+/**
+ * `transformInline` on the renderer path: hidden nodes dropped with the space
+ * before them unless a word follows directly, replaced text swapped into the
+ * node, prefixes put before it. Cached per list so the tree keeps its keys
+ * and identities across renders.
+ */
+function transformedInlines(children: Inline[], transform: InlineTransform): Inline[] {
+  const cached = transformedLists.get(children);
+  if (cached !== undefined && cached.transform === transform) return cached.out;
+  const out: Inline[] = [];
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i];
+    const result = transform(child);
+    if (result?.hide === true) {
+      const previous = out[out.length - 1];
+      if (previous?.kind === 'text' && previous.value.endsWith(' ') && !startsWithWord(children[i + 1])) {
+        out[out.length - 1] = { ...previous, value: previous.value.slice(0, -1) };
+      }
+      continue;
+    }
+    const prefix = result?.prefix;
+    if (prefix !== undefined && prefix.text !== '' && !/[\r\n]/.test(prefix.text)) {
+      out.push(prefixNode(child, prefix));
+    }
+    if (result?.text !== undefined) {
+      out.push(replaceText(child, result.text));
+      continue;
+    }
+    out.push(child);
+  }
+  transformedLists.set(children, { transform, out });
+  return out;
+}
+
+function replaceText(node: Inline, text: string): Inline {
+  switch (node.kind) {
+    case 'text':
+    case 'codeSpan':
+    case 'math':
+      return { ...node, value: text };
+    case 'htmlSpan':
+      return { ...node, literal: text };
+    case 'autolink':
+      return { ...node, text };
+    case 'emphasis':
+    case 'strong':
+    case 'strikethrough':
+    case 'underline':
+    case 'spoiler':
+    case 'link':
+      return { ...node, children: [{ kind: 'text', span: node.span, value: text }] } as Inline;
+    default:
+      return { kind: 'text', span: node.span, value: text };
+  }
+}
+
+/** Blocks in a column, `fallback` apart unless `theme.blocks` spaces them. */
+function stackBlocks(blocks: Block[], ctx: RenderContext, fallback: number): ReactNode {
+  return blocks.map((block, index) => {
+    const gap = index > 0 ? gapBefore(blocks[index - 1], block, ctx.theme, fallback) : 0;
+    return (
+      <View key={`${block.kind}:${block.span.start}:${index}`} style={gap > 0 ? { marginTop: gap } : undefined}>
+        {renderNode(block, ctx)}
+      </View>
+    );
+  });
+}
+
+/** A custom engine's autolink with no `text`: the typed slice without `<>`. */
+function autolinkLabel(href: string, typed: string): string {
+  const label = typed.startsWith('<') && typed.endsWith('>') ? typed.slice(1, -1) : typed;
+  return label || href;
+}
+
+function linkDecoration(theme: MarkdownTheme): TextStyle {
+  const { underline, underlineColor } = theme.link;
+  if (underline === 'none') return { textDecorationLine: 'none' };
+  const style: TextStyle = { textDecorationLine: 'underline' };
+  if (underline !== 'solid') style.textDecorationStyle = underline;
+  if (underlineColor !== undefined) style.textDecorationColor = underlineColor;
+  return style;
+}
+
+/** A fallback-path mark, shaped like the run's so one callback serves both paths. */
+function fallbackMark(kind: MarkKind, extra?: { level?: number; href?: string }): RunMark {
+  const mark: RunMark = { kind, start: 0, end: 0 };
+  if (extra?.level !== undefined) mark.level = extra.level;
+  if (extra?.href !== undefined) mark.href = extra.href;
+  return mark;
+}
+
+/** `style` with the document's `attributeForMark` for `mark` laid over it. */
+function markStyle(ctx: RenderContext, mark: RunMark, style: TextStyle | undefined): TextStyle | undefined {
+  const own = ctx.attributeForMark?.(mark);
+  return own === undefined ? style : { ...style, ...(own as TextStyle) };
+}
+
+/**
+ * One inline mark's `<Text>`, with `attributeForMark` applied and, when
+ * `chipForMark` asks for one, inside an inline chip box. A chip's text starts
+ * a new text root, so it restates the enclosing heading or body typography.
+ * Undefined `style` and no props render the children bare.
+ */
+function markText(
   ctx: RenderContext,
-  separator: string,
+  mark: RunMark,
+  base: TextStyle | undefined,
+  children: ReactNode,
+  props?: TextProps,
 ): ReactNode {
-  return blocks.map((block, index) => (
-    <Fragment key={`${block.kind}:${block.span.start}:${index}`}>
-      {index > 0 ? separator : null}
-      {renderNode(block, ctx)}
-    </Fragment>
-  ));
+  const style = markStyle(ctx, mark, base);
+  const chip = ctx.chipForMark?.(mark);
+  if (chip === undefined) {
+    return style === undefined && props === undefined ? children : (
+      <Text {...props} style={style}>
+        {children}
+      </Text>
+    );
+  }
+  const heading = ctx.marks?.find((scope) => scope.kind === 'heading');
+  const inherited =
+    heading?.level !== undefined
+      ? headingTextStyle(ctx.theme, heading.level as HeadingLevel)
+      : bodyTextStyle(ctx.theme);
+  const text: TextStyle = { ...inherited, ...style };
+  if (chip.color !== undefined) text.color = chip.color;
+  if (chip.fontFamily !== undefined) text.fontFamily = chip.fontFamily;
+  if (chip.fontSize !== undefined) text.fontSize = chip.fontSize;
+  if (chip.fontWeight !== undefined) text.fontWeight = chip.fontWeight;
+  if (chip.letterSpacing !== undefined) text.letterSpacing = chip.letterSpacing;
+  return (
+    <View
+      style={{
+        alignItems: 'center',
+        backgroundColor: chip.backgroundColor,
+        borderColor: chip.borderColor,
+        borderRadius: chip.borderRadius,
+        borderWidth: chip.borderWidth,
+        minWidth: chip.minWidth,
+        paddingHorizontal: chip.paddingHorizontal,
+        paddingVertical: chip.paddingVertical,
+      }}
+    >
+      <Text {...scaling(ctx)} {...props} style={text}>
+        {children}
+      </Text>
+    </View>
+  );
+}
+
+/**
+ * Press and screen-reader props for a link-shaped range, after
+ * `accessibilityForPressable`: 'none' is inert, 'text' keeps the press but
+ * not the role.
+ */
+function pressableProps(
+  ctx: RenderContext,
+  node: AnyNode & { href: string; span: { start: number; end: number } },
+  blocked: boolean,
+  pressable: boolean,
+): TextProps | undefined {
+  const a11y = ctx.accessibilityForPressable?.({ href: node.href, blocked, text: textContentOf(node, ctx.source) });
+  const role = a11y?.role ?? 'link';
+  if (role === 'none' || !pressable) return undefined;
+  const props: TextProps = { onPress: (event) => pressLink(ctx, node, blocked, event) };
+  if (!blocked && role !== 'text') props.accessibilityRole = role;
+  if (a11y?.label !== undefined) props.accessibilityLabel = a11y.label;
+  return props;
+}
+
+function highlighted(value: string, ctx: RenderContext): ReactNode {
+  const ranges = ctx.highlight ? queryRanges(value, ctx.highlight) : [];
+  if (ranges.length === 0) return value;
+  const style: TextStyle = { backgroundColor: ctx.theme.colors.highlight };
+  if (ctx.theme.colors.highlightText !== undefined) style.color = ctx.theme.colors.highlightText;
+  const out: ReactNode[] = [];
+  let cursor = 0;
+  for (const range of ranges) {
+    if (range.start > cursor) out.push(value.slice(cursor, range.start));
+    out.push(
+      <Text key={range.start} style={style}>
+        {value.slice(range.start, range.end)}
+      </Text>,
+    );
+    cursor = range.end;
+  }
+  if (cursor < value.length) out.push(value.slice(cursor));
+  return out;
 }
 
 /**
@@ -746,12 +1139,5 @@ function joinBlockChildren(
  * Used outside prose runs (code blocks, tables, and custom compositions).
  */
 export function renderBlocks(blocks: Block[], ctx: RenderContext): ReactNode {
-  return blocks.map((block, index) => (
-    <View
-      key={`${block.kind}:${block.span.start}:${index}`}
-      style={index > 0 ? { marginTop: ctx.theme.spacing.blockGap } : undefined}
-    >
-      {renderNode(block, ctx)}
-    </View>
-  ));
+  return stackBlocks(blocks, ctx, ctx.theme.spacing.blockGap);
 }

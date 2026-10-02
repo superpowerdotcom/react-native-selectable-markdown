@@ -206,6 +206,29 @@ function isBareTailLine(line: string, tablesOn: boolean): boolean {
   );
 }
 
+const PARTIAL_TASK_BOX = /\[(?:[ xX]\]?)?[ \t]*$/;
+const QUOTE_MARKERS = /^(?: {0,3}>[ \t]?)*/;
+
+/**
+ * Where a final line's half-typed task box ('- [', '- [x', '- [x]', with
+ * trailing blanks) starts, or -1. Cut there, the line is a bare list marker
+ * and the guard suppresses it; stripped like a lone '[' instead, '- [x' would
+ * flash as an item reading 'x'. Markers are peeled one at a time: a single
+ * regex over the whole prefix backtracks exponentially on a long '> > >' line.
+ */
+function partialTaskBox(line: string): number {
+  const box = PARTIAL_TASK_BOX.exec(line);
+  if (box === null) return -1;
+  let rest = line.slice(0, box.index);
+  rest = rest.slice(QUOTE_MARKERS.exec(rest)![0].length);
+  let markers = 0;
+  for (let m = LIST_MARKER.exec(rest); m !== null; m = LIST_MARKER.exec(rest)) {
+    rest = rest.slice(m[0].length);
+    markers++;
+  }
+  return markers > 0 && rest === '' ? box.index : -1;
+}
+
 const WS = /\s/;
 const ALNUM = /[\p{L}\p{N}]/u;
 
@@ -1453,6 +1476,14 @@ export function repairTail(
   }
   if (scan.htmlTrim !== null) {
     cutAt = cutAt === null ? scan.htmlTrim : Math.min(cutAt, scan.htmlTrim);
+  }
+  if (options.extensions.tasklists) {
+    const lineStart = Math.max(region.lastIndexOf('\n'), region.lastIndexOf('\r')) + 1;
+    const task = partialTaskBox(region.slice(lineStart));
+    if (task >= 0 && lineStart + task >= scan.inertEnd) {
+      const box = lineStart + task;
+      cutAt = cutAt === null ? box : Math.min(cutAt, box);
+    }
   }
   if (repair?.hideUriLikeLabels) {
     // An unfinished trailing link whose label-so-far is URI-like is hidden

@@ -106,6 +106,8 @@ internal object RunLayoutCache {
         val attributes: List<RunAttributedText.Attribute>,
         val decorations: List<RunDecorations.Decoration>,
         val embeds: List<RunEmbeds.Embed>,
+        /** Every SP conversion in `build` and `configurePaint` goes through it. */
+        val scaling: RunFontScaling,
         val density: Float,
         val scaledDensity: Float,
         val localeTag: String,
@@ -230,6 +232,7 @@ internal object RunLayoutCache {
         attributes: RunAttributedText.Spec,
         decorations: RunDecorations.Spec,
         embeds: RunEmbeds.Spec,
+        scaling: RunFontScaling = RunFontScaling.DEFAULT,
     ): Key {
         val metrics = DisplayMetricsHolder.getWindowDisplayMetrics()
         return Key(
@@ -237,6 +240,7 @@ internal object RunLayoutCache {
             attributes.layoutAttributes,
             decorations.decorations,
             embeds.embeds,
+            scaling,
             metrics.density,
             metrics.scaledDensity,
             Locale.getDefault().toLanguageTag(),
@@ -307,6 +311,7 @@ internal object RunLayoutCache {
                 RunAttributedText.Spec(key.attributes),
                 RunDecorations.Spec(key.decorations),
                 RunEmbeds.Spec(key.embeds),
+                key.scaling,
             )
         }
         synchronized(spannables) { spannables[key] }?.let { return it }
@@ -315,6 +320,7 @@ internal object RunLayoutCache {
             RunAttributedText.Spec(key.attributes),
             RunDecorations.Spec(key.decorations),
             RunEmbeds.Spec(key.embeds),
+            key.scaling,
         )
         // Built under inputs that no longer match the key (metrics or locale
         // moved mid-build): hand it back uncached rather than poison the map.

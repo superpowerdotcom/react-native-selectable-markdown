@@ -5,6 +5,8 @@
 export { visit } from './document/visit';
 export type { Visitor, VisitSignal } from './document/visit';
 export { parseDocument } from './engine/Engine';
+export { extractLinks } from './engine/links';
+export type { ExtractedLink } from './engine/links';
 export type { Engine } from './engine/Engine';
 export { presets, resolveOptions, withOptions } from './engine/options';
 export type { EngineOptions, ResolvedEngineOptions } from './engine/options';

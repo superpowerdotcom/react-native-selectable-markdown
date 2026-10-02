@@ -2,7 +2,7 @@ import { IS_DEV } from '../dev';
 import type { ParsedDocument } from '../document/nodes';
 import type { SourceSpan } from '../document/span';
 import { mapSelectionToSource, projectRun, selectionDisplayText } from '../selection/mapSelection';
-import type { ProjectedRun, ProjectionGlyphs } from '../selection/mapSelection';
+import type { ProjectedRun, ProjectionGlyphs, InlineTransform } from '../selection/mapSelection';
 import type { EmbedLookup, RunSegment } from '../selection/runs';
 
 /**
@@ -249,6 +249,12 @@ export interface SelectionActionContext {
    * that pass an `embed` prop must too.
    */
   embed?: EmbedLookup;
+  /** The soft-break glyph the run was projected with; same rule as `glyphs`. */
+  softBreak?: 'space' | 'newline';
+  /** The inline transform the run was projected with; same rule as `glyphs`. */
+  transformInline?: InlineTransform;
+  /** Widen a copy that starts inside a heading to the whole heading. */
+  snapHeadings?: boolean;
   /** DEV cross-check: warns when an id arrives that this menu never offered. Never changes the reported id. */
   actions?: readonly SelectionActionInput[];
 }
@@ -281,7 +287,12 @@ export function handleSelectionAction(
   }
   const projected =
     ctx?.projected ??
-    projectRun(run, doc, { glyphs: ctx?.glyphs, embed: ctx?.embed });
+    projectRun(run, doc, {
+      glyphs: ctx?.glyphs,
+      embed: ctx?.embed,
+      softBreak: ctx?.softBreak,
+      transformInline: ctx?.transformInline,
+    });
   const start = Math.max(0, Math.min(event.start, event.end));
   const end = Math.min(
     projected.text.length,
@@ -291,7 +302,7 @@ export function handleSelectionAction(
     return null;
   }
 
-  const span = mapSelectionToSource(projected, { start, end });
+  const span = mapSelectionToSource(projected, { start, end }, { snapHeadings: ctx?.snapHeadings });
   if (!span) {
     return null;
   }

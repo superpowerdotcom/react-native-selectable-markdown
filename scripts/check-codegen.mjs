@@ -356,6 +356,9 @@ const EXPECTED_ATTRIBUTE_MEMBERS = {
   fontWeight: 'std::string',
   fontStyle: 'std::string',
   textDecorationLine: 'std::string',
+  textDecorationColor: 'SharedColor',
+  textDecorationStyle: 'std::string',
+  letterSpacing: 'Float',
   color: 'SharedColor',
   backgroundColor: 'SharedColor',
   // A plain string, since a string union in an array element does not compile; "" is absent.
@@ -393,6 +396,21 @@ const EXPECTED_DECORATION_MEMBERS = {
   inset: 'Float',
   gap: 'Float',
   rowPaddingV: 'Float',
+  paddingH: 'Float',
+  minWidth: 'Float',
+  dotSize: 'Float',
+};
+
+// Pressables: three required Int32s plus sparse presentation fields.
+const EXPECTED_PRESSABLE_MEMBERS = {
+  start: 'int',
+  end: 'int',
+  pressableId: 'int',
+  accessibilityLabel: 'std::string',
+  accessibilityRole: 'std::string',
+  pressedColor: 'SharedColor',
+  pressedRadius: 'Float',
+  hitSlop: 'Float',
 };
 
 // The embeds struct: all five members are required from JS, but codegen
@@ -573,53 +591,11 @@ if (propsH) {
     'both embed decoders (RNSMAttributedText embedsWithProps, RunEmbeds.parse)',
   );
 
-  // The pressables struct. Deliberately boring — three required Int32s — so
-  // none of the sentinel machinery above applies; what is asserted is that it
-  // stays boring, plus that a parse overload exists at all.
-  const pressablesStructName = 'SelectableRunHostPressablesStruct';
-  const pressablesBody = new RegExp(`struct ${pressablesStructName} \\{\\n([\\s\\S]*?)\\n\\};`).exec(
-    propsH,
-  )?.[1];
-  if (!pressablesBody) {
-    fail(
-      `Props.h: no \`struct ${pressablesStructName}\`.\n` +
-        '    The pressables prop stopped generating a struct — either the prop was\n' +
-        '    renamed (the struct name is derived from it) or codegen changed how it\n' +
-        '    represents an array of objects. The iOS component view converts this\n' +
-        '    struct by name (RCTSelectableRunHostPressables).',
-    );
-  } else {
-    for (const member of ['int start{0};', 'int end{0};', 'int pressableId{0};']) {
-      expectText(
-        pressablesBody,
-        member,
-        `Props.h (${pressablesStructName})`,
-        'The pressable range contract is three required Int32s: UTF-16 offsets the\n' +
-          '    hosts hit-test taps against, and the identifier they echo back through\n' +
-          '    onInlinePress (docs/SELECTION.md, "Event: onInlinePress").',
-      );
-    }
-    const extraMembers = dataMembers(pressablesBody)
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0 && !/^int (start|end|pressableId)\{0\};$/.test(line));
-    if (extraMembers.length > 0) {
-      fail(
-        `Props.h: ${pressablesStructName} has unexpected member(s): ${extraMembers.join(' ')}\n` +
-          "    A new field here is a contract change: it must be read by both hosts'\n" +
-          '    pressable parsers and carried through the iOS Fabric conversion, or it\n' +
-          '    silently does nothing.',
-      );
-    }
-    if (!propsH.includes(`static inline void fromRawValue(const PropsParserContext& context, const RawValue &value, ${pressablesStructName} &result)`)) {
-      fail(
-        `Props.h: no fromRawValue overload for ${pressablesStructName}.\n` +
-          '    Without it no pressable range parses at all and every link inside a run\n' +
-          '    is styled but inert on iOS Fabric — the exact failure the prop exists\n' +
-          '    to fix.',
-      );
-    }
-  }
+  checkSparseStruct(
+    'SelectableRunHostPressablesStruct',
+    EXPECTED_PRESSABLE_MEMBERS,
+    'both pressable parsers (SelectableRunHostView.pressables, RunPressables parse on Android)',
+  );
 
   // The props class itself. Each line is quoted whole because the type *and*
   // the default are both load-bearing.
@@ -679,6 +655,10 @@ if (propsH) {
       '    would make every host mounted without the prop unselectable — the one\n' +
       '    failure mode this library cannot ship.',
   );
+  expectText(propsH, 'bool allowFontScaling{true};', 'Props.h',
+    'Omitting allowFontScaling must preserve system font scaling.');
+  expectText(propsH, 'Float maxFontSizeMultiplier{0.0};', 'Props.h',
+    'Omitting maxFontSizeMultiplier must leave system font scaling uncapped.');
   expectText(
     propsH,
     'bool exclusiveSelection{true};',
@@ -1121,6 +1101,8 @@ expectText(
   'This is the mapping that turns the native "selectionChange" event into the\n' +
     '    onSelectionChange prop. Both native hosts dispatch topSelectionChange.',
 );
+expectText(viewConfig, 'allowFontScaling:true', 'view config', 'The font-scaling switch must reach the host.');
+expectText(viewConfig, 'maxFontSizeMultiplier:true', 'view config', 'The font-scale cap must reach the host.');
 expectText(viewConfig, 'selectionActions:true', 'view config', 'The ordered action list is passed through as-is.');
 expectText(
   viewConfig,

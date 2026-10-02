@@ -155,6 +155,18 @@ type NativeRunTextAttribute = Readonly<{
   fontStyle?: string;
   /** 'none' | 'underline' | 'line-through'. */
   textDecorationLine?: string;
+  /** Colour of the underline / strike line; absent = the foreground colour. */
+  textDecorationColor?: ProcessedColorValue;
+  /** 'solid' | 'double' | 'dotted' | 'dashed'; `""` = solid. */
+  textDecorationStyle?: string;
+  /**
+   * Extra advance after every character, in points (RN's
+   * `TextStyle.letterSpacing`). Layout-affecting, so it is applied in the
+   * shared string builder and scales with the font-size multiplier like
+   * `fontSize`. `0.0` is absent, so a nested range cannot reset an enclosing
+   * range's spacing to exactly zero.
+   */
+  letterSpacing?: Float;
   color?: ProcessedColorValue;
   backgroundColor?: ProcessedColorValue;
   /** A `RunSemanticRole` or `""`, a plain string under the array-enum ban
@@ -196,7 +208,22 @@ type NativeRunDecoration = Readonly<{
   /** UTF-16 offsets into `text`, end-exclusive; a 'rule' has start === end. */
   start: Int32;
   end: Int32;
-  /** 'box' | 'rule' | 'columns' | 'indent'. */
+  /**
+   * 'box' | 'rule' | 'columns' | 'indent' | 'chip' | 'marker' | 'spacing'.
+   *
+   * - 'chip': a rounded fill (`color`, `borderRadius`, optional border)
+   *   behind the range, `paddingH` wider on each side and `paddingTop` /
+   *   `paddingBottom` taller than the glyph box. The horizontal room
+   *   (`paddingH`, plus `minWidth`'s shortfall split evenly) is reserved in
+   *   the string builder so the chip never overlaps its neighbours; the
+   *   vertical padding is draw-only. A chip never breaks across lines.
+   * - 'marker': a list marker column over the marker glyph range. Its advance
+   *   is pinned to at least `minWidth`, text at the leading edge, so an
+   *   item's first-line text starts where its wrapped lines hang. With
+   *   `dotSize` a dot is drawn there (JS hides the glyphs itself).
+   * - 'spacing': `paddingBottom` points of paragraph spacing after the last
+   *   paragraph of the range. JS never sends one for the run's last paragraph.
+   */
   kind: string;
   /** Box fill / rule colour. */
   color?: ProcessedColorValue;
@@ -229,6 +256,15 @@ type NativeRunDecoration = Readonly<{
   /** 'columns' only: interior row-boundary padding — see
    * `RunDecoration.rowPaddingV`. Layout-affecting, like `gap`. */
   rowPaddingV?: Float;
+  /** 'chip' only: horizontal room reserved on each side of the range. */
+  paddingH?: Float;
+  /** 'chip' and 'marker': the least advance the range takes, in points; a
+   * narrower range is widened (a chip centres its text, a marker keeps it at
+   * the leading edge). */
+  minWidth?: Float;
+  /** 'marker' only: diameter of a filled dot drawn in `color` at the leading
+   * edge of the marker column, centred on the first line's x-height. */
+  dotSize?: Float;
 }>;
 
 /**
@@ -237,9 +273,9 @@ type NativeRunDecoration = Readonly<{
  * markdown and never sees an href: it hit-tests taps against these ranges and
  * echoes `pressableId` back through `onInlinePress`, and JS resolves the id
  * to the URL (or whatever a future pressable kind activates). That keeps the
- * host semantics-free, and it is also what makes this struct safe for
- * codegen: three required `Int32`s, so none of the sentinel/optional traps
- * documented on `NativeRunTextAttribute` above can apply.
+ * host semantics-free. The optional presentation fields follow the sentinel
+ * rules on `NativeRunTextAttribute`: `""`, `0.0` and the undefined colour are
+ * absent.
  *
  * `pressableId` is JS's identifier for the range — in practice its index into
  * the `pressables` array as sent — carried explicitly rather than left to be
@@ -251,6 +287,18 @@ type NativePressableRange = Readonly<{
   start: Int32;
   end: Int32;
   pressableId: Int32;
+  /** What a screen reader announces; `""` = the range's text. */
+  accessibilityLabel?: string;
+  /** 'link' | 'button' | 'text'; `""` = link. 'text' stays tappable but
+   * gets no accessibility element: it is read as part of the prose. */
+  accessibilityRole?: string;
+  /** Fill painted behind the range (or its chip) while a touch is down on
+   * it; absent = no pressed feedback. */
+  pressedColor?: ProcessedColorValue;
+  pressedRadius?: Float;
+  /** Points added on every side of the range's hit rect. Tap hit-testing
+   * only; selection gestures are unaffected. */
+  hitSlop?: Float;
 }>;
 
 /**
@@ -315,6 +363,15 @@ type InlinePressEvent = Readonly<{
   start: Int32;
   end: Int32;
   pressableId: Int32;
+  /**
+   * The pressed range's bounds — the union of its line rects (or its chip),
+   * in points, in the same space as a touch's `pageX` / `pageY` (relative to
+   * the React root view). A binary that predates the fields sends none.
+   */
+  x: Float;
+  y: Float;
+  width: Float;
+  height: Float;
 }>;
 
 /**
@@ -406,6 +463,15 @@ export interface NativeProps extends ViewProps {
    * trees clear each other by default.
    */
   exclusiveSelection?: WithDefault<boolean, true>;
+  /**
+   * False pins every font size, line height and letter spacing to its
+   * declared points, ignoring the system text-size setting — the same switch
+   * as RN's `Text.allowFontScaling`. Defaults to true, the pre-prop behaviour.
+   */
+  allowFontScaling?: WithDefault<boolean, true>;
+  /** Caps the system text-size multiplier; `0` (the default) is no cap, as on
+   * RN's `Text`. Ignored when `allowFontScaling` is false. */
+  maxFontSizeMultiplier?: WithDefault<Float, 0.0>;
   /**
    * Menu items in order, each `id` or `id + U+001F + title`, split at the first
    * U+001F. Hosts title a bare id only for the built-ins and drop one they

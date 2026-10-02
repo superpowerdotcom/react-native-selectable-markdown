@@ -107,6 +107,8 @@ describe('parseDocument', () => {
         underline: false,
       },
       html: 'strip',
+      htmlAllow: [],
+      htmlOther: 'strip',
       smartPunctuation: true,
       urlPolicy: {
         linkPrefixes: ['https://', 'http://', 'mailto:'],

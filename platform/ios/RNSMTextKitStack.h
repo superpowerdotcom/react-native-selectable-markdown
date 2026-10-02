@@ -62,6 +62,26 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/**
+ * The chip line-breaking contract between the string builder (which stamps
+ * these) and the stack below (which obeys them). A chip does not break
+ * across lines (docs/SELECTION.md), and both keep the text untouched, so
+ * every UTF-16 offset and copied character stays what JS sent.
+ *
+ * `RNSMChipUnbreakableAttributeName` sits on every chip character but the
+ * first, with the chip's whole reserved width (lead + text + trail); the
+ * layout manager's delegate refuses a soft break before any of them unless
+ * that width exceeds the line, the one case that has to break somewhere.
+ *
+ * `RNSMChipWrapLeadAttributeName` sits on a chip's first character when its
+ * lead was kerned onto the character before it (anywhere but a paragraph
+ * start). If a soft wrap puts the chip first on a line, that kern stays on
+ * the previous line; the container then gives the new line this much room on
+ * its leading edge, so the padding wraps with the chip.
+ */
+extern NSString *const RNSMChipUnbreakableAttributeName;
+extern NSString *const RNSMChipWrapLeadAttributeName;
+
 @interface RNSMTextKitStack : NSObject
 
 /**

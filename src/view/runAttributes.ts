@@ -6,8 +6,8 @@ import type {
   RunMark,
 } from '../selection/mapSelection';
 import { isReservableEmbedSize } from './runEmbeds';
-import type { MarkdownTheme, ThemeFontWeight } from './theme';
-import { headingFontSize } from './theme';
+import type { MarkdownTheme, TableCellTextStyle, ThemeFontWeight } from './theme';
+import { bulletGlyph, headingStyle } from './theme';
 
 /**
  * Theme resolution for the native selection host.
@@ -88,6 +88,15 @@ export interface RunTextAttribute {
   fontWeight?: ThemeFontWeight;
   fontStyle?: 'normal' | 'italic';
   textDecorationLine?: 'none' | 'underline' | 'line-through';
+  /** Underline / strike colour; unset follows `color`. */
+  textDecorationColor?: string;
+  textDecorationStyle?: 'solid' | 'double' | 'dotted' | 'dashed';
+  /**
+   * Extra advance after each character, in points, like RN's
+   * `TextStyle.letterSpacing`. Zero means unset on the wire, so a nested
+   * range cannot cancel an enclosing range's spacing back to exactly 0.
+   */
+  letterSpacing?: number;
   color?: string;
   backgroundColor?: string;
 }
@@ -110,11 +119,13 @@ export type RunMarkStyle = Omit<
  * changes, so `strong` inside a `heading` keeps the heading's size and
  * colour and overrides nothing else.
  */
-function styleForMark(mark: RunMark, theme: MarkdownTheme): RunMarkStyle {
+function styleForMark(mark: RunMark, theme: MarkdownTheme, text: string): RunMarkStyle {
   const kind: MarkKind = mark.kind;
   switch (kind) {
     case 'emphasis':
-      return { fontStyle: 'italic' };
+      return theme.colors.emphasis !== undefined
+        ? { fontStyle: 'italic', color: theme.colors.emphasis }
+        : { fontStyle: 'italic' };
     case 'strong': {
       // `strongFamily` / `colors.strong` contribute only when set: a design
       // whose bold is a family swap (one font file per family — a weight
@@ -156,13 +167,14 @@ function styleForMark(mark: RunMark, theme: MarkdownTheme): RunMarkStyle {
         fontStyle: 'italic',
       };
     case 'html':
+      if (theme.html.display === 'text') return {};
       return {
         fontFamily: theme.fonts.mono,
         fontSize: theme.code.fontSize,
         color: theme.colors.muted,
       };
     case 'link':
-      return { color: theme.colors.link, textDecorationLine: 'underline' };
+      return linkStyle(theme);
     case 'blockedLink':
       // CONTRIBUTES NOTHING UNTIL THE CONSUMER ASKS. `blockedLink` is a new
       // mark over ranges that previously carried none, so any unconditional
@@ -189,37 +201,46 @@ function styleForMark(mark: RunMark, theme: MarkdownTheme): RunMarkStyle {
     case 'heading': {
       // The line height comes with the font size and cannot be left behind: a
       // 26pt heading laid out on the body's 22.4pt leading has its ascenders
-      // clipped by the line above it on both platforms. Same multiplier and
-      // same `headingFontSize` rounding as the `heading` renderer, so the
-      // fallback and the native host measure to the same height.
-      const fontSize = headingFontSize(theme, (mark.level ?? 1) as 1 | 2 | 3 | 4 | 5 | 6);
-      return {
-        color: theme.colors.heading,
-        fontSize,
-        // `headings.lineHeight` pins every level to one absolute leading (a
-        // design that lays headings on the body's grid); unset falls back to
-        // the multiplier.
-        lineHeight: theme.headings.lineHeight ?? fontSize * theme.fonts.lineHeight,
-        fontWeight: theme.headings.weight,
+      // clipped by the line above it on both platforms. `headingStyle` is
+      // shared with the `heading` renderer, so both paths measure the same.
+      const level = mark.level !== undefined && mark.level >= 1 && mark.level <= 6 ? mark.level : 1;
+      const resolved = headingStyle(theme, level as 1 | 2 | 3 | 4 | 5 | 6);
+      const heading: RunMarkStyle = {
+        color: resolved.color,
+        fontSize: resolved.fontSize,
+        lineHeight: resolved.lineHeight,
+        fontWeight: resolved.fontWeight,
       };
+      // Only a family the theme names, so an unset one keeps inheriting.
+      if (resolved.fontFamily !== theme.fonts.body) heading.fontFamily = resolved.fontFamily;
+      if (resolved.letterSpacing !== undefined) heading.letterSpacing = resolved.letterSpacing;
+      return heading;
     }
     case 'blockquote':
       return { color: theme.colors.quoteText };
-    case 'tableHeader':
-      return { fontWeight: theme.table.headerWeight };
-    // 'listMarker' follows the blockedLink philosophy: it contributes nothing
-    // until the consumer asks (via `colors.listMarker` or `attributeForMark`),
-    // so adding the mark changes no document nobody restyled.
-    case 'listMarker':
-      return theme.colors.listMarker ? { color: theme.colors.listMarker } : {};
-    // These style no characters — 'table' covers text whose styling the
-    // inner marks (tableHeader, and whatever the cells hold) already carry,
-    // 'thematicBreak' is zero-length so there is nothing to style, and a
-    // 'listItem' looks like the prose it contains. All three exist for the
-    // DECORATION channel (`runDecorations.ts`): the border box, the row
-    // rules, the horizontal rule, the list indents.
-    // An empty object drops the mark from the wire unless it carries a role, as 'listItem' does.
+    case 'tableHeader': {
+      const header = cellTextStyle(theme.table.header);
+      header.fontWeight = theme.table.header?.weight ?? theme.table.headerWeight;
+      return header;
+    }
+    // Body typography rides 'tableBody', which skips the header row; on
+    // 'table' it leaked into the header for every key 'tableHeader' left unset.
+    case 'tableBody':
+      return cellTextStyle(theme.table.body);
+    // Chrome only (runDecorations.ts) and the cell semantics below.
     case 'table':
+      return {};
+    // 'listMarker' follows the blockedLink philosophy: it contributes nothing
+    // until the consumer asks (via `colors.listMarker`, `list.marker` or
+    // `attributeForMark`), so adding the mark changes no document nobody
+    // restyled.
+    case 'listMarker':
+      return listMarkerStyle(theme, text.slice(mark.start, mark.end));
+    // These style no characters — 'thematicBreak' is zero-length so there is
+    // nothing to style, and a 'listItem' looks like the prose it contains.
+    // Both exist for the DECORATION channel (`runDecorations.ts`): the
+    // horizontal rule, the list indents.
+    // An empty object drops the mark from the wire unless it carries a role, as 'listItem' does.
     case 'thematicBreak':
     case 'listItem':
       return {};
@@ -232,6 +253,50 @@ function styleForMark(mark: RunMark, theme: MarkdownTheme): RunMarkStyle {
     case 'embed':
       return {};
   }
+}
+
+function linkStyle(theme: MarkdownTheme): RunMarkStyle {
+  const style: RunMarkStyle = { color: theme.colors.link };
+  const { underline, underlineColor } = theme.link;
+  if (underline === 'none') {
+    style.textDecorationLine = 'none';
+    return style;
+  }
+  style.textDecorationLine = 'underline';
+  if (underline !== 'solid') style.textDecorationStyle = underline;
+  if (underlineColor !== undefined) style.textDecorationColor = underlineColor;
+  return style;
+}
+
+/** Sparse: only what the theme sets, so an unset table style keeps body text. */
+function cellTextStyle(cell: TableCellTextStyle | undefined): RunMarkStyle {
+  const style: RunMarkStyle = {};
+  if (cell === undefined) return style;
+  if (cell.fontFamily !== undefined) style.fontFamily = cell.fontFamily;
+  if (cell.fontSize !== undefined) style.fontSize = cell.fontSize;
+  if (cell.lineHeight !== undefined) style.lineHeight = cell.lineHeight;
+  if (cell.color !== undefined) style.color = cell.color;
+  if (cell.weight !== undefined) style.fontWeight = cell.weight;
+  if (cell.letterSpacing !== undefined) style.letterSpacing = cell.letterSpacing;
+  return style;
+}
+
+/** A dot marker hides the bullet's glyphs; the 'marker' decoration draws the dot. */
+function listMarkerStyle(theme: MarkdownTheme, glyph: string): RunMarkStyle {
+  const marker = theme.list.marker;
+  if (marker?.kind === 'dot' && glyph === bulletGlyph(theme)) {
+    return { color: 'transparent' };
+  }
+  const style: RunMarkStyle = {};
+  const color = marker?.kind === 'glyph' ? marker.color : undefined;
+  if (color !== undefined) style.color = color;
+  else if (theme.colors.listMarker) style.color = theme.colors.listMarker;
+  if (marker?.kind === 'glyph') {
+    if (marker.fontFamily !== undefined) style.fontFamily = marker.fontFamily;
+    if (marker.fontSize !== undefined) style.fontSize = marker.fontSize;
+    if (marker.weight !== undefined) style.fontWeight = marker.weight;
+  }
+  return style;
 }
 
 type RunSemantics = Pick<
@@ -452,12 +517,8 @@ function baseAttribute(length: number, theme: MarkdownTheme): RunTextAttribute {
  *   `product://…` (an identifier that should read as ordinary prose) cannot say
  *   that with a single `colors.blockedLink`. The href is the only thing that
  *   separates them, and `RunMark` carries it.
- * - Per-level heading sizes. `headingFontSize` derives all six from
- *   `fonts.baseSize` by a fixed scale; an app with a designed type ramp
- *   (24/20/20/20/13/11, say) has no way to state it. `mark.level` is here.
- * - A bold FACE rather than a weight. An app shipping one file per family
- *   cannot use `fontWeight: '700'` — iOS resolves it within the single-face
- *   family and silently renders regular, so `strong` needs a family swap.
+ * - Anything keyed on the mark's own data beyond what `headings.levels`,
+ *   `fonts.strongFamily` and the other tokens already cover.
  *
  * Before this hook, a consumer's only route to any of that was the JS renderer
  * tree, which the native host does not use — so linking the native module
@@ -510,6 +571,8 @@ export function resolveRunAttributes(
   projected: ProjectedRun,
   theme: MarkdownTheme,
   attributeForMark?: MarkAttribute,
+  /** Applied after every mark and before the embed geometry: separator line heights, highlights. */
+  extra?: readonly RunTextAttribute[],
 ): RunTextAttribute[] {
   if (projected.text.length === 0) return [];
   const out: RunTextAttribute[] = [baseAttribute(projected.text.length, theme)];
@@ -520,7 +583,7 @@ export function resolveRunAttributes(
     // theme nor `attributeForMark` may drop or restyle.
     if (mark.kind === 'embed') continue;
     const override = attributeForMark?.(mark);
-    const style = override ?? styleForMark(mark, theme);
+    const style = override ?? styleForMark(mark, theme, projected.text);
     if (IS_DEV && override !== undefined) {
       warnUnpairedFontSize(mark, override, theme);
     }
@@ -535,6 +598,13 @@ export function resolveRunAttributes(
     });
   }
   for (const cell of semantics.cells) out.push(cell);
+  // After the marks, so a prefix inside a heading or link keeps its own colour.
+  for (const prefix of projected.prefixes ?? []) {
+    if (prefix.style !== undefined) out.push({ start: prefix.start, end: prefix.end, ...prefix.style });
+  }
+  if (extra !== undefined) {
+    for (const attribute of extra) out.push(attribute);
+  }
   // The embed geometry attributes, appended LAST so they sit innermost and
   // win over any covering construct's styling. Two fields, both load-bearing:
   //

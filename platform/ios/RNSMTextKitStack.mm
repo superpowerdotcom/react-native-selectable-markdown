@@ -16,10 +16,121 @@
  * RN means a run and an adjacent RN <Text> at least agree about leading, which
  * is what a consumer laying the two out together would expect.
  */
+NSString *const RNSMChipUnbreakableAttributeName = @"RNSMChipUnbreakable";
+NSString *const RNSMChipWrapLeadAttributeName = @"RNSMChipWrapLead";
+
+/*
+ * Chip line breaking (the contract is in the header). Attribute-driven and
+ * stateless, so one shared instance serves every stack on every thread.
+ */
+@interface RNSMLayoutPolicy : NSObject <NSLayoutManagerDelegate>
+@end
+
+@implementation RNSMLayoutPolicy
+
+static BOOL RNSMBreakAllowedBefore(NSLayoutManager *layoutManager, NSUInteger index)
+{
+  NSTextStorage *storage = layoutManager.textStorage;
+  if (index == 0 || index >= storage.length) {
+    return YES;
+  }
+  id value = [storage attribute:RNSMChipUnbreakableAttributeName atIndex:index effectiveRange:NULL];
+  if (![value isKindOfClass:[NSNumber class]]) {
+    return YES;
+  }
+  NSTextContainer *container = layoutManager.textContainers.firstObject;
+  if (container == nil) {
+    return YES;
+  }
+  // The widest line this paragraph can lay out; a chip wider than that must
+  // break somewhere, and TextKit's own choice is better than an overflow.
+  CGFloat usable = container.size.width - 2.0 * container.lineFragmentPadding;
+  NSParagraphStyle *style = [storage attribute:NSParagraphStyleAttributeName
+                                       atIndex:index
+                                effectiveRange:NULL];
+  if ([style isKindOfClass:[NSParagraphStyle class]]) {
+    if (style.tailIndent > 0.0) {
+      usable = MIN(usable, style.tailIndent);
+    } else {
+      usable += style.tailIndent;
+    }
+    usable -= MAX(style.firstLineHeadIndent, style.headIndent);
+  }
+  return ((NSNumber *)value).doubleValue > usable;
+}
+
+- (BOOL)layoutManager:(NSLayoutManager *)layoutManager
+    shouldBreakLineByWordBeforeCharacterAtIndex:(NSUInteger)charIndex
+{
+  return RNSMBreakAllowedBefore(layoutManager, charIndex);
+}
+
+- (BOOL)layoutManager:(NSLayoutManager *)layoutManager
+    shouldBreakLineByHyphenatingBeforeCharacterAtIndex:(NSUInteger)charIndex
+{
+  return RNSMBreakAllowedBefore(layoutManager, charIndex);
+}
+
+@end
+
+/*
+ * The leading-edge room for a chip a soft wrap put first on its line. The
+ * typesetter asks for each line's rect with that line's first character, so
+ * the room is reserved before the line is filled and cannot overflow it.
+ */
+@interface RNSMTextContainer : NSTextContainer
+@end
+
+@implementation RNSMTextContainer
+
+- (BOOL)isSimpleRectangularTextContainer
+{
+  return NO;
+}
+
+- (CGRect)lineFragmentRectForProposedRect:(CGRect)proposedRect
+                                  atIndex:(NSUInteger)characterIndex
+                         writingDirection:(NSWritingDirection)baseWritingDirection
+                            remainingRect:(nullable CGRect *)remainingRect
+{
+  CGRect rect = [super lineFragmentRectForProposedRect:proposedRect
+                                               atIndex:characterIndex
+                                      writingDirection:baseWritingDirection
+                                         remainingRect:remainingRect];
+  NSTextStorage *storage = self.layoutManager.textStorage;
+  if (characterIndex >= storage.length || CGRectIsEmpty(rect)) {
+    return rect;
+  }
+  id value = [storage attribute:RNSMChipWrapLeadAttributeName
+                        atIndex:characterIndex
+                 effectiveRange:NULL];
+  if (![value isKindOfClass:[NSNumber class]]) {
+    return rect;
+  }
+  const CGFloat lead = MIN((CGFloat)((NSNumber *)value).doubleValue, rect.size.width);
+  if (!(lead > 0.0)) {
+    return rect;
+  }
+  if (baseWritingDirection != NSWritingDirectionRightToLeft) {
+    rect.origin.x += lead;
+  }
+  rect.size.width -= lead;
+  return rect;
+}
+
+@end
+
 static NSLayoutManager *RNSMMakeLayoutManager(void)
 {
+  static RNSMLayoutPolicy *policy;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    policy = [RNSMLayoutPolicy new];
+  });
   NSLayoutManager *layoutManager = [NSLayoutManager new];
   layoutManager.usesFontLeading = NO;
+  // Weak on NSLayoutManager; the static keeps it alive.
+  layoutManager.delegate = policy;
   return layoutManager;
 }
 
@@ -27,7 +138,7 @@ static NSLayoutManager *RNSMMakeLayoutManager(void)
 
 + (NSTextStorage *)makeTextStackWithSize:(CGSize)size
 {
-  NSTextContainer *textContainer = [[NSTextContainer alloc] initWithSize:size];
+  NSTextContainer *textContainer = [[RNSMTextContainer alloc] initWithSize:size];
 
   // UIKit's default is 5 points on each edge, which would wrap the drawn text
   // at a width 10 points narrower than the width it was measured at.

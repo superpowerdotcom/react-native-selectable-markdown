@@ -1,6 +1,7 @@
 #import "SelectableMarkdownModule.h"
 
 #import <React/RCTBridge.h>
+#import <UIKit/UIKit.h>
 #import <React/RCTLog.h>
 
 #import <objc/runtime.h>
@@ -189,11 +190,11 @@ RCT_EXPORT_MODULE(SelectableMarkdown)
 
 /* RCTJSThread, not a private serial queue and not the main queue.
  *
- * The module's only method is blocking-synchronous, and React Native runs
- * those on the JS thread whatever this returns — but the value is not inert:
- * it is what RN would otherwise dispatch any *future* method on, and a main
- * queue here would be a standing invitation to add one that touches the
- * runtime from the wrong thread. Declaring RCTJSThread states the module's
+ * `install` is blocking-synchronous, and React Native runs those on the JS
+ * thread whatever this returns — but the value is not inert: it is what RN
+ * dispatches every async method on (`copyText`, which hops to main itself),
+ * and a main queue here would be a standing invitation to add one that
+ * touches the runtime from the wrong thread. Declaring RCTJSThread states the module's
  * actual affinity and costs RN nothing (it explicitly skips creating a
  * shared queue for it). */
 - (dispatch_queue_t)methodQueue
@@ -213,6 +214,16 @@ RCT_EXPORT_MODULE(SelectableMarkdown)
 RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(install)
 {
   return [self installOutcome];
+}
+
+/* The code-block card's Copy button when the app supplies no `onCodeCopy`.
+ * Arrives on the JS thread (see `methodQueue`); UIPasteboard wants main. */
+RCT_EXPORT_METHOD(copyText:(NSString *)text)
+{
+  NSString *copied = [text copy];
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [UIPasteboard generalPasteboard].string = copied;
+  });
 }
 
 - (NSString *)installOutcome

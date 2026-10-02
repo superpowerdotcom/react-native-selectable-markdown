@@ -4,6 +4,8 @@ Versions follow [semver](https://semver.org/); pre-1.0, breaking changes land in
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-10-02
+
 - BREAKING: complete `MarkdownTheme` objects now require `colors.highlight`, `table.frame`, `table.hideEmptyHeader`, `blocks`, `list`, `link`, and `html`. Use `mergeTheme(overrides)` to fill defaults before passing a theme to the run resolvers, or update complete theme literals.
 
 - Theme: `blocks` group of per-kind margins (`paragraph`, `heading`, `list`, `listItem`, `quote`, `code`, `table`, `rule`, `firstBlockLead`), collapsed web-style and measured from box edges. In a run each margin is the height of the separator's blank line, so selection offsets do not move. Unset, spacing is unchanged.

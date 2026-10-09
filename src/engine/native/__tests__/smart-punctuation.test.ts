@@ -68,23 +68,18 @@ function valueAndSlice(source: string, options?: EngineOptions): [string, string
 // The transform in isolation
 // ---------------------------------------------------------------------------
 
-/**
- * `before` is the character that preceded this slice in the same text run, or
- * `undefined` at the start of one. It is the entire flanking context the rule
- * needs: a quote opens at the start of a run, after whitespace, or after an
- * opening bracket, and closes everywhere else. That "everywhere else" is what
- * makes `don't` an apostrophe rather than an unbalanced opening quote, which
- * is the single most visible thing this rule gets right.
- */
 describe('applySmartPunctuation', () => {
-  test('a quote at the start of a run opens', () => {
+  test('a balanced pair at the start of a run opens and closes', () => {
     expect(applySmartPunctuation('"a"', undefined)).toBe('“a”');
     expect(applySmartPunctuation("'a'", undefined)).toBe('‘a’');
   });
 
-  test('a quote after whitespace opens, after a letter closes', () => {
-    expect(applySmartPunctuation('"a', ' ')).toBe('“a');
+  test('an unpaired quote is the closing form wherever it sits', () => {
+    // cmark's `handle_delim` emits every quote closing; only `process_emphasis` pairing flips one.
+    expect(applySmartPunctuation('"a', ' ')).toBe('”a');
     expect(applySmartPunctuation('"a', 'x')).toBe('”a');
+    expect(applySmartPunctuation('"abc', undefined)).toBe('”abc');
+    expect(applySmartPunctuation('foo "bar', undefined)).toBe('foo ”bar');
   });
 
   test('a quote after an opening bracket opens', () => {
@@ -98,6 +93,15 @@ describe('applySmartPunctuation', () => {
 
   test('an apostrophe mid-word closes', () => {
     expect(applySmartPunctuation("don't stop", undefined)).toBe('don’t stop');
+    expect(applySmartPunctuation("'tis the '90s", undefined)).toBe('’tis the ’90s');
+  });
+
+  test('a closer takes the nearest opener of its own kind, across the other', () => {
+    expect(applySmartPunctuation('"a \'b" c\'', undefined)).toBe('“a ‘b” c’');
+  });
+
+  test('a quote between two letters can only close', () => {
+    expect(applySmartPunctuation('a"b', undefined)).toBe('a”b');
   });
 
   test('dash runs follow cmark: 2 en, 3 em, and mixed beyond', () => {
@@ -145,6 +149,49 @@ describeNative('smart punctuation through the engine', () => {
       kind: 'text',
       value: '“a”',
     });
+  });
+
+  test('an unpaired quote in prose is the closing form, as cmark renders it', () => {
+    expect(valueAndSlice('"abc\n')[0]).toBe('”abc');
+    expect(valueAndSlice('foo "bar\n')[0]).toBe('foo ”bar');
+    const doc = parse('*foo*"\n');
+    expect(inlines(doc).map((n) => n.kind)).toEqual(['emphasis', 'text']);
+    expect(inlines(doc)[1]).toMatchObject({ kind: 'text', value: '”' });
+  });
+
+  test('a pair spans a soft break but not a paragraph', () => {
+    expect(valueAndSlice('"a\nb"\n')[0]).toBe('“a');
+    const doc = parse('"x\n\ny"\n');
+    expect(inlines(doc)[0]).toMatchObject({ value: '”x' });
+    expect((doc.blocks[1] as { children: Inline[] }).children[0]).toMatchObject({ value: 'y”' });
+  });
+
+  test('a closer inside an emphasis pairs with an opener outside it', () => {
+    // cmark resolves the `"` closer before the `*` one, while the outer opener is still on the stack.
+    const doc = parse('"a *b" c*\n');
+    expect(inlines(doc)[0]).toMatchObject({ kind: 'text', value: '“a ' });
+    expect((inlines(doc)[1] as { children: Inline[] }).children[0]).toMatchObject({ value: 'b” c' });
+  });
+
+  test('an opener inside a resolved emphasis cannot pair past it', () => {
+    // cmark drops every delimiter inside a resolved emphasis, so the `"` opened there is gone.
+    const doc = parse('*a "b* c"\n');
+    expect((inlines(doc)[0] as { children: Inline[] }).children[0]).toMatchObject({ value: 'a ”b' });
+    expect(inlines(doc)[1]).toMatchObject({ value: ' c”' });
+  });
+
+  test("a link's label pairs within itself", () => {
+    const outside = parse('"a [b" c](https://e.com)\n');
+    expect(inlines(outside)[0]).toMatchObject({ value: '”a ' });
+    expect((inlines(outside)[1] as { children: Inline[] }).children[0]).toMatchObject({ value: 'b” c' });
+    const inside = parse('["a](https://e.com) b"\n');
+    expect((inlines(inside)[0] as { children: Inline[] }).children[0]).toMatchObject({ value: '”a' });
+    expect(inlines(inside)[1]).toMatchObject({ value: ' b”' });
+  });
+
+  test('an escaped quote neither opens nor closes, and the pair around it holds', () => {
+    const doc = parse('"a \\"b\\" c"\n');
+    expect(inlines(doc).map((n) => (n as { value: string }).value).join('')).toBe('“a "b" c”');
   });
 
   test('off by default: the same source keeps its straight quotes', () => {

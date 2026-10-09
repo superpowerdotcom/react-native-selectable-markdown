@@ -142,7 +142,7 @@ const defaultIdleScheduler: IdleScheduler = (flush, ms) => {
  * entity reference already sitting at the tail ("&amp" + ";" decodes), which
  * would change an existing text node's value.
  */
-const CONSTRUCT_CHARS = /[\n\r\\`*_~$[\]()<>#|!&\-=+.:'";]/;
+const CONSTRUCT_CHARS = /[\n\r\\`*_~$[\]()<>#|!&\-=+.:'";\0]/;
 
 /** md4c's `scheme_map`; `incremental.test.ts` fails if this falls behind. */
 const PERMISSIVE_AUTOLINK_SCHEMES = ['http', 'https', 'ftp'];
@@ -151,15 +151,28 @@ const PERMISSIVE_AUTOLINK_SCHEMES = ['http', 'https', 'ftp'];
  * A trailing token that is (or is growing into) a bare autolink candidate.
  * Even a plain letter can re-extend one (`https://example.` + `c`). Tested on
  * the raw final line, which may span an emitted autolink plus trimmed
- * punctuation.
+ * punctuation. A scan, not a regex: `(?:^|[\s*_~(])(?:https?:|ftp:|www\.)\S*$`
+ * is quadratic on a long line.
  */
-const URLISH_TAIL = new RegExp(
-  `(?:^|[\\s*_~(])(?:(?:${PERMISSIVE_AUTOLINK_SCHEMES.join('|')}):|www\\.)\\S*$`,
-  'i',
-);
+function hasUrlishTail(line: string): boolean {
+  // The candidate can only sit inside the last whitespace-delimited token.
+  let tokenStart = line.length;
+  while (tokenStart > 0 && !WHITESPACE.test(line[tokenStart - 1])) tokenStart -= 1;
+  const token = line.slice(tokenStart).toLowerCase();
+  for (let at = 0; at < token.length; at += 1) {
+    if (at > 0 && !URLISH_LEAD.includes(token[at - 1])) continue;
+    for (const start of URLISH_STARTS) {
+      if (token.startsWith(start, at)) return true;
+    }
+  }
+  return false;
+}
+const URLISH_LEAD = '*_~(';
+const URLISH_STARTS = [...PERMISSIVE_AUTOLINK_SCHEMES.map((scheme) => scheme + ':'), 'www.'];
+const WHITESPACE = /\s/;
 
 /**
- * The email half of GFM autolinks, which `URLISH_TAIL` cannot see:
+ * The email half of GFM autolinks, which `hasUrlishTail` cannot see:
  * `foo@example.` + `c` becomes a link with no construct character. Two native
  * scans, because a regex here backtracks on every '@'-free line.
  */
@@ -524,7 +537,7 @@ export class StreamSession {
   private readonly repairOptions: RepairOptions | undefined;
   /**
    * Fast-path stand-down for `repair.hideBareUriSchemes`, the scheme-hide
-   * analogue of `URLISH_TAIL`: '/' is not a construct character, so once
+   * analogue of `hasUrlishTail`: '/' is not a construct character, so once
    * `scheme:` sits in the last whitespace-delimited token even a
    * construct-free delta (`/5f3a`) can commit the token to being hidden —
    * the parse path must run the repair. Built once from the listed schemes
@@ -1443,7 +1456,7 @@ export class StreamSession {
    * - the previous tail repair changed nothing (no virtual closers or
    *   suppressions are in flight);
    * - the text does not end in a growing autolink candidate — a `https:`,
-   *   `www.` or bare-email token (see `URLISH_TAIL` and `hasEmailTail`) —
+   *   `www.` or bare-email token (see `hasUrlishTail` and `hasEmailTail`) —
    *   nor (when `repair.hideBareUriSchemes` is set) in a token a listed
    *   scheme's hide may be about to blank.
    * Then the appended characters extend that text node and nothing else,
@@ -1496,14 +1509,14 @@ export class StreamSession {
     const lineStart = this.source.lastIndexOf('\n', prevLen - 1) + 1;
     const lastLine = this.source.slice(lineStart, prevLen);
     if (
-      URLISH_TAIL.test(lastLine) ||
+      hasUrlishTail(lastLine) ||
       hasEmailTail(lastLine) ||
       HTML_OPEN_TAIL.test(lastLine)
     ) {
       return false;
     }
     // A delta introducing `scheme:` itself contains ':' (a construct char),
-    // so testing the pre-delta line — exactly like URLISH_TAIL — covers
+    // so testing the pre-delta line — exactly like `hasUrlishTail` — covers
     // every way a hidden-scheme token can grow through this path.
     if (this.bareUriTailGuard !== null && this.bareUriTailGuard.test(lastLine)) {
       return false;

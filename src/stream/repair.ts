@@ -84,9 +84,9 @@ export interface RepairOptions {
 }
 
 // A label that is (so far) a scheme-prefixed URI with no whitespace:
-// `fhir:`, `fhir:/`, `fhir://Obs`. The `:` must be followed by `/` or by
-// nothing yet, the same bar `hideBareUriSchemes` applies to bare tokens.
-const URI_LIKE_LABEL_RE = /^[a-z][a-z0-9+.-]*:(?:\/[^\s]*)?$/i;
+// `fhir:/`, `fhir://Obs`. The `:` needs a `/` after it, as in `hideBareUriSchemes`:
+// `[Note:` is prose, and hiding it would flash it away for one chunk.
+const URI_LIKE_LABEL_RE = /^[a-z][a-z0-9+.-]*:\/[^\s]*$/i;
 
 /**
  * The label test behind {@link RepairOptions.hideUriLikeLabels}, exported
@@ -1751,7 +1751,14 @@ export function repairTail(
   ) {
     // An emphasis closer appended after whitespace would not bind — '\r'
     // included: a CRLF split at the cut leaves the CR as trailing space.
-    const trimmed = edited.replace(/[ \t\r]+$/, '');
+    // A scan, not `/[ \t\r]+$/`, which is quadratic on a long whitespace run.
+    let cut = edited.length;
+    while (cut > 0) {
+      const c = edited.charCodeAt(cut - 1);
+      if (c !== 0x20 && c !== 0x09 && c !== 0x0d) break;
+      cut -= 1;
+    }
+    const trimmed = edited.slice(0, cut);
     touched.push({
       start: regionStart + trimmed.length,
       end: regionStart + edited.length,

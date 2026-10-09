@@ -235,9 +235,20 @@ const NO_PRESSABLES: readonly never[] = Object.freeze([]);
  * NO_PRESSABLES. */
 const NO_EMBEDS: readonly never[] = Object.freeze([]);
 
+/** Neither host checks for NaN or Infinity; `start`/`end` are kept because both hosts clamp the range. */
+function omitNonFinite<T extends object>(native: T): T {
+  for (const key of Object.keys(native) as (keyof T)[]) {
+    const value = native[key];
+    if (typeof value === 'number' && !Number.isFinite(value) && key !== 'start' && key !== 'end') {
+      delete native[key];
+    }
+  }
+  return native;
+}
+
 function toNativeAttribute(attribute: RunTextAttribute): NativeTextAttribute {
   const { color, backgroundColor, textDecorationColor, ...rest } = attribute;
-  const native: NativeTextAttribute = { ...rest };
+  const native: NativeTextAttribute = omitNonFinite({ ...rest });
   // Only set the keys that were present: every entry is sparse, and a
   // `color: null` from processColor would read on the native side as "this
   // range clears the colour" rather than "this range says nothing about it".
@@ -272,12 +283,12 @@ function toNativePressable(pressable: RunPressable, index: number): NativePressa
   }
   if (pressable.pressedRadius !== undefined) native.pressedRadius = pressable.pressedRadius;
   if (pressable.hitSlop !== undefined) native.hitSlop = pressable.hitSlop;
-  return native;
+  return omitNonFinite(native);
 }
 
 function toNativeDecoration(decoration: RunDecoration): NativeRunDecoration {
   const { color, borderColor, barColor, ...rest } = decoration;
-  const native: NativeRunDecoration = { ...rest };
+  const native: NativeRunDecoration = omitNonFinite({ ...rest });
   // Same only-if-present discipline as toNativeAttribute: an absent colour
   // must stay absent (no fill, no stroke, no bar), not become null.
   const processedColor = color === undefined ? null : memoizedProcessColor(color);

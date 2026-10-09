@@ -54,9 +54,18 @@ export function extractLinks(
   return out;
 }
 
+/** Iterative: label depth is untrusted (one emphasis per delimiter pair), so recursion overflows. */
 function plainText(nodes: readonly AnyNode[]): string {
   let out = '';
-  for (const node of nodes) {
+  const stack: { nodes: readonly AnyNode[]; index: number }[] = [{ nodes, index: 0 }];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (frame.index >= frame.nodes.length) {
+      stack.pop();
+      continue;
+    }
+    const node = frame.nodes[frame.index];
+    frame.index += 1;
     switch (node.kind) {
       case 'text':
       case 'codeSpan':
@@ -76,7 +85,7 @@ function plainText(nodes: readonly AnyNode[]): string {
         out += '\n';
         break;
       default:
-        if ('children' in node) out += plainText(node.children as AnyNode[]);
+        if ('children' in node) stack.push({ nodes: node.children as AnyNode[], index: 0 });
     }
   }
   return out;

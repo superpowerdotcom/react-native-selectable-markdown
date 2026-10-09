@@ -223,16 +223,12 @@ async function loadSerializer() {
   return import(`data:text/javascript;base64,${Buffer.from(js, 'utf8').toString('base64')}`);
 }
 
-// Whitespace-tolerant comparison: <pre>…</pre> content is preserved verbatim
-// (whitespace is meaningful there); everywhere else, whitespace runs collapse
-// to one space, inter-tag whitespace is dropped, and void elements are
-// canonicalized to the CommonMark reference renderer's "<br />" form. Preserved segments hide
-// behind NUL-framed placeholders — NUL cannot occur in spec HTML (the spec
-// mandates NUL -> U+FFFD), so the sentinel is collision-free.
+// <pre> and <code> keep their whitespace: the spec checks a code span's interior spaces.
+// NUL frames the placeholders because spec HTML never contains one (NUL -> U+FFFD).
 function normalizeHtml(html) {
   const preserved = [];
   let s = html.replace(
-    /<pre[^>]*>[\s\S]*?<\/pre>/gi,
+    /<pre[^>]*>[\s\S]*?<\/pre>|<code>[\s\S]*?<\/code>/gi,
     (m) => `\u0000${preserved.push(m) - 1}\u0000`,
   );
   s = s

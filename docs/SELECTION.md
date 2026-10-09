@@ -719,11 +719,14 @@ handleSelectionAction(doc, run, {start, end, action}, ctx?)
   smart-punctuation paragraph maps offset for offset end to end.
 - Returns `null` for an empty, out-of-range or glyph-only selection. Never
   throws mid-gesture.
-- `ctx` is `{ projected?, glyphs?, embed?, actions? }`: an optional
-  precomputed projection, the theme's glyph overrides, the embed lookup the
-  run was segmented with, and the `selectionActions` list the menu was built
-  from — the last a DEV cross-check on the id the host reports, never a
-  filter. `<SelectableMarkdown>` passes all four. A hand-rolled `RunHost`
+- `ctx` is `{ projected?, glyphs?, embed?, softBreak?, transformInline?,
+  snapHeadings?, actions? }`: an optional precomputed projection, the theme's
+  glyph overrides, the embed lookup the run was segmented with, the
+  `softBreak` and `transformInline` the projection was made with, whether
+  `copySnapping="headings"` widens a markdown copy, and the
+  `selectionActions` list the menu was built from — the last a DEV
+  cross-check on the id the host reports, never a filter.
+  `<SelectableMarkdown>` passes all of them. A hand-rolled `RunHost`
   integration that passes an `embed` prop MUST thread the same lookup here:
   without it the fallback reprojection (`projectRun(run, doc, { glyphs,
   embed })`) builds a different piece table from the one on screen and the
@@ -1157,8 +1160,8 @@ with eldest-first multi-eviction, and a text longer than the whole budget is
 refused outright and built uncached. The budget, not the entry cap, is the
 standing bound.
 
-The key is `Key(text, attributes, decorations, embeds, density,
-scaledDensity, localeTag)` — the display-metrics values come from
+The key is `Key(text, attributes, decorations, embeds, scaling, typefaces,
+density, scaledDensity, localeTag)` — the display-metrics values come from
 `DisplayMetricsHolder` and the tag from the default locale, so a font-scale,
 density or locale change misses by construction, and `embeds` is in the key
 because `build` bakes each reservation into spans (an embed whose declared

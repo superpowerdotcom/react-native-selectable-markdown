@@ -63,6 +63,7 @@ export type {
 export {
   DEFAULT_LINK_PREFIXES,
   DEFAULT_IMAGE_PREFIXES,
+  DEFAULT_MAX_SOURCE_LENGTH,
   resolveOptions,
   withOptions,
   presets,

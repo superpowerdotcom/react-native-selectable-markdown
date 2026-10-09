@@ -1,8 +1,11 @@
 #!/usr/bin/env node
-// Refuses to release a BREAKING change under a version that is already tagged.
+// Refuses to release a BREAKING change under a version that is already tagged,
+// or under a version whose number does not announce it.
 //
 // Fails when CHANGELOG.md's Unreleased section mentions BREAKING and package.json's
-// version equals the latest `v*` tag. It does not judge the size of the bump.
+// version equals the latest `v*` tag, and when the section for a `--tag` mentions
+// BREAKING but that tag is not a minor bump (pre-1.0) or a major bump (1.0+),
+// the rule CHANGELOG.md's header states.
 //
 // Usage: node scripts/check-unreleased-breaking.mjs [--tag vX.Y.Z]...
 //                [--changelog PATH] [--manifest PATH] [--no-git]
@@ -38,10 +41,10 @@ const fail = (message) => {
 };
 
 /** Same section grammar as scripts/changelog-section.mjs; keep the two in step. */
-const unreleasedSection = (text) => {
+const sectionNamed = (text, name) => {
   const lines = text.split('\n');
   const start = lines.findIndex(
-    (line) => /^##\s+\[?([^\]\s]+)\]?/.exec(line)?.[1].toLowerCase() === 'unreleased',
+    (line) => /^##\s+\[?([^\]\s]+)\]?/.exec(line)?.[1].toLowerCase() === name.toLowerCase(),
   );
   if (start === -1) return null;
   let end = lines.length;
@@ -53,6 +56,8 @@ const unreleasedSection = (text) => {
   }
   return lines.slice(start + 1, end);
 };
+const unreleasedSection = (text) => sectionNamed(text, 'unreleased');
+const isBreakingLine = (line) => /^\s*[-*]\s+(?:\*\*)?BREAKING\b/i.test(line);
 
 const parseVersion = (raw) => {
   const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(raw.trim());
@@ -89,8 +94,32 @@ if (!fs.existsSync(manifestPath)) {
   fail(`${manifestPath} does not exist.`);
 }
 
-const section = unreleasedSection(fs.readFileSync(changelogPath, 'utf8'));
-const breaking = (section ?? []).filter((line) => /^\s*[-*]\s+(?:\*\*)?BREAKING\b/i.test(line));
+const changelogText = fs.readFileSync(changelogPath, 'utf8');
+
+for (const tag of flagValues('tag')) {
+  const parsed = parseVersion(tag);
+  if (!parsed) continue;
+  const lines = sectionNamed(changelogText, parsed.version);
+  if (!lines) continue; // changelog-section.mjs is the gate for a missing section
+  const breakingHere = lines.filter(isBreakingLine);
+  if (breakingHere.length === 0) continue;
+  const [major, minor, patch] = parsed.parts;
+  const announces = major === 0 ? patch === 0 : minor === 0 && patch === 0;
+  if (announces) continue;
+  const bump = major === 0 ? 'minor' : 'major';
+  const suggested = major === 0 ? `0.${minor + 1}.0` : `${major + 1}.0.0`;
+  fail(
+    `CHANGELOG.md's ${parsed.version} section names a BREAKING change, but ` +
+      `v${parsed.version} is not a ${bump} bump.\n` +
+      `    ${breakingHere.length} line(s) say BREAKING, the first being:\n` +
+      `      ${breakingHere[0].trim()}\n` +
+      `    CHANGELOG.md's header promises a ${bump} bump for a break; release it as ` +
+      `${suggested}, or drop the BREAKING label if nothing breaks.`,
+  );
+}
+
+const section = unreleasedSection(changelogText);
+const breaking = (section ?? []).filter(isBreakingLine);
 
 if (breaking.length === 0) {
   console.log(

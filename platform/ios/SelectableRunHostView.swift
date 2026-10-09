@@ -518,12 +518,16 @@ public final class SelectableRunHostView: UIView {
       setNeedsLayout()
     }
 
-    // Equal content: early out before any storage touch. `isEqual(to:)`
-    // compares text and attributes, so a styling-only change never lands
-    // here and still reaches the splice below.
-    if newLength == previousLength, attributedText.isEqual(to: lastAppliedText) {
-      return
-    }
+    // Identity, not `isEqual(to:)`: Fabric re-publishes the same handle for
+    // unchanged content, and the plan below catches equal content in a new object.
+    if attributedText === lastAppliedText { return }
+
+    let plan = RNSMTextSplice.plan(from: lastAppliedText, to: attributedText)
+    // Retained, not copied: published Fabric State is never mutated, even though
+    // its class is `NSMutableAttributedString`.
+    lastAppliedText = attributedText
+    let unchanged = plan.prefix == previousLength && previousLength == newLength
+    if unchanged { return }
 
     let saved = textView.selectedRange
     let hadSelectAll =
@@ -531,10 +535,6 @@ public final class SelectableRunHostView: UIView {
 
     // The pressed rect was laid out against the old text.
     pressedPressableId = nil
-
-    let plan = RNSMTextSplice.plan(from: lastAppliedText, to: attributedText)
-    lastAppliedText = NSAttributedString(attributedString: attributedText)
-    if plan.prefix == previousLength && previousLength == newLength { return }
     if plan.isEmpty {
       textView.attributedText = attributedText
     } else {

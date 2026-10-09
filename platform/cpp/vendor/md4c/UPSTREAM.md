@@ -30,8 +30,12 @@ this file.
 
 The vendored `.h` and `.c` files are never edited in place. Every local change
 lives in `patches/` as a numbered `.patch` file (unified diff, applied in
-lexical order). There are currently no patches: the files above are
-byte-identical to upstream at the pinned SHA.
+lexical order). One patch is applied: `0001-fence-closed.patch` adds
+`fence_closed` to `MD_BLOCK_CODE_DETAIL`, set when a closing fence rather
+than a container's end ended a fenced block; `OffsetParser.cpp` carries it to
+the wire as `kDetailFenceClosed`. The checksums above are the pristine
+upstream files; `md4c.h` and `md4c.c` in this directory are those files plus
+that patch, so re-fetching upstream and re-applying it reproduces them.
 
 ## Sync procedure (moving to a newer upstream)
 

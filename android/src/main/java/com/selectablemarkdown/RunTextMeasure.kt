@@ -112,7 +112,7 @@ internal object RunTextMeasure {
      * `getDesiredWidth` applies spans to its own working copy, not to the
      * paint it was passed. React Native's TextLayoutManager keeps the same
      * thread-local scratch for the same reason. (`withInitial` needs API 26;
-     * minSdk here is 23, hence the subclass.)
+     * minSdk here is 24, hence the subclass.)
      */
     private val scratchPaint = object : ThreadLocal<TextPaint>() {
         override fun initialValue(): TextPaint = TextPaint(TextPaint.ANTI_ALIAS_FLAG)

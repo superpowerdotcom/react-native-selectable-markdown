@@ -85,8 +85,8 @@ enum class NodeType : uint8_t {
 
 enum class TextKind : uint8_t {
   Normal,
-  /* A NUL byte in the source; CommonMark requires rendering U+FFFD. The
-   * event's byte range covers the NUL byte, stringA holds "�". */
+  /* A source NUL, rendered U+FFFD. md4c reports it via a static string, so the
+   * event has no byte range (kNoByteOffset); stringA holds "�". */
   NullChar,
   HardBreak,
   SoftBreak,
@@ -124,6 +124,7 @@ struct NodeEvent {
   bool listTight = false;                 /* UnorderedList / OrderedList */
   uint32_t orderedStart = 1;              /* OrderedList */
   char fenceChar = '\0';                  /* CodeBlock: '`'/'~'; 0 = indented */
+  bool fenceClosed = false;               /* CodeBlock: a closing fence ended it, not its container */
   TaskState task = TaskState::NotTask;    /* ListItem */
   uint32_t taskMarkByte = kNoByteOffset;  /* ListItem: byte of the char between '[' and ']' */
   CellAlign align = CellAlign::Default;   /* TableHeaderCell / TableCell */

@@ -32,7 +32,9 @@ export function sanitizeUrl(raw: string): string {
  * segments past it are counted (one layer of percent-decoding, `\` as a
  * separator, query and fragment ignored) and a URL that climbs above the
  * prefix is refused. This is best-effort, not RFC 3986 normalization: a
- * doubly-encoded `%252e%252e` can still escape.
+ * doubly-encoded `%252e%252e` can still escape, and the query and fragment
+ * are not scoped at all, so an app whose router reads a path out of either
+ * must check that part itself.
  */
 export function isUrlAllowed(url: string, prefixes: readonly string[]): boolean {
   const folded = foldUrlCase(url);

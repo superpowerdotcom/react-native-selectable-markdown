@@ -110,6 +110,7 @@ describe('parseDocument', () => {
       htmlAllow: [],
       htmlOther: 'strip',
       smartPunctuation: true,
+      maxSourceLength: 1048576,
       urlPolicy: {
         linkPrefixes: ['https://', 'http://', 'mailto:'],
         imagePrefixes: ['https://'],

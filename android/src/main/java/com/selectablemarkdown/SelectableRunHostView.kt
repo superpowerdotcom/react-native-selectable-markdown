@@ -804,9 +804,6 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         val chip = pendingDecorations.decorations.firstOrNull {
             it.kind == "chip" && it.start == pressable.start && it.end == pressable.end
         }
-        val radius = PixelUtil.toPixelFromDIP(
-            if (pressed.pressedRadius > 0f) pressed.pressedRadius else chip?.borderRadius ?: 0f,
-        )
         val text = textView.text as? android.text.Spanned
         if (chip != null && text != null &&
             RunDecorations.chipRect(layout, text, chip, textView.paint, decorationTextPaint, decorationRect)

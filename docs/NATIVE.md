@@ -69,7 +69,10 @@ Five properties the pipeline depends on:
    thousand-line document adds one entry rather than a thousand, and the
    decoder materializes an entry's string only in the branches that read it.
 3. **Event ranges are content ranges.** `**bold**` reports `bold`. Widening is
-   the decoder's job.
+   the decoder's job. One widening fact only md4c knows rides along as a
+   detail bit: `kDetailFenceClosed` says a closing fence ended a code block,
+   so the decoder never goes looking for one that a container's end denied
+   it (vendored patch 0001, `platform/cpp/vendor/md4c/patches/`).
 4. **Little-endian, 4-byte aligned, one allocation.** Fields are written byte
    by byte, so the format is an ABI. The magic word is the runtime check.
 5. **The flags word is enforced, not merely carried.** Bit 0 is
@@ -78,7 +81,9 @@ Five properties the pipeline depends on:
    clear: the events in such a buffer are only the prefix emitted before
    md4c gave up, and decoding that prefix would produce a well-formed
    document silently missing its tail. `decodeFlatBuffer` throws for the same
-   reason when the event list ends with frames still open.
+   reason when the event list ends with frames still open, and for an event
+   whose range leaves the source or runs backwards; an invalid UTF-8 entry in
+   the string table decodes to U+FFFD rather than throwing.
 
 ## Who owns what
 
@@ -90,7 +95,7 @@ Five properties the pipeline depends on:
 | Escapes and entities in hrefs, titles, info strings | C++ (`md_build_attribute` + `internAttribute` in `OffsetParser.cpp`) | String values, not source ranges. md4c drops backslash escapes while building the attribute and tags the entity substrings; `internAttribute` resolves those against the full table. Decoded exactly ONCE — a second JS pass turned `&amp;amp;` into `&` and a doubled backslash into a bare `*` |
 | Span widening | TS (`widen.ts`) | Needs the source string |
 | Text values, smart punctuation | TS (`decode.ts`) | Text is sliced from the JS source |
-| URL allowlist, HTML strip/raw | TS (`decode.ts`, rules in `src/engine/urlPolicy.ts`) | Applied while the node is built, so no renderer can forget it. Pinned by `src/engine/urlPolicy.test.ts` |
+| URL allowlist, HTML strip/raw/allow | TS (`decode.ts` and `htmlSubset.ts`, rules in `src/engine/urlPolicy.ts`) | Applied while the node is built, so no renderer can forget it; `html: { allow }` runs after the parse and applies the allowlist to its own `<a href>` nodes. Pinned by `src/engine/urlPolicy.test.ts` |
 | Spoilers (`\|\|…\|\|`) | TS, opt-in post-parse | The native wrapper has no spoiler flag; nothing native can enable non-CommonMark syntax |
 
 Both entity rows land in C++, so `src/engine/entities.ts` is left holding one
@@ -120,11 +125,11 @@ edge and stops when the characters stop being this construct's own syntax:
 
 That is a property of the WIDENERS, not of spans. A construct with no offsets
 is placed instead by `locateFirstNonBlankLine`, which returns the whole line
-minus leading spaces and tabs, so a located construct inside a container does
-include the marker: the source `"> -"` gives `list[0,3]`, ``"> ```"`` gives
-`codeBlock[0,5]`, and `"> ##"` gives `heading[0,4]` — each span covering the
-container marker as well as the construct. Pre-existing, and unchanged by the
-located-line work below.
+minus leading spaces and tabs, so an empty list item inside a container does
+include the marker: the source `"> -"` gives `list[0,3]`. An empty fence and
+an empty heading are then re-widened from their own syntax, so ``"> ```"``
+gives `codeBlock[2,5]` and `"> ##"` gives `heading[2,4]`, the quote marker
+outside. Pre-existing, and unchanged by the located-line work below.
 
 Constructs with no text (a thematic break, an empty heading or list item)
 arrive with no offsets. The decoder places them at the first non-blank line at
@@ -145,16 +150,18 @@ whose located line IS the fence: a closed `` ```js `` block followed by a bare
 `` ``` `` gave the second block the FIRST one's closing fence. Both wideners
 skip that step when the span was located.
 
-Tests assert over the whole CommonMark corpus that no span escapes its parent
-and none leaves the source bounds. Two span-invariant defects sit outside what
-those sweeps reach, both pre-existing. A pipe-less continuation row in a GFM
-table gets a zero-width padding cell for its missing column —
+Tests assert over the whole CommonMark corpus that no span escapes its parent,
+none leaves the source bounds, and nothing but an empty list item is
+zero-width. One span-invariant defect sits outside what those sweeps reach,
+pre-existing: a pipe-less continuation row in a GFM table gets a zero-width
+padding cell for its missing column —
 `"| a | b |\n| - | - |\n| 1 | 2 |\nx\n"` gives `tableRow[30,31]` holding
 `tableCell[30,31]` = `"x"` and `tableCell[31,31]` = `""`, and `MAY_BE_EMPTY`
 in `spans.test.ts` does not list `tableCell`, so it counts as a violation
-under the repo's own checker. And a located thematic break inside a blockquote
-leaves the quote zero-width: `> ***` gives `blockquote[0,0]` wrapping
-`thematicBreak[0,0]`.
+under the repo's own checker. A thematic break inside a container was the
+second until `locateThematicBreak` learned to step over the container's own
+marker: `> ***` gives `blockquote[0,5]` wrapping `thematicBreak[2,5]`, and
+`- ***` gives `list[0,5]` over `thematicBreak[2,5]`.
 
 ## Decoder hot paths
 
@@ -189,13 +196,19 @@ No on-device number yet.
   decodes to a `hardBreak` spanning exactly the tag, because dropping it
   joined the surrounding words with no separator and a GFM table cell has no
   other way to break a line. `<brand>` and every other tag still vanish;
-  `html: 'raw'` is unchanged. The branch is `P.TextKind.Html` in
+  `html: 'raw'` is unchanged. An HTML block of CommonMark type 1 to 5
+  (`<script>`, `<pre>`, `<style>`, `<textarea>`, `<!--`, `<?`, `<!X`,
+  `<![CDATA[`) ends at its own end marker, not at a blank line, so under
+  `'strip'` a comment or `<script>` a model opens on its own line and never
+  closes takes the rest of the message with it; the README's options table
+  says so. The branch is `P.TextKind.Html` in
   `src/engine/native/decode.ts`, with `isHtmlLineBreak` next to
   `locateLiteral`.
 - **A text node's `value` can differ from its source slice, in a closed list
   of ways.** A backslash escape drops its backslash, `&amp;` becomes `&`, NUL
   becomes U+FFFD, and `smartPunctuation` adds the four `cmark --smart`
-  rewrites. The fifth is by far the largest: a link or image whose destination
+  rewrites, pairing quotes the way cmark does: an unpaired `"` or `'`
+  renders as the closing form. The fifth is by far the largest: a link or image whose destination
   the URL policy rejects degrades to a text node carrying the flattened label
   or alt, while its span still covers the whole construct — under
   `presets.llmChat`, `[ab](ftp://e.com)` is `value: "ab"` over a
@@ -223,13 +236,15 @@ No on-device number yet.
 The test path is a Node-API addon over the same C++ in `native/node/`
 ([native/node/README.md](../native/node/README.md)). Without it, every block
 that needs a parser reports itself skipped rather than passing empty
-(`describeNative`); 23 of the 46 suites hold at least one.
+(`describeNative`); 34 of the 57 suites hold at least one, and 14 of them skip
+outright.
 
 ```sh
 node scripts/build-node-addon.mjs   # → build/selectable-markdown.<platform>-<arch>.node (gitignored)
 npm run conformance                 # 651/652; writes conformance/report-native.json
-npx jest src/engine/native          # 6 suites: protocol parity, host binding, documents,
-                                    # span properties, underline, smart punctuation
+npx jest src/engine/native          # 7 suites: protocol parity, host binding, documents,
+                                    # span properties, underline, smart punctuation,
+                                    # widener regressions
 npm run bench:all                   # throughput, pathological, streaming replay, crossing,
                                     # projection
 ```

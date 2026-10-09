@@ -301,32 +301,139 @@ const INLINE_DESTINATION =
 // Char codes, not one-character strings: this loop walks every byte of every
 // link tail in the document, and it was the single hottest function in a
 // decode profile (16% of the corpus decode) purely on string-compare cost.
+//
+// Each scan stops where its construct's grammar ends, never at a balancing
+// bracket: that ran every unbalanced tail to the end of the document.
 function skipLinkTail(source: string, pos: number): number {
   const open = source.charCodeAt(pos);
-  if (open !== 0x28 /* ( */ && open !== 0x5b /* [ */) return pos;
-  const close = open === 0x28 ? 0x29 /* ) */ : 0x5d /* ] */;
-  let depth = 0;
-  let i = pos;
+  if (open === 0x5b /* [ */) return skipReferenceLabel(source, pos);
+  if (open !== 0x28 /* ( */) return pos;
+  const end = scanInlineTail(source, pos);
+  return end !== -1 && INLINE_DESTINATION.test(source.slice(pos, end)) ? end : pos;
+}
+
+/** CommonMark caps a link label at 999 characters between the brackets. */
+const MAX_LABEL_LENGTH = 999;
+
+/** Index past the label's `]`, or `pos` when there is no label. */
+function skipReferenceLabel(source: string, pos: number): number {
+  const limit = Math.min(source.length, pos + 1 + MAX_LABEL_LENGTH + 1);
+  let i = pos + 1;
+  while (i < limit) {
+    const ch = source.charCodeAt(i);
+    if (ch === 0x5c /* \ */) {
+      i += 2;
+      continue;
+    }
+    if (ch === 0x5d /* ] */) return i + 1;
+    if (ch === 0x5b /* [ */ || (ch === 0x0a && isBlankLineAt(source, i + 1))) return pos;
+    i += 1;
+  }
+  return pos;
+}
+
+/** Index past the `)` of `(dest "title")`, or -1 when malformed. */
+function scanInlineTail(source: string, pos: number): number {
+  let i = skipLinkWhitespace(source, pos + 1);
+  if (source.charCodeAt(i) === 0x3c /* < */) {
+    i += 1;
+    let closed = false;
+    while (i < source.length) {
+      const ch = source.charCodeAt(i);
+      if (ch === 0x5c /* \ */) {
+        i += 2;
+        continue;
+      }
+      if (ch === 0x3e /* > */) {
+        closed = true;
+        i += 1;
+        break;
+      }
+      if (ch === 0x3c || ch === 0x0a || ch === 0x0d) return -1;
+      i += 1;
+    }
+    if (!closed) return -1;
+  } else {
+    let depth = 0;
+    while (i < source.length) {
+      const ch = source.charCodeAt(i);
+      if (ch === 0x5c /* \ */) {
+        i += 2;
+        continue;
+      }
+      if (ch <= 0x20 || ch === 0x7f) break;
+      if (ch === 0x28 /* ( */) depth += 1;
+      else if (ch === 0x29 /* ) */) {
+        if (depth === 0) break;
+        depth -= 1;
+      }
+      i += 1;
+    }
+    if (depth !== 0) return -1;
+  }
+  i = skipLinkWhitespace(source, i);
+  const quote = source.charCodeAt(i);
+  if (quote === 0x22 /* " */ || quote === 0x27 /* ' */ || quote === 0x28 /* ( */) {
+    const titleEnd = scanTitle(source, i + 1, quote === 0x28 ? 0x29 : quote);
+    if (titleEnd === -1) return -1;
+    i = skipLinkWhitespace(source, titleEnd);
+  }
+  return source.charCodeAt(i) === 0x29 /* ) */ ? i + 1 : -1;
+}
+
+function skipLinkWhitespace(source: string, from: number): number {
+  let i = from;
+  let newlines = 0;
+  while (i < source.length) {
+    const ch = source.charCodeAt(i);
+    if (ch === 0x20 || ch === 0x09) i += 1;
+    else if ((ch === 0x0a || ch === 0x0d) && newlines === 0) {
+      newlines = 1;
+      i += ch === 0x0d && source.charCodeAt(i + 1) === 0x0a ? 2 : 1;
+    } else break;
+  }
+  return i;
+}
+
+function isBlankLineAt(source: string, from: number): boolean {
+  let i = from;
+  while (i < source.length) {
+    const ch = source.charCodeAt(i);
+    if (ch === 0x0a || ch === 0x0d) return true;
+    if (ch !== 0x20 && ch !== 0x09) return false;
+    i += 1;
+  }
+  return true;
+}
+
+/* Closer-less regions per closer: without them, `[a]("` repeated N times is N
+ * scans to the next blank line. */
+let titleMemoSource: string | null = null;
+const titleMemo = new Map<number, { from: number; until: number }>();
+
+function scanTitle(source: string, from: number, closer: number): number {
+  if (titleMemoSource !== source) {
+    titleMemoSource = source;
+    titleMemo.clear();
+  }
+  const known = titleMemo.get(closer);
+  if (known !== undefined && from >= known.from && from < known.until) return -1;
+  let i = from;
   while (i < source.length) {
     const ch = source.charCodeAt(i);
     if (ch === 0x5c /* \ */) {
       i += 2;
       continue;
     }
-    if (ch === open) depth += 1;
-    else if (ch === close) {
-      depth -= 1;
-      if (depth === 0) {
-        const end = i + 1;
-        if (open === 0x5b) return end;
-        return INLINE_DESTINATION.test(source.slice(pos, end)) ? end : pos;
-      }
+    if (ch === closer) return i + 1;
+    if (ch === 0x0a && isBlankLineAt(source, i + 1)) {
+      titleMemo.set(closer, { from, until: i + 1 });
+      return -1;
     }
     i += 1;
   }
-  // Unterminated: consume nothing rather than swallowing the rest of the
-  // paragraph. Streaming sees this constantly (`[label](https://exa` mid-token).
-  return pos;
+  titleMemo.set(closer, { from, until: source.length + 1 });
+  return -1;
 }
 
 /**
@@ -436,7 +543,8 @@ export function widenCodeBlock(
   source: string,
   span: SourceSpan,
   fenceChar: string | null,
-  hasContent = true,
+  hasContent: boolean,
+  closedByFence: boolean,
 ): { span: SourceSpan; closed: boolean } {
   if (!isAnchored(span)) return { span, closed: fenceChar === null };
   if (fenceChar === null) {
@@ -454,12 +562,14 @@ export function widenCodeBlock(
     : findFenceStart(source, contentLineStart, lineEnd(source, span.start), fenceChar);
 
   // The content range ends at the last code character; the closing fence,
-  // if any, is on the next line.
+  // if any, is on the next non-blank line.
   const trimmed = trimSpanEnd(source, { start, end: span.end });
+  // Not fence-closed: any later fence run is another block's, and taking it leaves that block unanchored.
+  if (!closedByFence) return { span: trimmed, closed: false };
   let closeStart = nextLineStart(source, trimmed.end);
   while (closeStart < source.length) {
     const end = lineEnd(source, closeStart);
-    if (!/^(?:[ \t]*>[ \t]?)*[ \t\r]*$/.test(source.slice(closeStart, end))) break;
+    if (!isBlankInContainers(source, closeStart, end)) break;
     closeStart = nextLineStart(source, end);
   }
   if (closeStart >= source.length) return { span: trimmed, closed: false };
@@ -469,11 +579,28 @@ export function widenCodeBlock(
   // start, so a fence inside a blockquote (`> ``` `) still closes the block.
   const at = closeLine.indexOf(fenceChar.repeat(3));
   if (at === -1) return { span: trimmed, closed: false };
-  const rest = closeLine.slice(at).replace(/[ \t]+$/, '');
-  for (const ch of rest) {
-    if (ch !== fenceChar) return { span: trimmed, closed: false };
+  let restEnd = closeLine.length;
+  while (restEnd > at && isSpaceOrTab(closeLine, restEnd - 1)) restEnd -= 1;
+  for (let i = at; i < restEnd; i += 1) {
+    if (closeLine[i] !== fenceChar) return { span: trimmed, closed: false };
   }
   return { span: { start: trimmed.start, end: closeEnd }, closed: true };
+}
+
+/** A loop, not `^(?:[ \t]*>[ \t]?)*[ \t\r]*$`: that regex backtracks 2^k ways over k markers. */
+function isBlankInContainers(source: string, from: number, to: number): boolean {
+  let afterCr = false;
+  for (let i = from; i < to; i += 1) {
+    const ch = source.charCodeAt(i);
+    if (ch === 0x20 || ch === 0x09) continue;
+    if (ch === 0x0d) {
+      afterCr = true;
+      continue;
+    }
+    if (ch === 0x3e /* > */ && !afterCr) continue;
+    return false;
+  }
+  return true;
 }
 
 /** Offset of a `\`\`\`` / `~~~` run inside [from, to), or `to` when absent. */
@@ -698,7 +825,44 @@ export function locateThematicBreak(
 ): SourceSpan | null {
   const line = locateFirstNonBlankLine(source, from, to);
   if (line === null) return null;
-  return THEMATIC_BREAK_LINE.test(source.slice(line.start, line.end)) ? line : null;
+  // Whole line first: `- - -` is a thematic break, not a list item holding one.
+  let start = line.start;
+  while (start < line.end) {
+    if (THEMATIC_BREAK_LINE.test(source.slice(start, line.end))) return { start, end: line.end };
+    const next = skipContainerMarker(source, start, line.end);
+    if (next === -1) return null;
+    start = next;
+  }
+  return null;
+}
+
+/** Index past one container marker and the spaces CommonMark folds into it; -1 when none starts at `at`. */
+function skipContainerMarker(source: string, at: number, end: number): number {
+  let i = at;
+  while (i < end && isSpaceOrTab(source, i)) i += 1;
+  if (i >= end) return -1;
+  const ch = source.charCodeAt(i);
+  if (ch === 0x3e /* > */) {
+    i += 1;
+    return i < end && isSpaceOrTab(source, i) ? i + 1 : i;
+  }
+  let markerEnd = -1;
+  if (ch === 0x2d || ch === 0x2b || ch === 0x2a /* - + * */) {
+    markerEnd = i + 1;
+  } else if (ch >= 0x30 && ch <= 0x39) {
+    let digits = i;
+    while (digits < end && digits - i < 9 && source.charCodeAt(digits) >= 0x30 && source.charCodeAt(digits) <= 0x39) {
+      digits += 1;
+    }
+    const delimiter = source.charCodeAt(digits);
+    if (delimiter === 0x2e || delimiter === 0x29 /* . ) */) markerEnd = digits + 1;
+  }
+  if (markerEnd === -1) return -1;
+  let spaces = markerEnd;
+  while (spaces < end && isSpaceOrTab(source, spaces)) spaces += 1;
+  const count = spaces - markerEnd;
+  if (count === 0) return -1;
+  return count <= 4 ? spaces : markerEnd + 1;
 }
 
 /**

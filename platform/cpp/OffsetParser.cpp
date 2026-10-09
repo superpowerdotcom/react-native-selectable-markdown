@@ -225,8 +225,12 @@ struct SaxState {
 
   bool anchor(const MD_CHAR* text, MD_SIZE textSize, uint32_t* start) const {
     if (text == nullptr) return false;
-    if (text < source) return false;
-    const size_t offset = static_cast<size_t>(text - source);
+    /* As integers: md4c also passes its own static strings, and comparing
+     * pointers into different objects is unspecified. */
+    const uintptr_t at = reinterpret_cast<uintptr_t>(text);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(source);
+    if (at < base) return false;
+    const size_t offset = static_cast<size_t>(at - base);
     if (offset > size || textSize > size - offset) return false;
     *start = static_cast<uint32_t>(offset);
     return true;
@@ -383,6 +387,7 @@ void fillBlockDetail(NodeEvent& event, MD_BLOCKTYPE type, void* detail,
     case MD_BLOCK_CODE: {
       const auto* d = static_cast<const MD_BLOCK_CODE_DETAIL*>(detail);
       event.fenceChar = d->fence_char;
+      event.fenceClosed = d->fence_closed != 0;
       event.stringA = state.internAttribute(d->lang);
       break;
     }

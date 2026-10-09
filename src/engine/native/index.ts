@@ -20,6 +20,7 @@
  */
 
 import type { Engine } from '../Engine';
+import { assertSourceLength } from '../options';
 import { decodeFlatBuffer } from './decode';
 import { installNativeEngine } from './install';
 import type { ParseToBuffer } from './protocol';
@@ -49,6 +50,7 @@ export function createNativeEngine(
       // the crossing is pure overhead and streaming hits this case on every
       // session's first delta.
       if (source.length === 0) return { source, blocks: [] };
+      assertSourceLength(source, options);
       const buffer = parseToBuffer(source, extensionBits(options), htmlPolicyBit());
       return decodeFlatBuffer(source, buffer, options);
     },
@@ -175,6 +177,7 @@ export const nativeEngine: Engine = {
     // shown a single character of markdown, which is precisely the failure
     // the deliberate throw further down is meant to be *informative* about.
     if (source.length === 0) return { source, blocks: [] };
+    assertSourceLength(source, options);
     const engine = resolveEngine();
     if (engine) return engine.parse(source, options);
     throw new Error(

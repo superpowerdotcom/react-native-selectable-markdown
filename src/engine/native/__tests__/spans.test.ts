@@ -76,7 +76,7 @@ const EVERYTHING: EngineOptions = {
  * inside a container and a marker-only list item both reach the decoder with
  * no text to anchor to; everything else with an empty span is a bug.
  */
-const MAY_BE_EMPTY: ReadonlySet<string> = new Set(['thematicBreak', 'listItem']);
+const MAY_BE_EMPTY: ReadonlySet<string> = new Set(['listItem']);
 
 /** One line per violation: `<where> <invariant> <detail>`. */
 function check(source: string, doc: ParsedDocument, where: string, out: string[]): void {

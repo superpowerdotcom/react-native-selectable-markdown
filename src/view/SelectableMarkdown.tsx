@@ -25,7 +25,12 @@ import type { Engine } from '../engine/Engine';
 import { resolveOptions } from '../engine/options';
 import type { EngineOptions } from '../engine/options';
 import { mapSelectionToSource } from '../selection/mapSelection';
-import type { InlineTransform, ProjectedRun, RunMark } from '../selection/mapSelection';
+import type {
+  InlineTransform,
+  ProjectedRun,
+  ProjectedRunEmbed,
+  RunMark,
+} from '../selection/mapSelection';
 import { segmentRuns } from '../selection/runs';
 import type {
   ClassifyBlock,
@@ -489,14 +494,58 @@ interface ResolvedEmbedSpec extends EmbedContent {
 }
 
 const DEFAULT_ESTIMATED_HEIGHT = 44;
-const NO_EMBED_HEIGHTS: ReadonlyMap<string, number> = new Map();
 
 /** Identity of a claimed node across reprojections. */
 function embedMeasureKey(node: AnyNode): string {
   return `${node.span.start}:${node.span.end}`;
 }
 
-/** Resolves `height: 'auto'` claims to their measured height, else the estimate. */
+/**
+ * Kept out of React state and the embed lookup: the lookup's identity keys every
+ * run's projection cache, so one measurement there reprojects the whole document.
+ */
+interface EmbedHeightStore {
+  get(key: string): number | undefined;
+  set(key: string, height: number): void;
+  subscribe(listener: () => void): () => void;
+}
+
+function createEmbedHeightStore(): EmbedHeightStore {
+  const heights = new Map<string, number>();
+  const listeners = new Set<() => void>();
+  return {
+    get: (key) => heights.get(key),
+    set(key, height) {
+      if (heights.get(key) === height) return;
+      heights.set(key, height);
+      for (const listener of [...listeners]) listener();
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+}
+
+function withMeasuredHeights(
+  projected: ProjectedRun | null,
+  heights: EmbedHeightStore,
+): ProjectedRun | null {
+  if (projected === null || projected.embeds === undefined) return projected;
+  let embeds: ProjectedRunEmbed[] | null = null;
+  projected.embeds.forEach((entry, index) => {
+    const spec = entry.content as Partial<ResolvedEmbedSpec>;
+    if (!spec.measured) return;
+    const height = heights.get(embedMeasureKey(entry.node));
+    if (height === undefined || height === entry.content.height) return;
+    embeds ??= [...projected.embeds!];
+    embeds[index] = { ...entry, content: { ...entry.content, height } };
+  });
+  return embeds === null ? projected : { ...projected, embeds };
+}
+
 /** Set by `resolveEmbedSizes` when a claim asked for the container width. */
 interface ContainerClaims {
   seen: boolean;
@@ -504,12 +553,12 @@ interface ContainerClaims {
 
 /**
  * The `embed` prop with every size resolved: `'auto'` heights to their
- * measurement or estimate, `'container'` widths to `width` (`fallbackWidth`
- * until the container is measured, which `claims` records).
+ * estimate (the measurement is applied per run, see `EmbedHeightStore`),
+ * `'container'` widths to `width` (`fallbackWidth` until the container is
+ * measured, which `claims` records).
  */
 function resolveEmbedSizes(
   embed: EmbedRenderer | undefined,
-  heights: ReadonlyMap<string, number>,
   width: number | null,
   fallbackWidth: number,
   claims: ContainerClaims,
@@ -524,7 +573,7 @@ function resolveEmbedSizes(
       width: spec.width === 'container' ? (width ?? fallbackWidth) : spec.width,
       height:
         spec.height === 'auto'
-          ? heights.get(embedMeasureKey(node)) ?? spec.estimatedHeight ?? DEFAULT_ESTIMATED_HEIGHT
+          ? spec.estimatedHeight ?? DEFAULT_ESTIMATED_HEIGHT
           : spec.height,
     };
     if (spec.height === 'auto') resolved.measured = true;
@@ -670,6 +719,8 @@ interface RunViewProps {
   /** Space above the run, for `blocks.firstBlockLead` on the first one. */
   lead: number;
   onEmbedMeasure: (key: string, height: number) => void;
+  /** Stable identity: every run subscribes to it. */
+  embedHeights: EmbedHeightStore;
   softBreak: 'space' | 'newline';
   transformInline?: InlineTransform;
   copySnapping: 'none' | 'headings';
@@ -704,6 +755,7 @@ function RunView(props: RunViewProps): ReactNode {
     onSelectionChange,
     lead,
     onEmbedMeasure,
+    embedHeights,
     softBreak,
     transformInline,
     copySnapping,
@@ -785,7 +837,7 @@ function RunView(props: RunViewProps): ReactNode {
   // Block spacing reads the separators off the block log, so only a theme
   // that spaces blocks pays for recording it.
   const recordBlocks = spacingManaged(theme) || itemGap(theme) !== undefined;
-  const projected = useMemo(
+  const projectedBase = useMemo(
     () =>
       run.standalone
         ? null
@@ -797,6 +849,25 @@ function RunView(props: RunViewProps): ReactNode {
             transformInline,
           }),
     [cache, run, doc, bullet, taskChecked, taskUnchecked, embed, softBreak, recordBlocks, transformInline],
+  );
+
+  // The snapshot is one joined string so it compares by value, and only runs whose embed was measured re-render.
+  const measureKeys = useMemo(() => {
+    const keys: string[] = [];
+    projectedBase?.embeds?.forEach((entry) => {
+      if ((entry.content as Partial<ResolvedEmbedSpec>).measured) {
+        keys.push(embedMeasureKey(entry.node));
+      }
+    });
+    return keys;
+  }, [projectedBase]);
+  const measuredHeights = useSyncExternalStore(embedHeights.subscribe, () =>
+    measureKeys.map((key) => embedHeights.get(key) ?? '').join(','),
+  );
+  const projected = useMemo(
+    () => withMeasuredHeights(projectedBase, embedHeights),
+    // `measuredHeights` is the store's version for this run's keys.
+    [projectedBase, embedHeights, measuredHeights],
   );
 
   const spacing = useMemo(
@@ -1199,6 +1270,7 @@ function runPropsEqual(prev: RunViewProps, next: RunViewProps): boolean {
     prev.gap === next.gap &&
     prev.lead === next.lead &&
     prev.onEmbedMeasure === next.onEmbedMeasure &&
+    prev.embedHeights === next.embedHeights &&
     prev.softBreak === next.softBreak &&
     prev.transformInline === next.transformInline &&
     prev.copySnapping === next.copySnapping &&
@@ -1558,23 +1630,25 @@ function SelectableMarkdownWithRef(
   const resolvedImageWidth = optionWidth === 'container' ? (contentWidth ?? imageWidth) : (optionWidth ?? imageWidth);
   const optionHeight = imageOptions?.height;
   const maxImageHeight = imageOptions?.maxHeight;
-  // Measured heights of `height: 'auto'` embeds, keyed by source span.
-  const [embedHeights, setEmbedHeights] = useState<ReadonlyMap<string, number>>(NO_EMBED_HEIGHTS);
-  const onEmbedMeasure = useCallback((key: string, height: number) => {
-    const rounded = Math.ceil(height);
-    if (!(rounded > 0)) return;
-    setEmbedHeights((previous) =>
-      previous.get(key) === rounded ? previous : new Map(previous).set(key, rounded),
-    );
-  }, []);
+  const embedHeightsRef = useRef<EmbedHeightStore | null>(null);
+  embedHeightsRef.current ??= createEmbedHeightStore();
+  const embedHeights = embedHeightsRef.current;
+  const onEmbedMeasure = useCallback(
+    (key: string, height: number) => {
+      const rounded = Math.ceil(height);
+      if (!(rounded > 0)) return;
+      embedHeights.set(key, rounded);
+    },
+    [embedHeights],
+  );
   // The width joins the lookup only once a claim has asked for it, so a
   // layout pass does not reproject a document whose embeds are all sized.
   const containerClaims = useRef<ContainerClaims>({ seen: false }).current;
   const embedWidth = containerClaims.seen ? contentWidth : null;
   const claimingEmbed = useMemo(() => (codeCards ? withCodeBlockCards(embed) : embed), [codeCards, embed]);
   const sizedEmbed = useMemo(
-    () => resolveEmbedSizes(claimingEmbed, embedHeights, embedWidth, imageWidth, containerClaims),
-    [claimingEmbed, embedHeights, embedWidth, imageWidth, containerClaims],
+    () => resolveEmbedSizes(claimingEmbed, embedWidth, imageWidth, containerClaims),
+    [claimingEmbed, embedWidth, imageWidth, containerClaims],
   );
 
   const embedLookup = useMemo((): EmbedLookup | undefined => {
@@ -1697,6 +1771,7 @@ function SelectableMarkdownWithRef(
             doc={visibleDoc}
             codeCard={codeCard}
             embed={embedLookup}
+            embedHeights={embedHeights}
             onEmbedMeasure={onEmbedMeasure}
             exclusiveSelection={exclusiveSelection}
             gap={gap}
@@ -1765,6 +1840,8 @@ function sameShallow(a: object | undefined, b: object | undefined): boolean {
 /** Width / height per image URL, shared across documents; bounded, oldest out. */
 const imageRatios = new Map<string, number>();
 const pendingRatios = new Set<string>();
+/** So a broken image is not refetched on every streaming snapshot. */
+const failedRatios = new Set<string>();
 /**
  * Everyone waiting on a URL. The request is shared, so its answer goes to every
  * current subscriber, not only the effect that started it: a second view of the
@@ -1781,8 +1858,16 @@ function settleRatio(src: string): void {
   for (const listener of [...listeners]) listener();
 }
 
+function rememberRatioFailure(src: string): void {
+  if (failedRatios.size >= MAX_IMAGE_RATIOS) {
+    const oldest = failedRatios.values().next().value;
+    if (oldest !== undefined) failedRatios.delete(oldest);
+  }
+  failedRatios.add(src);
+}
+
 function requestRatio(src: string): void {
-  if (pendingRatios.has(src) || imageRatios.has(src)) return;
+  if (pendingRatios.has(src) || imageRatios.has(src) || failedRatios.has(src)) return;
   pendingRatios.add(src);
   Image.getSize(
     src,
@@ -1793,12 +1878,19 @@ function requestRatio(src: string): void {
           if (oldest !== undefined) imageRatios.delete(oldest);
         }
         imageRatios.set(src, width / height);
+      } else {
+        rememberRatioFailure(src);
       }
       settleRatio(src);
     },
-    () => settleRatio(src),
+    () => {
+      rememberRatioFailure(src);
+      settleRatio(src);
+    },
   );
 }
+
+const NO_SOURCES: readonly string[] = Object.freeze([]);
 
 /**
  * Fetches the aspect ratio of every sole-paragraph image in `doc` it has not
@@ -1806,16 +1898,23 @@ function requestRatio(src: string): void {
  */
 function useImageRatios(doc: ParsedDocument | null): number {
   const [version, setVersion] = useState(0);
-  const sources = useMemo(() => {
-    if (doc === null) return [];
-    const out: string[] = [];
+  // Keyed on the URLs, not the document, which is new on every streamed token.
+  // '\n' separates them; a substituted engine may skip the URL policy that strips
+  // it, so a src containing one goes unmeasured rather than splitting in two.
+  let sourceKey = '';
+  if (doc !== null) {
     for (const block of doc.blocks) {
       if (block.kind !== 'paragraph' || block.children.length !== 1) continue;
       const only = block.children[0];
-      if (only.kind === 'image' && !imageRatios.has(only.src)) out.push(only.src);
+      if (only.kind !== 'image' || only.src.includes('\n')) continue;
+      if (imageRatios.has(only.src) || failedRatios.has(only.src)) continue;
+      sourceKey = sourceKey === '' ? only.src : `${sourceKey}\n${only.src}`;
     }
-    return out;
-  }, [doc]);
+  }
+  const sources = useMemo(
+    () => (sourceKey === '' ? NO_SOURCES : sourceKey.split('\n')),
+    [sourceKey],
+  );
   useLayoutEffect(() => {
     if (sources.length === 0) return undefined;
     const bump = (): void => setVersion((value) => value + 1);

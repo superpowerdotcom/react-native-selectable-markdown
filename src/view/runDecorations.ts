@@ -163,19 +163,15 @@ export function resolveRunDecorations(
   // everything inside the quote, and overlapping layout spans are exactly
   // what the two platforms disagree about (see insetSegments).
   const quoteStep = theme.quote.barWidth + theme.quote.indent;
-  const quotes: { start: number; end: number }[] = [];
+  const quotes: Range[] = [];
   for (const mark of projected.marks) {
     if (mark.kind === 'blockquote') {
       quotes.push({ start: mark.start, end: mark.end });
     }
   }
-  const quoteInset = (start: number, end: number): number => {
-    let depth = 0;
-    for (const quote of quotes) {
-      if (quote.start <= start && quote.end >= end) depth += 1;
-    }
-    return depth * quoteStep;
-  };
+  const quoteCounter = createQuoteCounter(projected.marks, quotes);
+  const quoteInset = (start: number, end: number): number =>
+    quoteCounter.containing(start, end) * quoteStep;
   /**
    * The inset of a quote's OWN chrome (its bar and fill): one step per
    * ENCLOSING quote, so a nested quote's bar draws beside its parent's
@@ -187,16 +183,8 @@ export function resolveRunDecorations(
    * emitted outermost-first, so for a quote "encloses me" is "contains my
    * range AND appears earlier".
    */
-  const enclosingQuoteInset = (ordinal: number): number => {
-    const self = quotes[ordinal];
-    let depth = 0;
-    for (let i = 0; i < ordinal; i += 1) {
-      if (quotes[i].start <= self.start && quotes[i].end >= self.end) {
-        depth += 1;
-      }
-    }
-    return depth * quoteStep;
-  };
+  const enclosingQuoteInset = (ordinal: number): number =>
+    quoteCounter.enclosingEarlier(ordinal) * quoteStep;
   let quoteOrdinal = 0;
 
   for (const mark of projected.marks) {
@@ -497,60 +485,72 @@ interface InsetSegment {
  * the item's segment produces.
  */
 function insetSegments(projected: ProjectedRun): InsetSegment[] {
-  const items: { start: number; end: number; level: number }[] = [];
-  const islands: { start: number; end: number }[] = [];
-  const quotes: { start: number; end: number }[] = [];
+  // A sweep over range edges, not a containment scan per segment, which is quadratic on a long flat list.
+  const ITEM = 0;
+  const ISLAND = 1;
+  const QUOTE = 2;
+  const events: { at: number; kind: 0 | 1 | 2; delta: 1 | -1; level: number }[] = [];
+  let hasItems = false;
+  let hasQuotes = false;
   for (const mark of projected.marks) {
+    let kind: 0 | 1 | 2;
+    let level = 0;
     if (mark.kind === 'listItem') {
-      items.push({ start: mark.start, end: mark.end, level: mark.level ?? 1 });
+      kind = ITEM;
+      level = mark.level ?? 1;
+      hasItems = true;
     } else if (mark.kind === 'codeBlock' || mark.kind === 'table') {
-      islands.push({ start: mark.start, end: mark.end });
+      kind = ISLAND;
     } else if (mark.kind === 'blockquote') {
-      quotes.push({ start: mark.start, end: mark.end });
+      kind = QUOTE;
+      hasQuotes = true;
+    } else {
+      continue;
     }
+    events.push({ at: mark.start, kind, delta: 1, level });
+    events.push({ at: mark.end, kind, delta: -1, level });
   }
-  if (items.length === 0 && quotes.length === 0) {
+  if (!hasItems && !hasQuotes) {
     return [];
   }
+  events.sort((a, b) => a.at - b.at);
 
-  const boundaries = new Set<number>();
-  for (const range of items) {
-    boundaries.add(range.start);
-    boundaries.add(range.end);
-  }
-  for (const range of islands) {
-    boundaries.add(range.start);
-    boundaries.add(range.end);
-  }
-  for (const range of quotes) {
-    boundaries.add(range.start);
-    boundaries.add(range.end);
-  }
-  const sorted = [...boundaries].sort((a, b) => a - b);
-
+  // Every edge is a boundary, so each range covers a segment fully or not at all.
+  let islandsOpen = 0;
+  let quoteDepth = 0;
+  const itemsOpen = new Map<number, number>();
+  let level = 0;
   const out: InsetSegment[] = [];
-  for (let i = 0; i + 1 < sorted.length; i += 1) {
-    let start = sorted[i];
-    const end = sorted[i + 1];
+  for (let i = 0; i < events.length; ) {
+    const at = events[i].at;
+    for (; i < events.length && events[i].at === at; i += 1) {
+      const event = events[i];
+      if (event.kind === ISLAND) {
+        islandsOpen += event.delta;
+      } else if (event.kind === QUOTE) {
+        quoteDepth += event.delta;
+      } else {
+        const open = (itemsOpen.get(event.level) ?? 0) + event.delta;
+        if (open > 0) {
+          itemsOpen.set(event.level, open);
+          level = Math.max(level, event.level);
+        } else {
+          itemsOpen.delete(event.level);
+          if (event.level === level) {
+            level = 0;
+            for (const key of itemsOpen.keys()) level = Math.max(level, key);
+          }
+        }
+      }
+    }
+    if (i >= events.length) break;
+    let start = at;
+    const end = events[i].at;
     while (start < end && projected.text.charCodeAt(start) === 10 /* '\n' */) {
       start += 1;
     }
     if (start >= end) continue;
-    // Boundaries include every island edge, so island coverage is uniform
-    // within a segment: fully covered or not at all.
-    if (islands.some((r) => r.start <= start && r.end >= end)) continue;
-    let level = 0;
-    for (const item of items) {
-      if (item.start <= start && item.end >= end) {
-        level = Math.max(level, item.level);
-      }
-    }
-    let quoteDepth = 0;
-    for (const quote of quotes) {
-      if (quote.start <= start && quote.end >= end) {
-        quoteDepth += 1;
-      }
-    }
+    if (islandsOpen > 0) continue;
     if (level === 0 && quoteDepth === 0) continue;
     const previous = out[out.length - 1];
     if (
@@ -565,4 +565,98 @@ function insetSegments(projected: ProjectedRun): InsetSegment[] {
     }
   }
   return out;
+}
+
+interface Range {
+  start: number;
+  end: number;
+}
+
+/**
+ * Queries must arrive in nondecreasing `start` / `ordinal` order; marks that are
+ * not start-sorted (`projectRun` sorts them) fall back to a plain scan.
+ */
+function createQuoteCounter(
+  marks: readonly { start: number }[],
+  quotes: readonly Range[],
+): {
+  containing(start: number, end: number): number;
+  enclosingEarlier(ordinal: number): number;
+} {
+  let sorted = true;
+  for (let i = 1; i < marks.length && sorted; i += 1) {
+    if (marks[i - 1].start > marks[i].start) sorted = false;
+  }
+  if (!sorted || quotes.length === 0) {
+    return {
+      containing(start, end) {
+        let depth = 0;
+        for (const quote of quotes) {
+          if (quote.start <= start && quote.end >= end) depth += 1;
+        }
+        return depth;
+      },
+      enclosingEarlier(ordinal) {
+        const self = quotes[ordinal];
+        let depth = 0;
+        for (let i = 0; i < ordinal; i += 1) {
+          if (quotes[i].start <= self.start && quotes[i].end >= self.end) depth += 1;
+        }
+        return depth;
+      },
+    };
+  }
+  const ends = [...new Set(quotes.map((quote) => quote.end))].sort((a, b) => a - b);
+  const rankOf = new Map<number, number>();
+  ends.forEach((end, index) => rankOf.set(end, index));
+  const firstRankAtLeast = (end: number): number => {
+    let low = 0;
+    let high = ends.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (ends[mid] < end) low = mid + 1;
+      else high = mid;
+    }
+    return low;
+  };
+  const byStart = createEndCounter(ends.length);
+  const byOrdinal = createEndCounter(ends.length);
+  let startInserted = 0;
+  let ordinalInserted = 0;
+  return {
+    containing(start, end) {
+      while (startInserted < quotes.length && quotes[startInserted].start <= start) {
+        byStart.add(rankOf.get(quotes[startInserted].end)!);
+        startInserted += 1;
+      }
+      return byStart.countFrom(firstRankAtLeast(end));
+    },
+    enclosingEarlier(ordinal) {
+      while (ordinalInserted < ordinal) {
+        byOrdinal.add(rankOf.get(quotes[ordinalInserted].end)!);
+        ordinalInserted += 1;
+      }
+      return byOrdinal.countFrom(firstRankAtLeast(quotes[ordinal].end));
+    },
+  };
+}
+
+/** A Fenwick tree over `size` ranks. */
+function createEndCounter(size: number): {
+  add(rank: number): void;
+  countFrom(rank: number): number;
+} {
+  const tree = new Int32Array(size + 1);
+  let total = 0;
+  return {
+    add(rank) {
+      total += 1;
+      for (let i = rank + 1; i <= size; i += i & -i) tree[i] += 1;
+    },
+    countFrom(rank) {
+      let below = 0;
+      for (let i = rank; i > 0; i -= i & -i) below += tree[i];
+      return total - below;
+    },
+  };
 }

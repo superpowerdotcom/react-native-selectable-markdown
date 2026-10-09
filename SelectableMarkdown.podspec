@@ -20,7 +20,8 @@ Pod::Spec.new do |s|
   s.homepage     = package["repository"]["url"].sub(/\.git\z/, "")
   s.license      = package["license"]
   s.authors      = { "Superpower" => "https://superpower.com" }
-  s.platforms    = { :ios => "13.4" }
+  # The React Native peer floor (0.82) requires iOS 15.1: min_ios_version_supported.
+  s.platforms    = { :ios => "15.1" }
   s.source       = { :git => package["repository"]["url"], :tag => "v#{s.version}" }
 
   # platform/cpp/*.cpp is the parser core plus the JSI binding; the vendored

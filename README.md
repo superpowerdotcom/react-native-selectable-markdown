@@ -66,13 +66,15 @@ export function Message({ markdown }: { markdown: string }) {
       onSelectionCopy={({ action, plain, markdown, span }) => {
         // action: which item was tapped. plain: the selected display text.
         // markdown: exact source slice. span: UTF-16 range into the source.
+        // The items only report. Write the clipboard here, e.g.
+        // Clipboard.setString(action === 'copy-markdown' ? markdown : plain).
       }}
     />
   );
 }
 ```
 
-`selectionActions` needs `onSelectionCopy`: with no handler the custom menu is empty rather than one item short, because an item that reports nowhere is not offered (DEV warns). The reverse is not true — a handler on its own is the common case and gets both default items. An entry may also be `{ id, title }`, which is the one way to localise both platforms from JS; any id beyond the two built-ins is your own action and must carry a title, and it arrives at `onSelectionCopy` with the same `plain`, `markdown` and `span`. A `session` supersedes `source`, which is then never parsed (DEV warns).
+`selectionActions` needs `onSelectionCopy`: with no handler the custom menu is empty rather than one item short, because an item that reports nowhere is not offered (DEV warns). Neither built-in item writes the clipboard itself: the handler does, with whichever clipboard module the app already uses. The reverse is not true — a handler on its own is the common case and gets both default items. An entry may also be `{ id, title }`, which is the one way to localise both platforms from JS; any id beyond the two built-ins is your own action and must carry a title, and it arrives at `onSelectionCopy` with the same `plain`, `markdown` and `span`. A `session` supersedes `source`, which is then never parsed (DEV warns).
 
 For a toolbar of your own, `onSelectionChange` reports `{ span, plain }` as the user drags and `null` when the selection goes away — the half `onSelectionCopy` cannot give you, since it fires only after a menu item is tapped. A `ref` typed `SelectableMarkdownHandle` adds `getSelection()`, `clearSelection()` and `setSelection(span)`. `setSelection` returns `false` for two kinds of refusal: no run shows the span (past the end of the document, a standalone block, a span of pure markup like a fence or a `# `, a run not mounted yet), or the run that shows it cannot take a selection right now (Android's unsettled streaming tail, a run rendered `selectable={false}`, a binary built against a native spec older than the selection commands). It can select wider than asked when the span lands inside an entity, an image's alt text or an embed placeholder, and it presents no menu and issues no scroll — there is no scroll-to-span, though it does take focus, which a scrolling ancestor is entitled to react to. Full contract in [docs/SELECTION.md](docs/SELECTION.md).
 
@@ -130,7 +132,7 @@ function AssistantMessage(props: { events: TextMessageEvents; messageId: string 
 
 The session finalizes on message end and on run finished or failed, since an aborted stream never sends END; a `messageId` switch settles the outgoing session as `'aborted'` rather than stranding it mid-stream, and it stays in the hook's map, so switching back shows the settled document. The third argument is either bare parse options, as above, or a full session init — `{ engine, options, coalesce, smoother, holdBackChars, holdIdleMs, repair, bufferScheduler, idleScheduler, now }`, where `smoother` is a factory because there is one session per messageId. Each delta commits on its own unless the init carries a buffering field (`smoother`, `holdBackChars`, `holdIdleMs`, either scheduler) or an explicit `coalesce: true`; `repair` and `now` deliberately do not switch coalescing on. Every field is latched when a messageId's session is created, so changing the init later reaches the next new message, not the one already streaming. What the per-message adapter does not do is hold at run end: neither `useAgUiSession` nor `bindMessageEvents` calls `notifyRunFinalized`, so run end finalizes straight through a metered tail — a smoothed reveal commits the rest in one revision instead of playing it out.
 
-For a transport that owns a whole run, `bindRunTextEvents(events, store, policy?)` and its hook `useAgUiRunSessions(events, init?)` (the same session fields, plus `policy`) manage per-message sessions: they seed pre-existing messages without re-typing, route new ones through `appendBuffered`, and report `holding: true` until every smoother has drained at run end. Policy fields are documented on `RunBindingPolicy`. The three run-lifecycle callbacks take an optional trailing `runId`; pass it when the transport has one, and `bindRunTextEvents` ignores a late run finished or failed from a run it already watched go spent. An id stops being spent the moment that run starts again — announce a retry that reuses it with `onRunStarted` and it keeps its right to finalize — and `onAttached` catch-up clears the spent-run memory outright, since nothing learned before a gap the binding cannot see into is trustworthy. `bindMessageEvents` observes no run start and filters nothing.
+For a transport that owns a whole run, `bindRunTextEvents(events, store, policy?)` and its hook `useAgUiRunSessions(events, init?)` (the same session fields except `coalesce`, which its buffering fields imply, plus `policy`) manage per-message sessions: they seed pre-existing messages without re-typing, route new ones through `appendBuffered`, and report `holding: true` until every smoother has drained at run end. Policy fields are documented on `RunBindingPolicy`. The three run-lifecycle callbacks take an optional trailing `runId`; pass it when the transport has one, and `bindRunTextEvents` ignores a late run finished or failed from a run it already watched go spent. An id stops being spent the moment that run starts again — announce a retry that reuses it with `onRunStarted` and it keeps its right to finalize — and `onAttached` catch-up clears the spent-run memory outright, since nothing learned before a gap the binding cannot see into is trustworthy. `bindMessageEvents` observes no run start and filters nothing.
 
 ### Headless
 
@@ -157,7 +159,7 @@ const theme: PartialTheme = {
 <SelectableMarkdown source={md} theme={theme} colorScheme="auto" />
 ```
 
-Overrides merge one level deep over a base theme. The groups are `colors`, `fonts`, `spacing`, `code`, `quote`, `table`, `headings`, `rule`, `glyphs`, `blocks`, `list` and `link`. `colorScheme` is `'light'`, `'dark'` or `'auto'` (the default; follows the system). `mergeTheme(overrides, base)` computes a theme ahead of render. `glyphs` (bullet and task markers) are part of the projected text, so changing them shifts selection offsets; the library handles that. The font keys are `body`, `mono`, `baseSize`, `lineHeight`, `strongWeight` and the optional `strongFamily`; an unknown token is ignored, with a DEV warning. Four tokens also cross groups, each only when the token it feeds is not itself overridden: `code.borderRadius` feeds `table.borderRadius` (squaring your code blocks squares your tables), and the deprecated `spacing.quoteIndent`, `spacing.tableCellPadding` and `colors.quoteBar` feed `quote.indent`, `table.cellPaddingH`/`cellPaddingV` and `quote.barColor`.
+Overrides merge one level deep over a base theme. The groups are `colors`, `fonts`, `spacing`, `code`, `quote`, `table`, `headings`, `rule`, `glyphs`, `blocks`, `list`, `link` and `html`. `colorScheme` is `'light'`, `'dark'` or `'auto'` (the default; follows the system). `mergeTheme(overrides, base)` computes a theme ahead of render. `glyphs` (bullet and task markers) are part of the projected text, so changing them shifts selection offsets; the library handles that. The font keys are `body`, `mono`, `baseSize`, `lineHeight`, `strongWeight` and the optional `strongFamily`; an unknown token is ignored, with a DEV warning. Four tokens also cross groups, each only when the token it feeds is not itself overridden: `code.borderRadius` feeds `table.borderRadius` (squaring your code blocks squares your tables), and the deprecated `spacing.quoteIndent`, `spacing.tableCellPadding` and `colors.quoteBar` feed `quote.indent`, `table.cellPaddingH`/`cellPaddingV` and `quote.barColor`.
 
 To style one mark rather than a construct (a heading ramp, a bold face instead of a weight bump), pass `attributeForMark`. Give it a stable identity; it takes part in the per-run memo.
 
@@ -255,9 +257,10 @@ No options (or `presets.commonmark`) turns every extension off — not a spec-co
 | `math` | off | off | `$5 and $10` must never become math. |
 | `spoilers` | off | off | On only in `everything`. Parses only a balanced `\|\|x\|\|` inside one paragraph or heading; a stray `\|` stays text. |
 | `underline` | off | off | `_` stops meaning emphasis. On only in `everything`. |
-| `smartPunctuation` | off | off | Smart quotes and dashes in prose only; code and URLs stay byte-exact. On in `everything`. |
-| `html` | `'strip'` | `'strip'` | `'strip'` drops an HTML block with the lines it covers — a `<div>`, a `<details>` or a raw `<table>` contributes nothing to the document — and drops inline tags while keeping the text between them. `<br>` is the exception: it becomes a hard break spanning the tag. `'raw'` keeps both as `htmlBlock` / `htmlSpan` nodes. |
-| Link prefixes | `https://`, `http://`, `mailto:` | same | A case-insensitive prefix test, not scheme parsing: `https:example.com` matches nothing and renders as plain text, not a dead link. Your list replaces this one; spread `DEFAULT_LINK_PREFIXES` to keep it. A prefix reaching into a path (`myapp://checkout/`) is a scope: a destination whose path climbs back out of it with `..` (raw or percent-encoded once) is refused, one that descends and returns (`a/../b`) is not, and a `..` inside a query string or fragment is left alone. |
+| `smartPunctuation` | off | off | Smart quotes and dashes in prose only; code and URLs stay byte-exact. Quotes pair the way `cmark --smart` pairs them, so an unpaired `"` renders as the closing form. On in `everything`. |
+| `maxSourceLength` | 1,048,576 | same | The longest source `parseDocument` accepts, in UTF-16 units; longer input throws a `RangeError` before anything is parsed, from a session's `append` too. `Infinity` opts out. The native parse keeps one event per construct in memory, and node-dense text (`*a*a*a…`) amplifies its size by two orders of magnitude. |
+| `html` | `'strip'` | `'strip'` | `'strip'` drops an HTML block with the lines it covers — a `<div>`, a `<details>` or a raw `<table>` contributes nothing to the document — and drops inline tags while keeping the text between them. `<br>` is the exception: it becomes a hard break spanning the tag. A block opening with `<!--`, `<script>`, `<pre>`, `<style>`, `<textarea>`, `<?` or `<!` runs to its own end marker rather than to a blank line, as CommonMark says, so a model that opens a comment on its own line and never closes it erases the rest of its message. `'raw'` keeps both as `htmlBlock` / `htmlSpan` nodes. `{ allow: ['a', 'br', 'strong', 'em', 'code', …], other? }` turns the listed tags into real nodes (an `<a href>` goes through the URL policy) and treats every other tag as `other`, `'strip'` by default. |
+| Link prefixes | `https://`, `http://`, `mailto:` | same | A case-insensitive prefix test, not scheme parsing: `https:example.com` matches nothing and renders as plain text, not a dead link. Your list replaces this one; spread `DEFAULT_LINK_PREFIXES` to keep it. A prefix reaching into a path (`myapp://checkout/`) is a scope: a destination whose path climbs back out of it with `..` (raw or percent-encoded once) is refused, one that descends and returns (`a/../b`) is not, and a `..` inside a query string or fragment is left alone, so a router that reads its own path out of the fragment or query must check that part itself. |
 | Image prefixes | `https://` | same | Blocked images render their alt text. |
 | `urlPolicy.blockedLinks` | `'text'` | `'text'` | `'node'` keeps a blocked link as a `blocked: true` node for your `onLinkPress`, `embed` or `classifyBlock` handler — the `link` renderer runs only for standalone blocks. Never navigable. |
 
@@ -317,7 +320,7 @@ A block-level embed may be any height; an inline one shares a line with prose, s
 
 `classifyBlock` marks a block `'standalone'` so it gets its own selection scope and renderer. Use it for blocks that own a competing gesture and should end the sweep rather than flow through it. A block holding a spoiler, or an image no claim covered, is standalone already. Give it a stable identity; the document is resegmented when it changes.
 
-Standalone lists and blockquotes use separate text blocks. Selection cannot span their items or paragraphs, and list markers are outside selectable text, so they are not copied. This also applies when the native run host is unavailable.
+A standalone list is one `<Text>` with its markers inside it, so a selection runs across items and copies the markers, and a standalone blockquote is one `<Text>` over its paragraphs. Nested text cannot hang-indent, so a wrapped list line returns to the list's leading edge.
 
 ```tsx
 import type { ClassifyBlock } from 'react-native-selectable-markdown';
@@ -354,14 +357,14 @@ selection offsets ──► mapSelectionToSource ──► exact source span ─
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/PERFORMANCE.md](docs/PERFORMANCE.md): measurements, cost model, roadmap.
 - [docs/FABRIC-PLAN.md](docs/FABRIC-PLAN.md): design retrospective of the new-architecture port.
 
-## Status (Unreleased)
+## Status
 
 | Area | Where it stands |
 | --- | --- |
 | Parser | md4c, 651/652 on CommonMark 0.31.2 (the one failure is example 174, an unclosed HTML block inside a blockquote). The only parser; throws where not linked. |
 | Streaming | Incremental tail-only parsing, checked by a prefix oracle. Coalescing, holdback, smoothers. A 251-case tail-repair corpus. |
 | Selection and copy | Exact source ranges, property-tested. Code blocks, tables and rules flow through runs; a block holding a spoiler, or an image no claim covered, is standalone — the whole block, not just the construct. Selections never span hosts: a document's runs clear another's unless `exclusiveSelection={false}` opts them out in both directions — which keeps every range reported and exact for copy, but only the run holding focus draws a highlight. |
-| Copy menu | Copy Text and Copy Markdown, retitleable from JS and extensible with your own ids. With no title from JS the labels come from platform resources (`NSLocalizedString`, `res/values/strings.xml`), which the host app can override. Custom items need iOS 16+; iOS 13.4 to 15 gets the system menu only. |
+| Copy menu | Copy Text and Copy Markdown, retitleable from JS and extensible with your own ids. With no title from JS the labels come from platform resources (`NSLocalizedString`, `res/values/strings.xml`), which the host app can override. Custom items need iOS 16+; iOS 15.1, React Native 0.82's floor, gets the system menu only. Both items report through `onSelectionCopy`; the app writes the clipboard. |
 | Imperative selection | `onSelectionChange`, and a ref with `getSelection()`, `clearSelection()` and `setSelection(span)`. Codegen commands on both hosts; reviewed rather than exercised on device, like the host itself. No scroll-to-span. |
 | Selection host | Fabric only (`react-native >= 0.82`). CI compiles C++ and runs codegen against React Native 0.82.1, the supported minimum release line, and checks Swift against the iOS SDK. There is no example app yet, so on-device behaviour is reviewed rather than exercised. |
 | Accessibility | Links, headings, list items and table cells survive run merging: each is a VoiceOver/TalkBack focus stop, a link activates through the same press path a tap takes, a heading carries the platform heading trait, and on Android an item or cell carries its position (`CollectionItemInfoCompat`), which iOS has no trait for. Code-block and blockquote structure is still flattened by merging — neither platform has a primitive for it. `accessible` or `accessibilityRole` on the container collapses the document to one element, so label it but do not make it a leaf. Standalone blocks keep the roles `renderers.tsx` sets. Reviewed, not exercised: no screen reader has run against it here. |
@@ -398,6 +401,8 @@ npm run conformance      # CommonMark score, written to conformance/report-nativ
 npm run bench:all
 npm run verify:pack      # the packed tarball loads
 npm run check:codegen && npm run check:fabric-cpp && npm run check:swift
+npm run check:app:android  # builds a fresh RN app with the packed tarball (JDK 17 + Android SDK)
+npm run check:app:ios      # the same through CocoaPods and xcodebuild (macOS)
 ```
 
 Without a compiler the native suites report as skipped, not passed. CI, the release workflow and `npm run release` all build the addon as a hard gate before the suite runs; `npm run release -- --skip-tests` opts out of the build and the suite together, and says so. See [native/node/README.md](native/node/README.md).
@@ -407,7 +412,7 @@ Without a compiler the native suites report as skipped, not passed. CI, the rele
 Publishing is tag-triggered. The tarball `npm run release` writes locally is a dry run, never the published artifact.
 
 1. Move the Unreleased entries into the target version's section in [CHANGELOG.md](CHANGELOG.md), `## [X.Y.Z] — <date>`.
-2. Run `npm run release <patch|minor|major|x.y.z>`. It checks types and tests, bumps the manifest and lockfile, verifies the proposed tag against the changelog, verifies the package, and packs a local dry run. Unreleased BREAKING entries fail both this guard and CI; a failure rolls the version bump back. Nothing is committed, tagged or published.
+2. Run `npm run release <patch|minor|major|x.y.z>`. It checks types and tests, bumps the manifest and lockfile, verifies the proposed tag against the changelog, verifies the package, and packs a local dry run. Unreleased BREAKING entries fail both this guard and CI, and so does a BREAKING entry under a version that is not a minor bump (a major, past 1.0); a failure rolls the version bump back. Nothing is committed, tagged or published.
 3. `git add package.json package-lock.json CHANGELOG.md && git commit -m "release X.Y.Z"`.
 4. `git push origin main && git tag vX.Y.Z && git push origin vX.Y.Z`.
 

@@ -1,6 +1,6 @@
 {
   "name": "react-native-selectable-markdown",
-  "version": "0.13.1",
+  "version": "0.14.0",
   "description": "Streaming-first CommonMark + GFM markdown renderer for React Native with document-grade text selection: every rendered character maps back to an exact UTF-16 range of the source.",
   "license": "MIT",
   "private": false,
@@ -158,6 +158,22 @@
       },
       "default": "./dist/view/renderers.js"
     },
+    "./dist/view/codeBlocks": {
+      "types": {
+        "import": "./dist/esm/view/codeBlocks.d.ts",
+        "default": "./dist/view/codeBlocks.d.ts"
+      },
+      "react-native": "./src/view/codeBlocks.tsx",
+      "require": {
+        "types": "./dist/view/codeBlocks.d.ts",
+        "default": "./dist/view/codeBlocks.js"
+      },
+      "import": {
+        "types": "./dist/esm/view/codeBlocks.d.ts",
+        "default": "./dist/esm/view/codeBlocks.js"
+      },
+      "default": "./dist/view/codeBlocks.js"
+    },
     "./dist/view/RunHost.js": {
       "types": {
         "import": "./dist/esm/view/RunHost.d.ts",
@@ -206,6 +222,22 @@
       },
       "default": "./dist/view/renderers.js"
     },
+    "./dist/view/codeBlocks.js": {
+      "types": {
+        "import": "./dist/esm/view/codeBlocks.d.ts",
+        "default": "./dist/view/codeBlocks.d.ts"
+      },
+      "react-native": "./src/view/codeBlocks.tsx",
+      "require": {
+        "types": "./dist/view/codeBlocks.d.ts",
+        "default": "./dist/view/codeBlocks.js"
+      },
+      "import": {
+        "types": "./dist/esm/view/codeBlocks.d.ts",
+        "default": "./dist/esm/view/codeBlocks.js"
+      },
+      "default": "./dist/view/codeBlocks.js"
+    },
     "./dist/esm/*": {
       "types": "./dist/esm/*.d.ts",
       "react-native": "./src/*.ts",
@@ -225,6 +257,11 @@
       "types": "./dist/esm/view/renderers.d.ts",
       "react-native": "./src/view/renderers.tsx",
       "default": "./dist/esm/view/renderers.js"
+    },
+    "./dist/esm/view/codeBlocks": {
+      "types": "./dist/esm/view/codeBlocks.d.ts",
+      "react-native": "./src/view/codeBlocks.tsx",
+      "default": "./dist/esm/view/codeBlocks.js"
     },
     "./dist/esm/*.js": {
       "types": "./dist/esm/*.d.ts",
@@ -246,11 +283,17 @@
       "react-native": "./src/view/renderers.tsx",
       "default": "./dist/esm/view/renderers.js"
     },
+    "./dist/esm/view/codeBlocks.js": {
+      "types": "./dist/esm/view/codeBlocks.d.ts",
+      "react-native": "./src/view/codeBlocks.tsx",
+      "default": "./dist/esm/view/codeBlocks.js"
+    },
     "./src/*.ts": "./src/*.ts",
     "./src/*.tsx": "./src/*.tsx",
     "./src/view/RunHost": "./src/view/RunHost.tsx",
     "./src/view/SelectableMarkdown": "./src/view/SelectableMarkdown.tsx",
-    "./src/view/renderers": "./src/view/renderers.tsx"
+    "./src/view/renderers": "./src/view/renderers.tsx",
+    "./src/view/codeBlocks": "./src/view/codeBlocks.tsx"
   },
   "files": [
     "dist",
@@ -306,6 +349,8 @@
     "check:fabric-cpp:selftest": "node scripts/check-fabric-cpp.mjs --selftest",
     "check:swift": "node scripts/check-swift.mjs",
     "check:swift:selftest": "node scripts/check-swift.mjs --selftest",
+    "check:app:android": "scripts/build-test-app.sh android",
+    "check:app:ios": "scripts/build-test-app.sh ios",
     "conformance": "node conformance/run-commonmark.mjs",
     "bench:throughput": "node bench/throughput.mjs",
     "bench:pathological": "node bench/pathological.mjs",

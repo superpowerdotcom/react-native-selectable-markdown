@@ -63,6 +63,8 @@ export const DETAIL_TASK_SHIFT = 2;
 export const DETAIL_TASK_MASK = 0x3 << DETAIL_TASK_SHIFT;
 export const DETAIL_ALIGN_SHIFT = 4;
 export const DETAIL_ALIGN_MASK = 0x3 << DETAIL_ALIGN_SHIFT;
+/** CodeBlock: a closing fence ended it; clear when its container or the document did. */
+export const DETAIL_FENCE_CLOSED = 1 << 6;
 
 export const enum EventKind {
   BlockEnter = 0,

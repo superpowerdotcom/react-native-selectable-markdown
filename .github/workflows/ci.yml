@@ -54,7 +54,7 @@ jobs:
         # succeeds anyway — and if they are genuinely missing, that build is
         # the step that should go red, with a message about headers.
         continue-on-error: true
-        run: npx --yes node-gyp install
+        run: npx --yes node-gyp@13.1.0 install
       - name: Build the native parser (test addon)
         # No --if-available: see above. A compile error, a link error, an
         # undefined-symbol violation and an unequipped machine all fail this

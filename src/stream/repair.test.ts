@@ -1533,7 +1533,7 @@ describe('repairTail hide options', () => {
     // The label grows char by char through all three states; no snapshot
     // may paint any of it.
     const states = [
-      'see [fhir:',
+      'see [fhir:/',
       'see [fhir://Obs',
       'see [fhir://Obs]',
       'see [fhir://Obs](',
@@ -1542,6 +1542,9 @@ describe('repairTail hide options', () => {
     for (const tail of states) {
       expect(repairTail(tail, SEED, base, hideLabels).text).toBe('see ');
     }
+    // A bare `scheme:` is prose until its `/` arrives, so `[Note:` never flashes away.
+    expect(repairTail('see [fhir:', SEED, base, hideLabels).text).toBe('see fhir:');
+    expect(repairTail('see [Note:', SEED, base, hideLabels).text).toBe('see Note:');
   });
 
   test('a prose label holding a colon keeps the default treatment', () => {
@@ -1569,13 +1572,13 @@ describe('repairTail hide options', () => {
 
 describe('isUriLikeLabel', () => {
   test('matches scheme-prefixed whitespace-free labels, trimmed', () => {
-    for (const label of ['fhir:', 'fhir:/', 'fhir://Obs', 'https://x', ' fhir://Obs ', 'MESSAGE://5F']) {
+    for (const label of ['fhir:/', 'fhir://Obs', 'https://x', ' fhir://Obs ', 'MESSAGE://5F']) {
       expect(isUriLikeLabel(label)).toBe(true);
     }
   });
 
   test('rejects prose, task boxes, and space-broken URIs', () => {
-    for (const label of ['Vitamin D', 'x', ' ', '', 'fhir://a b', '1abc:x', '**fhir://x']) {
+    for (const label of ['Vitamin D', 'x', ' ', '', 'fhir://a b', '1abc:x', '**fhir://x', 'fhir:', 'Note:']) {
       expect(isUriLikeLabel(label)).toBe(false);
     }
   });

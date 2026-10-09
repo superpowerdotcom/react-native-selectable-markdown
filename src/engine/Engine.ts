@@ -12,7 +12,7 @@ import { applySpoilers } from './extensions/spoilers';
 // second.
 import { nativeEngine } from './native/index';
 import type { EngineOptions, ResolvedEngineOptions } from './options';
-import { resolveOptions } from './options';
+import { assertSourceLength, resolveOptions } from './options';
 
 /**
  * The parser seam.
@@ -65,6 +65,7 @@ export function parseDocument(
   engine?: Engine,
 ): ParsedDocument {
   const resolved = resolveOptions(options);
+  assertSourceLength(source, resolved);
   let doc = (engine ?? nativeEngine).parse(source, resolved);
   if (resolved.htmlAllow.length > 0) doc = applyHtmlSubset(doc, resolved);
   return resolved.extensions.spoilers ? applySpoilers(doc) : doc;

@@ -6,7 +6,8 @@
  * conformance sweeps and for benchmarking. This addon calls the SAME entry
  * point those bindings call (Protocol.h's parseToFlatBuffer) and hands the
  * same bytes to JS, so a regression caught here is a regression on device.
- * It is a test/bench harness only — nothing in the shipped package loads it.
+ * It is a test/bench harness: nothing in src/ loads it, though it ships behind
+ * the package's `./node` entry so a consumer's own tests can build it too.
  *
  * CONSTRAINTS this file exists to enforce:
  *

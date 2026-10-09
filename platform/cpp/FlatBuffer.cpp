@@ -101,14 +101,13 @@ inline uint32_t toUtf16(const std::vector<uint32_t>& map, uint32_t byteOffset) {
   return byteToUtf16(map, byteOffset);
 }
 
-/* Four small enums/bools share one byte. Packing is unconditional because
- * NodeEvent's defaults (listTight/autolink false, task NotTask, align
- * Default) are all zero, so a node that does not use a field contributes
- * nothing to it — no per-node-type branching needed here. */
+/* Unconditional: every packed field defaults to zero in NodeEvent, so a node
+ * type that does not use one adds no bits. */
 inline uint8_t packDetailFlags(const NodeEvent& event) {
   uint8_t flags = 0;
   if (event.listTight) flags |= kDetailListTight;
   if (event.autolink) flags |= kDetailAutolink;
+  if (event.fenceClosed) flags |= kDetailFenceClosed;
   flags |= static_cast<uint8_t>(
       (static_cast<uint8_t>(event.task) << kDetailTaskShift) & kDetailTaskMask);
   flags |= static_cast<uint8_t>(

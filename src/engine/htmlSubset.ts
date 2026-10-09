@@ -74,26 +74,12 @@ function decodeAttribute(value: string): string {
     .replace(/&amp;/g, '&');
 }
 
-function convertBlock(block: Block, ctx: SubsetContext): Block | null {
+function convertLeaf(block: Block, ctx: SubsetContext): Block | null {
   switch (block.kind) {
     case 'paragraph':
     case 'heading': {
       const children = convertInlines(block.children, ctx);
       return children === block.children ? block : { ...block, children };
-    }
-    case 'blockquote':
-    case 'listItem': {
-      const children = convertBlocks(block.children, ctx);
-      return children === block.children ? block : { ...block, children };
-    }
-    case 'list': {
-      let changed = false;
-      const items = block.items.map((item) => {
-        const next = convertBlock(item, ctx);
-        if (next !== item) changed = true;
-        return (next ?? { ...item, children: [] }) as typeof item;
-      });
-      return changed ? { ...block, items } : block;
     }
     case 'table': {
       const header = convertRow(block.header, ctx);
@@ -112,15 +98,64 @@ function convertBlock(block: Block, ctx: SubsetContext): Block | null {
   }
 }
 
-function convertBlocks(blocks: Block[], ctx: SubsetContext): Block[] {
-  let changed = false;
-  const out: Block[] = [];
-  for (const block of blocks) {
-    const next = convertBlock(block, ctx);
-    if (next !== block) changed = true;
-    if (next !== null) out.push(next);
+function blockChildren(block: Block): Block[] | null {
+  switch (block.kind) {
+    case 'blockquote':
+    case 'listItem':
+      return block.children;
+    case 'list':
+      return block.items;
+    default:
+      return null;
   }
-  return changed ? out : blocks;
+}
+
+function withBlockChildren(block: Block, children: Block[]): Block {
+  switch (block.kind) {
+    case 'blockquote':
+    case 'listItem':
+      return { ...block, children };
+    case 'list':
+      return { ...block, items: children as typeof block.items };
+    default:
+      return block;
+  }
+}
+
+interface BlockFrame {
+  container: Block | null;
+  source: Block[];
+  index: number;
+  out: Block[];
+  changed: boolean;
+}
+
+/** Iterative: block depth is untrusted (each `>` on a line nests a blockquote), so recursion overflows. */
+function convertBlocks(blocks: Block[], ctx: SubsetContext): Block[] {
+  const stack: BlockFrame[] = [{ container: null, source: blocks, index: 0, out: [], changed: false }];
+  for (;;) {
+    const top = stack[stack.length - 1];
+    if (top.index < top.source.length) {
+      const child = top.source[top.index];
+      top.index += 1;
+      const kids = blockChildren(child);
+      if (kids !== null) {
+        stack.push({ container: child, source: kids, index: 0, out: [], changed: false });
+        continue;
+      }
+      const next = convertLeaf(child, ctx);
+      if (next !== child) top.changed = true;
+      if (next !== null) top.out.push(next);
+      continue;
+    }
+    stack.pop();
+    const built = top.changed ? top.out : top.source;
+    if (top.container === null) return built;
+    const parent = stack[stack.length - 1];
+    const rebuilt = top.changed ? withBlockChildren(top.container, built) : top.container;
+    if (rebuilt !== top.container) parent.changed = true;
+    parent.out.push(rebuilt);
+  }
 }
 
 function convertRow<T extends Extract<Block, { kind: 'tableRow' }>>(row: T, ctx: SubsetContext): T {
@@ -158,7 +193,7 @@ function convertHtmlBlock(block: Extract<Block, { kind: 'htmlBlock' }>, ctx: Sub
 /** Raw HTML into text, soft-break and htmlSpan nodes with exact spans. */
 function tokenize(raw: string, offset: number): Inline[] {
   const out: Inline[] = [];
-  const end = raw.replace(/\s+$/, '').length;
+  const end = raw.trimEnd().length;
   const pushText = (from: number, to: number): void => {
     let at = from;
     raw
@@ -197,20 +232,49 @@ interface Open {
   index: number;
 }
 
+interface Level {
+  input: Inline[];
+  index: number;
+  out: Inline[];
+  changed: boolean;
+  owner: Inline | null;
+}
+
+/** Iterative: inline depth is untrusted (one emphasis per delimiter pair), so recursion overflows. */
 function convertInlines(children: Inline[], ctx: SubsetContext): Inline[] {
-  let changed = false;
-  // Grandchildren first, so pairing sees them converted.
-  const nested = children.map((child) => {
-    if (!('children' in child) || !Array.isArray(child.children)) return child;
-    const inner = convertInlines(child.children as Inline[], ctx);
-    if (inner === child.children) return child;
-    changed = true;
-    return { ...child, children: inner } as Inline;
-  });
-  if (!nested.some((child) => child.kind === 'htmlSpan')) return changed ? nested : children;
+  const stack: Level[] = [{ input: children, index: 0, out: [], changed: false, owner: null }];
+  for (;;) {
+    const level = stack[stack.length - 1];
+    if (level.index < level.input.length) {
+      const child = level.input[level.index];
+      level.index += 1;
+      if ('children' in child && Array.isArray(child.children)) {
+        stack.push({ input: child.children as Inline[], index: 0, out: [], changed: false, owner: child });
+      } else {
+        level.out.push(child);
+      }
+      continue;
+    }
+    stack.pop();
+    const converted = pairTags(level.changed ? level.out : level.input, ctx);
+    if (level.owner === null) return converted;
+    const parent = stack[stack.length - 1];
+    if (converted === level.input) {
+      parent.out.push(level.owner);
+    } else {
+      parent.changed = true;
+      parent.out.push({ ...level.owner, children: converted } as Inline);
+    }
+  }
+}
+
+/** Expects each child's own children already converted. */
+function pairTags(nested: Inline[], ctx: SubsetContext): Inline[] {
+  if (!nested.some((child) => child.kind === 'htmlSpan')) return nested;
 
   const out: Inline[] = [];
   const stack: Open[] = [];
+  let changed = false;
   for (const child of nested) {
     if (child.kind !== 'htmlSpan') {
       out.push(child);
@@ -219,8 +283,11 @@ function convertInlines(children: Inline[], ctx: SubsetContext): Inline[] {
     const tag = parseTag(child.literal);
     if (tag === null || !ctx.allow.has(tag.name)) {
       if (ctx.options.htmlOther === 'raw') out.push(child);
+      else changed = true;
       continue;
     }
+    // Every allowed tag is consumed: converted, paired or dropped.
+    changed = true;
     if (tag.name === 'br') {
       out.push({ kind: 'hardBreak', span: child.span });
       continue;
@@ -239,13 +306,13 @@ function convertInlines(children: Inline[], ctx: SubsetContext): Inline[] {
     const inner = out.splice(open.index);
     out.push(wrap(open.tag, inner, span(open.start, child.span.end), ctx));
   }
-  return out;
+  return changed ? out : nested;
 }
 
 function wrap(tag: Tag, children: Inline[], whole: SourceSpan, ctx: SubsetContext): Inline {
   const kind = PAIRED[tag.name];
   if (kind === 'code') {
-    return { kind: 'codeSpan', span: whole, value: children.map(plain).join('') };
+    return { kind: 'codeSpan', span: whole, value: plain(children) };
   }
   if (kind !== 'link') return { kind, span: whole, children };
   const href = sanitizeUrl(tag.href ?? '');
@@ -256,20 +323,36 @@ function wrap(tag: Tag, children: Inline[], whole: SourceSpan, ctx: SubsetContex
     return { kind: 'link', span: whole, href, children, blocked: true };
   }
   // Refused or missing: its text, like a blocked markdown link.
-  return { kind: 'text', span: whole, value: children.map(plain).join('') };
+  return { kind: 'text', span: whole, value: plain(children) };
 }
 
-function plain(node: Inline): string {
-  switch (node.kind) {
-    case 'text':
-    case 'codeSpan':
-    case 'math':
-      return node.value;
-    case 'softBreak':
-      return ' ';
-    case 'hardBreak':
-      return '\n';
-    default:
-      return 'children' in node ? (node.children as Inline[]).map(plain).join('') : '';
+/** Iterative for the same reason as `convertInlines`. */
+function plain(nodes: readonly Inline[]): string {
+  let out = '';
+  const stack: { nodes: readonly Inline[]; index: number }[] = [{ nodes, index: 0 }];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (frame.index >= frame.nodes.length) {
+      stack.pop();
+      continue;
+    }
+    const node = frame.nodes[frame.index];
+    frame.index += 1;
+    switch (node.kind) {
+      case 'text':
+      case 'codeSpan':
+      case 'math':
+        out += node.value;
+        break;
+      case 'softBreak':
+        out += ' ';
+        break;
+      case 'hardBreak':
+        out += '\n';
+        break;
+      default:
+        if ('children' in node) stack.push({ nodes: node.children as Inline[], index: 0 });
+    }
   }
+  return out;
 }

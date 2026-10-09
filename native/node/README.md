@@ -2,10 +2,12 @@
 
 A [Node-API](https://nodejs.org/api/n-api.html) addon that exposes
 `selectable_markdown::parseToFlatBuffer` (`platform/cpp/Protocol.h`) to plain
-Node. It is not shipped: it is absent from `package.json`'s `files` and nothing
-under `src/` imports it. It exists so the native engine can be tested and
-benchmarked without a device, and it is the only way markdown gets parsed in
-Node at all, since the package has no JavaScript parser.
+Node. Nothing under `src/` imports it, but it ships in the tarball
+(`package.json`'s `files` lists `native/node` and
+`scripts/build-node-addon.mjs`) behind the `./node` entry, so a consumer's
+own tests can build the engine too. It exists so the native engine can be
+tested and benchmarked without a device, and it is the only way markdown
+gets parsed in Node at all, since the package has no JavaScript parser.
 
 It stops where the real bindings stop. iOS, Android and this addon all call
 `parseToFlatBuffer(source, byteLength, config)` and hand the bytes to JS
@@ -35,9 +37,9 @@ and arch so an arm64 Node and a Rosetta Node coexist.
 failures (compile, link, undefined symbol) still exit non-zero. Jest's
 `describeNative` uses it, so without a compiler the native suites report as
 skipped. CI does not pass it: a runner that skips this build skips every
-markdown-parsing check — 426 of the 1451 Jest tests, spread over 22 of the 46
-suites and taking 10 of them out entirely, plus the whole conformance run — so
-there a missing compiler is a failed job. (Measured 2026-09-03 against a tree
+markdown-parsing check — 607 of the 1790 Jest tests, spread over 34 of the 57
+suites and taking 14 of them out entirely, plus the whole conformance run — so
+there a missing compiler is a failed job. (Measured 2026-10-09 against a tree
 with no addon; nothing asserts those counts, so a new test file moves them.)
 
 ### The undefined-symbol guard

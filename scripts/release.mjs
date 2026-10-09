@@ -133,6 +133,8 @@ console.log(
 );
 console.log(`[release]   2. git add package.json package-lock.json CHANGELOG.md && git commit -m "release ${next}"`);
 console.log(`[release]   3. git push origin main && git tag v${next} && git push origin v${next}`);
-console.log('[release] the tag is what runs .github/workflows/release.yml: the macOS gates, then every');
-console.log('[release] gate CI runs, then npm publication of the packed tarball and the GitHub release. It re-runs');
-console.log('[release] them from scratch, so the tagged commit does not have to be one CI already saw.');
+console.log('[release] the tag is what runs .github/workflows/release.yml: the macOS gates and the Android and');
+console.log('[release] iOS app builds, then every gate CI runs, then npm publication of the packed tarball and the');
+console.log('[release] GitHub release. It re-runs them from scratch, so the tagged commit does not have to be one CI');
+console.log('[release] already saw. The app builds run nowhere else; to try them before tagging:');
+console.log('[release]   gh workflow run native-build.yml --ref <branch>');

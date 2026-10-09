@@ -77,8 +77,12 @@ Harnesses and tables: [BENCHMARKS.md](BENCHMARKS.md). Incremental parsing:
   so every settle re-resolves all four over the whole settled run and
   `RunHost` re-maps every attribute for the wire (`toNativeAttribute`). That
   is O(run) per settle rather than O(append), and the run cap bounds it only
-  as far as it bounds a run (§3). Unmeasured; it is the JS half of what
-  roadmap item 1 exists to measure.
+  as far as it bounds a run (§3). The decoration pass's inset scan is
+  O(n log n) in marks; it was O(segments × marks), and an 8,000-item list
+  cost 111 ms where it now costs 2 ms. Measuring a `height: 'auto'` embed
+  re-resolves only the run holding it; the projection cache and block
+  classification survive the measurement. Otherwise unmeasured; it is the JS
+  half of what roadmap item 1 exists to measure.
 - **Layout and commit.** Unmeasured on device (BENCHMARKS.md metrics 5 and
   6, planned). External measurements put the cost here:
   - LibreChat: settled-block memoization cut code-block renders 88% and
@@ -112,7 +116,7 @@ commits per second (reasoned; no throughput number claimed).
 
 ### Tail repair hardening
 
-The corpus is 251 table cases (319 tests in `src/stream/repair.test.ts`).
+The corpus is 251 table cases (322 tests in `src/stream/repair.test.ts`).
 `RepairResult` gained one field, the carry-forward `scan` §1 describes; new
 repairs are recorded in `touched` as before. New: a
 lone high surrogate at the cut is dropped instead of becoming U+FFFD; a tail
@@ -147,8 +151,9 @@ Measured on Node/V8, `bench:crossing`.
 `RunLayoutCache` (`android/src/main/java/com/selectablemarkdown/RunLayoutCache.kt`)
 caches built Spannables and measurements keyed on the full
 `(width, widthMode, height, heightMode)` tuple, like React Native's
-`TextMeasureCache`. Keys include text, attributes, decorations, embeds, a
-display-metrics token from `DisplayMetricsHolder.getWindowDisplayMetrics()`
+`TextMeasureCache`. Keys include text, attributes, decorations, embeds, the
+font scaling and resolved typefaces, a display-metrics token from
+`DisplayMetricsHolder.getWindowDisplayMetrics()`
 (what `PixelUtil` uses) and the locale tag `configurePaint` sets as the
 paint's `textLocale`, so an embed resized under unchanged text, a font-scale
 or density change, and a locale change that moves CJK line breaking all miss
@@ -182,7 +187,10 @@ longest common suffix of the old and new strings, each compared characters
 first and then attribute runs, with both boundaries kept off surrogate pairs.
 Only the differing middle is replaced, in one `replaceCharacters` inside
 `beginEditing`/`endEditing`, so TextKit relayouts that middle and what follows
-it. An append is the degenerate plan with an empty suffix and costs what it
+it. The applied string is kept by reference and the next one is compared to
+it by identity before the plan runs, so a re-published unchanged State handle
+costs a pointer compare, and no snapshot pays a full attributed-string
+compare or copy on the way in. An append is the degenerate plan with an empty suffix and costs what it
 always did; full swap now means the two strings share nothing at either end.
 
 The case the prefix-only test missed was not exotic. A still-streaming fenced

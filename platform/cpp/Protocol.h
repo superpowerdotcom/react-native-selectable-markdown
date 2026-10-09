@@ -129,6 +129,9 @@ inline constexpr uint8_t kDetailTaskShift = 2;  /* 2 bits: TaskState */
 inline constexpr uint8_t kDetailTaskMask = 0x3u << kDetailTaskShift;
 inline constexpr uint8_t kDetailAlignShift = 4;  /* 2 bits: CellAlign */
 inline constexpr uint8_t kDetailAlignMask = 0x3u << kDetailAlignShift;
+/* CodeBlock: set only when a closing fence ended it. Older decoders ignore the
+ * bit, so it needs no protocol version bump. */
+inline constexpr uint8_t kDetailFenceClosed = 1u << 6;
 
 /* Extension bits accepted by configFromBits. Mirrors ExtensionFlags field
  * order; `spoilers` is deliberately absent (see OffsetParser.h constraint 1)

@@ -77,6 +77,9 @@ src/
     options.ts             ExtensionFlags, EngineOptions, resolveOptions, presets
     entities.ts            fallback entity decoding for the decoder's Entity case (internal)
     urlPolicy.ts           sanitizeUrl + isUrlAllowed, applied at parse time, re-checked at press
+    htmlSubset.ts          applyHtmlSubset(): the html: { allow } post-parse transform
+    links.ts               extractLinks(): the links of a parse, policy applied
+    namedEntities.ts       the HTML5 entity table behind entities.ts
     native.ts              re-export facade for the md4c engine
     native/                md4c binding: protocol.ts, decode.ts, widen.ts, install.ts, index.ts
     extensions/spoilers.ts applySpoilers(): opt-in post-parse ||…|| transform
@@ -103,6 +106,11 @@ src/
     runPressables.ts       link marks -> tappable ranges the host hit-tests
     runEmbeds.ts           embed entries -> RunEmbed[] the host reserves space from
     imageEmbeds.ts         withImageEmbeds(): the built-in image embed claim behind `images`
+    codeBlocks.tsx         withCodeBlockCards(): the codeBlocks="card" claim and its Copy button
+    runPresentation.ts     presentPressables()/resolveChips()/resolveRunHighlights(): pressable
+                           labels, chip boxes and highlight ranges for the host
+    blockSpacing.ts        resolveRunSpacing(): theme.blocks margins as run decorations
+    selectionTracking.ts   the live-selection reducer behind onSelectionChange/getSelection
     projectionCache.ts     createRunProjectionCache(): incremental projectRun per run
     processedColors.ts     memoizedProcessColor(): the bounded, evicting processColor memo
     runIdentity.ts         runKey()/embedRectKey(): identities that survive a settle
@@ -123,19 +131,21 @@ platform/
   ios/       UITextView host, Fabric component view, iOS measurer, JSI installer
 android/     TextView host + ViewManager, CMake/JNI glue, JSI installer. At the package root
              because RN's Gradle plugin looks for package.json one directory up.
-native/node/ Node-API harness over the same C++ for tests and benches (never shipped)
+native/node/ Node-API harness over the same C++ for tests and benches; ships behind the
+             ./node entry and builds on first import, and nothing in src/ imports it
 conformance/ CommonMark runner, streaming prefix oracle, projection oracle, fixtures
 bench/       Node benchmarks
 scripts/     build-node-addon (builds the Node harness), emit-dist-spec-shim (the codegen
-             spec's dist stub), check-codegen / check-fabric-cpp / check-swift, verify-pack,
-             release, changelog-section
+             spec's dist stub), clean-dist / finish-esm-build (the two builds), check-codegen /
+             check-fabric-cpp / check-swift, verify-pack, release, changelog-section,
+             check-lock-sync / check-unreleased-breaking (release preflight), generate-entities
 docs/        this file and its siblings
 SelectableMarkdown.podspec, react-native.config.js   what autolinking reads; both ship
 ```
 
-Dependencies point downward: `document` depends on nothing; `engine` on `document`; `stream` on both; `selection` on `document` and `engine`; `view` on all of the above; `agui` on `stream` (plus the `EngineOptions` type from `engine`). Nothing in `src/` imports from `platform/`.
+Dependencies point downward: `document` depends on nothing; `engine` on `document`; `stream` on both; `selection` on `document` and `engine` (plus one `import type` from `view/theme`); `view` on all of the above; `agui` on `stream` (plus the `EngineOptions` type from `engine`). Nothing in `src/` imports from `platform/`.
 
-`index.ts` names every export one at a time instead of re-exporting modules wholesale, so the surface is a decision rather than a consequence of where a helper happens to live. It publishes the document model plus its span algebra (`visit`, `findAt`, `childrenOf`, `isBlock`/`isInline`, `spanLength` and friends); `parseDocument`, the `Engine` type, `resolveOptions`/`withOptions`/`presets`, `DEFAULT_LINK_PREFIXES`/`DEFAULT_IMAGE_PREFIXES`, `sanitizeUrl`/`isUrlAllowed`, `applySpoilers`, and the native quartet `nativeEngine`/`createNativeEngine`/`installNativeEngine`/`isNativeEngineAvailable` (with `isNativeEngineInstalled` and `isNativeEnginePermanentlyRefused` for diagnostics); `StreamSession`, `createSmoother`/`createAdaptiveSmoother`/`snapPastLinkDestination`, `repairTail`/`seedFromSettled`/`continueSeed`, `trimTrailingPlaceholders`; `segmentRuns`/`classifyTopLevelBlock`/`DEFAULT_MAX_RUN_CHARS`, `projectRun`/`mapSelectionToSource`/`EMBED_PLACEHOLDER`, `buildCopyPayload`; the ag-ui adapters; and the view layer — `SelectableMarkdown`, `RunHost`, the theme, the renderers with `openUrl`/`textContentOf`/`MAX_RENDER_DEPTH`, the selection-action helpers, and the per-channel resolvers a consumer driving `RunHost` itself needs (`resolveRunAttributes`, `resolveRunPressables`, `resolveRunDecorations`, `resolveRunEmbeds`, `withImageEmbeds`, `createRunProjectionCache`, `mapSourceToRunRange`). What it deliberately does not publish stays reachable one directory in: the flat-buffer decoder and `__linkNativeEngine` at `dist/engine/native`, the selection-menu wire codec at `dist/view/selectionActions`.
+`index.ts` names every export one at a time instead of re-exporting modules wholesale, so the surface is a decision rather than a consequence of where a helper happens to live. It publishes the document model plus its span algebra (`visit`, `findAt`, `childrenOf`, `isBlock`/`isInline`, `spanLength` and friends); `parseDocument`, the `Engine` type, `resolveOptions`/`withOptions`/`presets`, `DEFAULT_LINK_PREFIXES`/`DEFAULT_IMAGE_PREFIXES`/`DEFAULT_MAX_SOURCE_LENGTH`, `sanitizeUrl`/`isUrlAllowed`, `applySpoilers`, and the native quartet `nativeEngine`/`createNativeEngine`/`installNativeEngine`/`isNativeEngineAvailable` (with `isNativeEngineInstalled` and `isNativeEnginePermanentlyRefused` for diagnostics); `StreamSession`, `createSmoother`/`createAdaptiveSmoother`/`snapPastLinkDestination`, `repairTail`/`seedFromSettled`/`continueSeed`, `trimTrailingPlaceholders`; `segmentRuns`/`classifyTopLevelBlock`/`DEFAULT_MAX_RUN_CHARS`, `projectRun`/`mapSelectionToSource`/`EMBED_PLACEHOLDER`, `buildCopyPayload`; the ag-ui adapters; and the view layer — `SelectableMarkdown`, `RunHost`, the theme, the renderers with `openUrl`/`textContentOf`/`MAX_RENDER_DEPTH`, the selection-action helpers, and the per-channel resolvers a consumer driving `RunHost` itself needs (`resolveRunAttributes`, `resolveRunPressables`, `resolveRunDecorations`, `resolveRunEmbeds`, `withImageEmbeds`, `createRunProjectionCache`, `mapSourceToRunRange`). What it deliberately does not publish stays reachable one directory in: the flat-buffer decoder and `__linkNativeEngine` at `dist/engine/native`, the selection-menu wire codec at `dist/view/selectionActions`.
 
 One file is build input rather than runtime code. React Native's codegen and babel plugin read `SelectableRunHostNativeComponent.ts` and only match `codegenNativeComponent<…>` in the original source; a `tsc`-transpiled copy yields no view config, the component never registers, and `RunHost` throws for every run. So `package.json` points Metro at `src/index.ts`, `tsconfig.build.json` excludes the file from emit, `RunHost` reaches it through a call-expression `require` (an `import type` would defeat the exclusion), and `npm run check:codegen` asserts the generated C++ still matches.
 
@@ -148,7 +158,7 @@ export interface Engine {
 }
 ```
 
-That is the whole contract. `parseDocument(source, options?, engine?)` resolves options, calls the engine (`nativeEngine` by default), and applies the spoiler transform if `extensions.spoilers` is true. Nothing validates or normalizes the result: whatever the engine returns is the document, spans included. Spoilers run after the parse on purpose, so no engine carries always-on non-CommonMark syntax and the opt-in behaves the same under a substituted parser.
+That is the whole contract. `parseDocument(source, options?, engine?)` resolves options, refuses a source longer than `maxSourceLength` with a `RangeError`, calls the engine (`nativeEngine` by default), applies the `html: { allow }` transform when one is set, and applies the spoiler transform if `extensions.spoilers` is true. Nothing else validates or normalizes the result: whatever the engine returns is the document, spans included. Both transforms run after the parse on purpose, so no engine carries always-on non-CommonMark syntax and the opt-ins behave the same under a substituted parser.
 
 The third argument is the supported way to bring your own parser.
 
@@ -189,7 +199,7 @@ Four rules, each a way a real engine goes wrong:
 3. **Node kinds are a fixed vocabulary.** `Block` and `Inline` are discriminated unions from `src/document/nodes.ts`: `paragraph`, `heading`, `codeBlock`, `blockquote`, `list`, `listItem`, `table`, `tableRow`, `tableCell`, `thematicBreak`, `htmlBlock`; `text`, `emphasis`, `strong`, `strikethrough`, `underline`, `codeSpan`, `link`, `image`, `autolink`, `hardBreak`, `softBreak`, `math`, `spoiler`, `htmlSpan`. The type checker rejects anything else, and `RendererMap` is a mapped type over `AnyNode['kind']`, so a missing renderer is a compile error.
 4. **The stream layer speaks CommonMark, not your dialect.** `StreamSession` never hands you the tail as it arrived. `repairTail` (`src/stream/repair.ts`) appends virtual CommonMark closers (`**bold` parses as `**bold**`) and suppresses a bare trailing construct line that would flip the structure above it (a lone `-` about to make a setext heading), and there is no switch that turns it off. The parse-free fast path calls you at all only when a delta holds one of the characters in `CONSTRUCT_CHARS` (`src/stream/StreamSession.ts`) or ends in a space or tab, so an engine whose own construct characters are not a subset of that class — a `@mention` engine, say — shows stale structure until an unrelated construct character happens to arrive. An engine that is not parsing CommonMark is better driven by parsing the accumulated text yourself than through `StreamSession`.
 
-The second parameter is `ResolvedEngineOptions`, with every default filled in. Honouring the flags is optional; the span invariant is not. `options.urlPolicy` in particular is yours to apply: nothing between `parseDocument` and the view re-filters a node's `href`, and the view's press-time re-check is a backstop for navigation only, not for the hrefs your own UI reads off a node.
+The second parameter is `ResolvedEngineOptions`, with every default filled in. Honouring the flags is optional; the span invariant is not. `options.urlPolicy` in particular is yours to apply: nothing between `parseDocument` and the view re-filters a node's `href` (the one exception is the `<a href>` node the `html: { allow }` transform creates, which it runs through `linkPrefixes` itself), and the view's press-time re-check is a backstop for navigation only, not for the hrefs your own UI reads off a node.
 
 ### The engine that ships
 

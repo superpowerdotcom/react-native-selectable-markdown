@@ -317,6 +317,8 @@ typedef struct MD_BLOCK_CODE_DETAIL {
     MD_ATTRIBUTE info;
     MD_ATTRIBUTE lang;
     MD_CHAR fence_char;     /* The character used for fenced code block; or zero for indented code block. */
+    int fence_closed;       /* Non-zero if a closing fence ended a fenced block; zero if its container or the
+                             * document did. Local patch 0001 (see patches/README.md), not upstream. */
 } MD_BLOCK_CODE_DETAIL;
 
 /* Detailed info for MD_BLOCK_TABLE. */

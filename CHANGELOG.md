@@ -4,7 +4,27 @@ Versions follow [semver](https://semver.org/); pre-1.0, breaking changes land in
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-10-09
+
+- Fix (Android): `SelectableRunHostView.kt` referenced an undefined `pressed` in `pressableBounds`, so every app on 0.13.1 failed Kotlin compilation.
+- Fix (Android): `SelectableRunHostView.kt` assigned `textView.textClassifier`, which Kotlin 2 imports as read-only (`@NonNull` getter, `@Nullable` setter), so every release so far failed to compile under Kotlin 2.x, the default in React Native 0.82's app template.
+- Fix (engine): the closing-fence search after fenced code no longer backtracks exponentially on a line of `> ` markers (a 59-byte message took seconds, 35 markers took minutes), and no longer takes a later sibling's or a top-level fence as the closer of a block its container ended, which produced overlapping spans and an unanchored code block. md4c now reports whether a fence closed the block (vendored patch 0001, `kDetailFenceClosed` on the wire; the protocol version is unchanged).
+- Fix (engine): link tails are scanned by the link grammar instead of to the balancing bracket, so reference links each followed by a lone `(` or an unterminated title cost linear time (100 kB: 2.4 s to 92 ms).
+- Fix (engine): a thematic break inside a list item or blockquote (`- ***`, `> ***`) gets its real span instead of a zero-width one, and the span sweep no longer tolerates a zero-width rule.
+- Fix (engine): `extractLinks` and `html: { allow }` no longer overflow the stack on deeply nested inlines; the HTML-subset tokenizer trims trailing whitespace in linear time.
+- Fix (engine): the decoder throws `NativeProtocolError` for an event range outside the source or running backwards, decodes an invalid UTF-8 string-table entry to U+FFFD instead of throwing `RangeError`, and wraps the inline children of an unknown node type in a paragraph.
+- Engine: smart punctuation pairs quotes as `cmark --smart` does; an unpaired `"` or `'` now renders as the closing form (`"abc` → `”abc`).
+- Engine: `maxSourceLength` (default 1,048,576 UTF-16 units; `Infinity` opts out). `parseDocument` and `nativeEngine` throw a `RangeError` for longer input before parsing it. `ResolvedEngineOptions` gains `maxSourceLength`, and the default is exported as `DEFAULT_MAX_SOURCE_LENGTH`.
+- Fix (streaming): tail repair's trailing-whitespace trim and the fast path's autolink guard are linear (40,000 spaces before a pending closer: 3.3 s to under a millisecond per append; 10,000 `(http:` candidates on one line: 1.5 s to under a millisecond), and a NUL in a plain delta forces a reparse so the snapshot matches a fresh parse.
+- Streaming: under `hideUriLikeLabels`, a label ending in a bare `scheme:` stays visible until its `/` arrives; `isUriLikeLabel('fhir:')` is false.
+- Fix (view): measuring a `height: 'auto'` embed no longer reprojects and re-renders every run; a failed `Image.getSize` is not retried on every streaming snapshot; decoration inset resolution is O(n log n) in marks (8,000-item list: 111 ms to 2 ms); non-finite theme numbers are dropped before the bridge.
+- iOS: a snapshot no longer pays a full attributed-string compare and copy before the splice.
+- Packaging: `dist/view/codeBlocks` resolves under the `react-native` condition; the podspec declares iOS 15.1, React Native 0.82's floor; `npm run release` and the release workflow refuse a BREAKING entry under a version that is not a minor bump; CI pins `node-gyp`. Before publishing, the release workflow installs the packed tarball into a fresh React Native app and builds it on Android (Gradle, plus the Kotlin unit tests) and iOS (CocoaPods, xcodebuild); `npm run check:app:android` and `check:app:ios` run the same build locally.
+- Docs: a standalone list is one `<Text>` whose markers copy (0.13.1's notes said otherwise); the selection-menu items never write the clipboard; `native/node` ships in the tarball; the theme has an `html` group and `html` takes an object form; open-ended HTML blocks under `'strip'`; corrected widening examples and test counts.
+
 ## [0.13.1] — 2026-10-02
+
+Carries three BREAKING entries under a patch number, against the policy above: 0.13.0 was never published, and v0.12.0 was tagged but reached neither npm nor a GitHub release. The release guard now refuses a break under a patch version.
 
 - BREAKING: complete `MarkdownTheme` objects now require `colors.highlight`, `table.frame`, `table.hideEmptyHeader`, `blocks`, `list`, `link`, and `html`. Use `mergeTheme(overrides)` to fill defaults before passing a theme to the run resolvers, or update complete theme literals.
 
@@ -115,6 +135,8 @@ Versions follow [semver](https://semver.org/); pre-1.0, breaking changes land in
 - `<SelectableMarkdown session={…}>` renders the session's snapshot; the session owns its parse context.
 - Tests are excluded from the published tarball.
 
-[Unreleased]: https://github.com/superpowerdotcom/react-native-selectable-markdown/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/superpowerdotcom/react-native-selectable-markdown/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/superpowerdotcom/react-native-selectable-markdown/releases/tag/v0.13.1
+[0.12.0]: https://github.com/superpowerdotcom/react-native-selectable-markdown/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/superpowerdotcom/react-native-selectable-markdown/releases/tag/v0.11.0
 [0.10.0]: https://github.com/superpowerdotcom/react-native-selectable-markdown/releases/tag/v0.10.0

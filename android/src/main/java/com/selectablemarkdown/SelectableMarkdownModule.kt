@@ -160,7 +160,7 @@ class SelectableMarkdownModule(reactContext: ReactApplicationContext) :
          * build (or filters out this ABI) still gets a working view layer
          * and one line in logcat explaining why nothing parses.
          *
-         * System.loadLibrary, not SoLoader.loadLibrary: minSdk here is 23, so
+         * System.loadLibrary, not SoLoader.loadLibrary: minSdk here is 24, so
          * the system linker both extracts and resolves DT_NEEDED entries
          * (libjsi.so, libc++_shared.so) without help, and this avoids a
          * compile-time reference to a class that lives outside the React

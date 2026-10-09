@@ -46,6 +46,12 @@ export interface EngineOptions {
   html?: 'strip' | 'raw' | { allow: readonly string[]; other?: 'strip' | 'raw' };
   /** Default false. */
   smartPunctuation?: boolean;
+  /**
+   * The longest source `parseDocument` accepts, in UTF-16 code units; longer
+   * input throws a `RangeError` before anything is parsed. Default
+   * {@link DEFAULT_MAX_SOURCE_LENGTH}; `Infinity` opts out.
+   */
+  maxSourceLength?: number;
   urlPolicy?: {
     /**
      * REPLACES the defaults, it does not extend them — spread
@@ -68,6 +74,7 @@ export interface ResolvedEngineOptions {
   /** The treatment of tags outside `htmlAllow` when it is set. */
   htmlOther: 'strip' | 'raw';
   smartPunctuation: boolean;
+  maxSourceLength: number;
   urlPolicy: {
     linkPrefixes: string[];
     imagePrefixes: string[];
@@ -96,6 +103,19 @@ export const DEFAULT_LINK_PREFIXES: readonly string[] = [
 ];
 export const DEFAULT_IMAGE_PREFIXES: readonly string[] = ['https://'];
 
+export const DEFAULT_MAX_SOURCE_LENGTH = 1_048_576;
+
+/** Here, not in Engine.ts: the native engine calls it too, and importing Engine.ts there would form a cycle. */
+export function assertSourceLength(source: string, options: ResolvedEngineOptions): void {
+  if (source.length > options.maxSourceLength) {
+    throw new RangeError(
+      `react-native-selectable-markdown: the source is ${source.length} UTF-16 units long, ` +
+        `over options.maxSourceLength (${options.maxSourceLength}). Truncate it, or raise ` +
+        'the limit (Infinity opts out) if this size is expected.',
+    );
+  }
+}
+
 export function resolveOptions(o?: EngineOptions): ResolvedEngineOptions {
   return {
     extensions: { ...NO_EXTENSIONS, ...o?.extensions },
@@ -103,6 +123,7 @@ export function resolveOptions(o?: EngineOptions): ResolvedEngineOptions {
     htmlAllow: typeof o?.html === 'object' ? [...o.html.allow] : [],
     htmlOther: typeof o?.html === 'object' ? (o.html.other ?? 'strip') : 'strip',
     smartPunctuation: o?.smartPunctuation ?? false,
+    maxSourceLength: o?.maxSourceLength ?? DEFAULT_MAX_SOURCE_LENGTH,
     urlPolicy: {
       linkPrefixes: [
         ...(o?.urlPolicy?.linkPrefixes ?? DEFAULT_LINK_PREFIXES),

@@ -237,6 +237,7 @@ const ENGINE_OPTIONS_KEYS: Record<keyof EngineOptions, true> = {
   extensions: true,
   html: true,
   smartPunctuation: true,
+  maxSourceLength: true,
   urlPolicy: true,
 };
 

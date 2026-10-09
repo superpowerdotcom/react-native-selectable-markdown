@@ -302,7 +302,9 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
             // The default TextClassifier binds an on-device service per
             // selection (latency) and is a known NPE source on some OEM
             // builds; markdown runs need none of its smart-selection output.
-            textView.textClassifier = android.view.textclassifier.TextClassifier.NO_OP
+            // A setter call: the getter is @NonNull and the setter @Nullable,
+            // so Kotlin 2 imports `textClassifier` as a val.
+            textView.setTextClassifier(android.view.textclassifier.TextClassifier.NO_OP)
         }
         // ExploreByTouchHelper's constructor forces `focusable` and importantForAccessibility YES;
         // both are restored, as React Native's ReactAccessibilityDelegate does.
@@ -804,9 +806,6 @@ class SelectableRunHostView(context: ReactContext) : FrameLayout(context) {
         val chip = pendingDecorations.decorations.firstOrNull {
             it.kind == "chip" && it.start == pressable.start && it.end == pressable.end
         }
-        val radius = PixelUtil.toPixelFromDIP(
-            if (pressed.pressedRadius > 0f) pressed.pressedRadius else chip?.borderRadius ?: 0f,
-        )
         val text = textView.text as? android.text.Spanned
         if (chip != null && text != null &&
             RunDecorations.chipRect(layout, text, chip, textView.paint, decorationTextPaint, decorationRect)

@@ -105,9 +105,11 @@ about 20 s of retrying in all at the default — the session arms no further
 timer and REJECTS every outstanding `drained()` with the engine's own error,
 and rejects immediately for any `drained()` called while it stays given up.
 Nothing is dropped: the text stays in the pending buffer, `pendingLength`
-still counts it, and any explicit drain (`append`, `flushBuffered`,
-`replace`, `finalize`) or new `appendBuffered` input clears the state and
-tries again, so a session whose engine comes back keeps every character. A
+still counts it, an explicit drain (`append`, `flushBuffered`, `replace`,
+`finalize`) retries the parse once — a success clears the given-up state, a
+failure throws to the caller and leaves it set — and new `appendBuffered` or
+`rewrite` input starts a fresh ladder, so a session whose engine comes back
+keeps every character. A
 caller awaiting `drained()` must therefore handle a rejection.
 `bindRunTextEvents`' park-behind-drain does: it releases its hold (so
 `holding` goes back to `false`), skips the finalize that would hand the same
@@ -136,8 +138,8 @@ Two options hold text back so tail ambiguity resolves before render:
   frame later. The cut never splits a visible glyph: it retreats to the
   nearest cluster boundary, so the whole cluster stays pending (the last
   bullet under [Protocol edge cases](#protocol-edge-cases) says which
-  clusters are recognised). A metered flush also holds back a trailing
-  cluster that could still GROW: when the pending buffer's last code point
+  clusters are recognised). Every scheduled flush, metered or not, also holds
+  back a trailing cluster that could still GROW: when the pending buffer's last code point
   is non-ASCII it waits for one more code point — or for the idle drain or
   `finalize` — which costs one code point of latency and is why a flag or an
   emoji arriving in two deltas never commits half a glyph.
@@ -494,7 +496,7 @@ trimming the same array comes back.
 
 ### Corpus
 
-The repair corpus has 251 table cases (319 tests in
+The repair corpus has 251 table cases (322 tests in
 `src/stream/repair.test.ts`, counting the purity, loop and carried-scan
 checks), including the surrogate drop (handler 0), partial backtick closers
 (handler 2), leaf-block boundaries for the inline region (handler 3),

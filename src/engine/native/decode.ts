@@ -86,6 +86,9 @@ interface Frame {
   runValue: string;
   runActive: boolean;
   htmlBreakEnd?: number;
+  /** Smart quotes: `ctx.quotes.length` and `ctx.quoteBottom` when this frame opened. */
+  quotesAtOpen: number;
+  quoteBottomAtOpen: number;
 }
 
 function newFrame(
@@ -115,6 +118,8 @@ function newFrame(
     runEnd: -1,
     runValue: '',
     runActive: false,
+    quotesAtOpen: 0,
+    quoteBottomAtOpen: 0,
   };
 }
 
@@ -137,7 +142,8 @@ export function decodeFlatBuffer(
   const header = readHeader(buffer, source);
   const words = new Uint32Array(buffer, header.eventsOffset, header.eventCount * 6);
   const strings = new StringTable(buffer, header);
-  const ctx: DecodeContext = { source, options, strings, cursor: 0 };
+  const ctx: DecodeContext = { source, options, strings, cursor: 0, quotes: newQuoteStack() };
+  const smart = options.smartPunctuation;
 
   const stack: Frame[] = [newFrame(P.NodeType.Document, -1, -1, 0, 0, -1, -1)];
 
@@ -156,6 +162,14 @@ export function decodeFlatBuffer(
     const contentStart = start === P.NO_OFFSET ? -1 : start;
     const contentEnd =
       contentStart < 0 ? -1 : end === P.NO_OFFSET ? contentStart : end;
+    // Throw, not clamp: a bad range decodes into a plausible document that
+    // selection and the streaming splice trust.
+    if (contentStart >= 0 && (contentEnd < contentStart || contentEnd > source.length)) {
+      throw new NativeProtocolError(
+        `native parse event ${i} carries the range [${contentStart}, ${contentEnd}) in a ` +
+          `source of ${source.length} UTF-16 units`,
+      );
+    }
 
     switch (kind) {
       case P.EventKind.BlockEnter:
@@ -164,9 +178,13 @@ export function decodeFlatBuffer(
         // The parent's pending text run ends where its next child begins;
         // flushing here is what keeps inline order (`hello ` before `*world*`).
         flushText(stack[stack.length - 1], ctx);
-        stack.push(
-          newFrame(node, contentStart, contentEnd, detailFlags, detailA, stringA, stringB),
-        );
+        const frame = newFrame(node, contentStart, contentEnd, detailFlags, detailA, stringA, stringB);
+        if (smart) {
+          frame.quotesAtOpen = ctx.quotes.delims.length;
+          frame.quoteBottomAtOpen = ctx.quotes.bottom;
+          if (!isQuoteTransparent(node)) ctx.quotes.bottom = ctx.quotes.delims.length;
+        }
+        stack.push(frame);
         break;
       }
       case P.EventKind.BlockLeave:
@@ -177,6 +195,12 @@ export function decodeFlatBuffer(
         }
         const frame = stack.pop() as Frame;
         flushText(frame, ctx);
+        if (smart) {
+          // Transparent emphasis too: cmark drops the delimiters a resolved emphasis encloses.
+          // Before the build, which copies a blocked link's or an image's label into a string.
+          dropQuotes(ctx.quotes, frame.quotesAtOpen);
+          ctx.quotes.bottom = frame.quoteBottomAtOpen;
+        }
         closeFrame(frame, stack[stack.length - 1], ctx);
         break;
       }
@@ -198,6 +222,7 @@ export function decodeFlatBuffer(
 
   const root = stack[0];
   flushText(root, ctx);
+  if (smart) dropQuotes(ctx.quotes, 0);
   return { source, blocks: root.children as Block[] };
 }
 
@@ -213,6 +238,7 @@ interface DecodeContext {
    * empty blocks like `## ` or a thematic break.
    */
   cursor: number;
+  quotes: QuoteStack;
 }
 
 // ---------------------------------------------------------------------------
@@ -343,10 +369,11 @@ function utf8Decode(bytes: Uint8Array, from: number, to: number): string {
     } else if ((lead & 0xf0) === 0xe0) {
       cp = lead & 0x0f;
       size = 3;
-    } else if ((lead & 0xf8) === 0xf0) {
+    } else if (lead >= 0xf0 && lead <= 0xf4) {
       cp = lead & 0x07;
       size = 4;
     } else {
+      // A stray continuation byte, or a lead above F4, which no code point ≤ U+10FFFF uses.
       out += '�';
       i += 1;
       continue;
@@ -355,7 +382,21 @@ function utf8Decode(bytes: Uint8Array, from: number, to: number): string {
       out += '�';
       break;
     }
-    for (let j = 1; j < size; j += 1) cp = (cp << 6) | (bytes[i + j] & 0x3f);
+    let valid = true;
+    for (let j = 1; j < size; j += 1) {
+      const byte = bytes[i + j];
+      if ((byte & 0xc0) !== 0x80) {
+        valid = false;
+        break;
+      }
+      cp = (cp << 6) | (byte & 0x3f);
+    }
+    // `fromCodePoint` throws past U+10FFFF.
+    if (!valid || cp > 0x10ffff) {
+      out += '�';
+      i += 1;
+      continue;
+    }
     out += String.fromCodePoint(cp);
     i += size;
   }
@@ -470,7 +511,7 @@ function onText(
     case P.TextKind.NullChar:
       // CommonMark renders a NUL as U+FFFD; the span still covers the one
       // source character it replaces, so the text run around it stays whole.
-      appendText(frame, synthesizeCharSpan(span, ctx, '\u0000'), '\ufffd', ctx);
+      appendText(frame, synthesizeCharSpan(span, ctx, '\u0000'), '\ufffd', ctx, null);
       break;
     case P.TextKind.Entity:
       // The span keeps covering the raw `&amp;`; the value is md4c's
@@ -482,11 +523,20 @@ function onText(
           ? ctx.strings.get(stringA)
           : decodeEntity(textOf(anchored, start, end, stringA, ctx)),
         ctx,
+        null,
       );
       break;
     default: {
       const literal = textOf(anchored, start, end, stringA, ctx);
-      appendText(frame, span, maybeSmartPunctuation(literal, span, frame, ctx), ctx);
+      // Plain prose by construction: escapes and entities arrive as their own
+      // events, and code, math and autolink URIs as their own nodes.
+      if (!ctx.options.smartPunctuation || !anchored || isEscapedSlice(ctx.source, span)) {
+        appendText(frame, span, literal, ctx, null);
+        break;
+      }
+      SCRATCH_QUOTES.length = 0;
+      const value = smartenText(literal, SCRATCH_QUOTES);
+      appendText(frame, span, value, ctx, SCRATCH_QUOTES.length > 0 ? SCRATCH_QUOTES : null);
       break;
     }
   }
@@ -573,105 +623,310 @@ function decodeEntity(raw: string): string {
  * `\*escaped\*` would decode as three text nodes whose spans skip the
  * backslashes and break the source-slice invariant.
  */
-function appendText(frame: Frame, span: SourceSpan, value: string, ctx: DecodeContext): void {
+function appendText(
+  frame: Frame,
+  span: SourceSpan,
+  value: string,
+  ctx: DecodeContext,
+  quotes: readonly ScratchQuote[] | null,
+): void {
   if (!W.isAnchored(span)) {
     if (frame.runActive) frame.runValue += value;
     return;
   }
+  let base: number;
   if (frame.runActive && W.isEscapeGap(ctx.source, frame.runEnd, span.start)) {
+    base = frame.runValue.length;
     frame.runEnd = span.end;
     frame.runValue += value;
-    return;
+  } else {
+    flushText(frame, ctx);
+    base = 0;
+    frame.runActive = true;
+    frame.runStart = W.widenEscapedTextStart(ctx.source, span.start);
+    frame.runEnd = span.end;
+    frame.runValue = value;
   }
-  flushText(frame, ctx);
-  frame.runActive = true;
-  frame.runStart = W.widenEscapedTextStart(ctx.source, span.start);
-  frame.runEnd = span.end;
-  frame.runValue = value;
+  if (quotes !== null) {
+    for (const quote of quotes) {
+      recordQuote(ctx, frame, quote.ch, span.start + quote.inIndex, base + quote.outIndex);
+    }
+  }
 }
 
-function flushText(frame: Frame, _ctx: DecodeContext): void {
+function flushText(frame: Frame, ctx: DecodeContext): void {
   if (!frame.runActive) return;
-  frame.children.push({
-    kind: 'text',
+  const node = {
+    kind: 'text' as const,
     span: { start: frame.runStart, end: frame.runEnd },
     value: frame.runValue,
-  });
+  };
+  frame.children.push(node);
+  // Only the top frame's run can be pending, so its quotes are the stack's node-less tail.
+  const quotes = ctx.quotes.delims;
+  for (let i = quotes.length - 1; i >= 0 && quotes[i].node === null; i -= 1) {
+    if (quotes[i].frame === frame) quotes[i].node = node;
+  }
   frame.runActive = false;
   frame.runValue = '';
-}
-
-/**
- * cmark `--smart` rules, applied per event slice.
- *
- * Per *slice* is what makes the exclusions fall out for free: md4c reports
- * every escape and every entity as its own text event, and code spans, math
- * and autolink URIs arrive as their own node types, so a slice that reaches
- * this function is already known to be plain prose. Nothing here has to
- * re-scan for `\'` or `&apos;` to avoid transforming it.
- */
-function maybeSmartPunctuation(
-  literal: string,
-  span: SourceSpan,
-  frame: Frame,
-  ctx: DecodeContext,
-): string {
-  if (!ctx.options.smartPunctuation) return literal;
-  if (isEscapedSlice(ctx.source, span)) return literal;
-  const before = frame.runActive && frame.runValue.length > 0
-    ? frame.runValue[frame.runValue.length - 1]
-    : undefined;
-  return applySmartPunctuation(literal, before);
 }
 
 function isEscapedSlice(source: string, span: SourceSpan): boolean {
   return span.end - span.start === 1 && span.start > 0 && source[span.start - 1] === '\\';
 }
 
+interface ScratchQuote {
+  ch: '"' | "'";
+  /** For anchored text, also the offset from `span.start`. */
+  inIndex: number;
+  outIndex: number;
+}
+
+const SCRATCH_QUOTES: ScratchQuote[] = [];
+
+interface QuoteDelim {
+  ch: '"' | "'";
+  canOpen: boolean;
+  canClose: boolean;
+  /** Holds the character: `node` once built, else `frame`'s pending run, which becomes `node`. */
+  frame: Frame | null;
+  node: { value: string } | null;
+  /** Stays valid: a flip never changes the value's length. */
+  offset: number;
+  /** Index of the unpaired opener of the same character below this one, or -1. */
+  prev: number;
+  /** Paired by a later closer; `dropQuotes` writes the opening form into `node`. */
+  opened: boolean;
+}
+
 /**
- * Exported so the typographic rules can be pinned directly, one input string
- * at a time, without first finding a document whose emphasis and punctuation
- * happen to isolate the flanking case under test. See
- * __tests__/smart-punctuation.test.ts.
+ * cmark's `subj->delimiters`, quotes only. Paired openers stay in `delims`
+ * until dropped, so indices are stable; the unpaired ones of each character
+ * form a chain through `prev`, which is all a closer has to look at.
  */
-export function applySmartPunctuation(text: string, before: string | undefined): string {
-  let out = '';
-  let prev = before;
+interface QuoteStack {
+  delims: QuoteDelim[];
+  /** A closer never pairs with an opener below this index. */
+  bottom: number;
+  /** The innermost unpaired `"` and `'` openers, or -1. */
+  lastDouble: number;
+  lastSingle: number;
+}
+
+function newQuoteStack(): QuoteStack {
+  return { delims: [], bottom: 0, lastDouble: -1, lastSingle: -1 };
+}
+
+/** A frame whose closers may still pair with openers outside it. */
+function isQuoteTransparent(node: P.NodeType): boolean {
+  return (
+    node === P.NodeType.Emphasis ||
+    node === P.NodeType.Strong ||
+    node === P.NodeType.Underline ||
+    node === P.NodeType.Strikethrough
+  );
+}
+
+/** Each quote is emitted closing; `dropQuotes` flips it when a later quote paired with it. */
+function smartenText(text: string, quotes: ScratchQuote[]): string {
   let i = 0;
+  for (; i < text.length; i += 1) {
+    const c = text.charCodeAt(i);
+    if (c === 0x22 || c === 0x27 || c === 0x2d || c === 0x2e) break;
+  }
+  if (i === text.length) return text;
+  let out = text.slice(0, i);
   while (i < text.length) {
     const ch = text[i];
     if (ch === '"' || ch === "'") {
-      const opener = prev === undefined || /[\s([{]/.test(prev);
-      out += ch === '"' ? (opener ? '“' : '”') : opener ? '‘' : '’';
-      prev = ch;
+      quotes.push({ ch, inIndex: i, outIndex: out.length });
+      out += ch === '"' ? '”' : '’';
       i += 1;
       continue;
     }
     if (ch === '-') {
       let n = 1;
       while (text[i + n] === '-') n += 1;
-      if (n === 1) {
-        out += '-';
-        prev = '-';
-        i += 1;
-        continue;
-      }
-      out += dashRun(n);
-      prev = '-';
+      out += n === 1 ? '-' : dashRun(n);
       i += n;
       continue;
     }
     if (ch === '.' && text[i + 1] === '.' && text[i + 2] === '.') {
       out += '…';
-      prev = '.';
       i += 3;
       continue;
     }
     out += ch;
-    prev = ch;
     i += 1;
   }
   return out;
+}
+
+const CAN_OPEN = 1;
+const CAN_CLOSE = 2;
+
+/** cmark's `scan_delims`, for a quote. */
+function quoteRole(before: number, after: number): number {
+  const beforeSpace = isUnicodeSpace(before);
+  const beforePunct = isUnicodePunctuation(before);
+  const afterSpace = isUnicodeSpace(after);
+  const afterPunct = isUnicodePunctuation(after);
+  const left = !afterSpace && (!afterPunct || beforeSpace || beforePunct);
+  const right = !beforeSpace && (!beforePunct || afterSpace || afterPunct);
+  const canOpen = left && (!right || before === 0x28 || before === 0x5b);
+  return (canOpen ? CAN_OPEN : 0) | (right ? CAN_CLOSE : 0);
+}
+
+/** Past either edge of the text (here and in `codePointAfter`) cmark reads a line feed. */
+function codePointBefore(text: string, pos: number): number {
+  if (pos <= 0) return 0x0a;
+  const unit = text.charCodeAt(pos - 1);
+  if (unit >= 0xdc00 && unit <= 0xdfff && pos >= 2) {
+    const high = text.charCodeAt(pos - 2);
+    if (high >= 0xd800 && high <= 0xdbff) return (high - 0xd800) * 0x400 + (unit - 0xdc00) + 0x10000;
+  }
+  return unit;
+}
+
+function codePointAfter(text: string, pos: number): number {
+  return pos >= text.length ? 0x0a : (text.codePointAt(pos) as number);
+}
+
+/** `cmark_utf8proc_is_space`: ASCII whitespace plus the Zs category. */
+function isUnicodeSpace(cp: number): boolean {
+  return (
+    cp === 0x09 ||
+    cp === 0x0a ||
+    cp === 0x0c ||
+    cp === 0x0d ||
+    cp === 0x20 ||
+    cp === 0xa0 ||
+    cp === 0x1680 ||
+    (cp >= 0x2000 && cp <= 0x200a) ||
+    cp === 0x202f ||
+    cp === 0x205f ||
+    cp === 0x3000
+  );
+}
+
+const UNICODE_PUNCTUATION = /[\p{P}\p{S}]/u;
+
+/** CommonMark's Unicode punctuation, which counts category S (symbols). */
+function isUnicodePunctuation(cp: number): boolean {
+  if (cp < 0x80) {
+    return (
+      (cp >= 0x21 && cp <= 0x2f) ||
+      (cp >= 0x3a && cp <= 0x40) ||
+      (cp >= 0x5b && cp <= 0x60) ||
+      (cp >= 0x7b && cp <= 0x7e)
+    );
+  }
+  return UNICODE_PUNCTUATION.test(String.fromCodePoint(cp));
+}
+
+/** Flanking reads the raw source, not the rewritten text, as cmark does. */
+function recordQuote(
+  ctx: DecodeContext,
+  frame: Frame,
+  ch: '"' | "'",
+  sourcePos: number,
+  offset: number,
+): void {
+  const role = quoteRole(
+    codePointBefore(ctx.source, sourcePos),
+    codePointAfter(ctx.source, sourcePos + 1),
+  );
+  if (role === 0) return;
+  resolveQuote(ctx.quotes, {
+    ch,
+    canOpen: (role & CAN_OPEN) !== 0,
+    canClose: (role & CAN_CLOSE) !== 0,
+    frame,
+    node: null,
+    offset,
+    prev: -1,
+    opened: false,
+  });
+}
+
+/**
+ * cmark's `process_emphasis` step for one quote delimiter. Only the chain's
+ * head can pair: scanning the stack instead was quadratic on `"a "a … b' b'`.
+ */
+function resolveQuote(stack: QuoteStack, delim: QuoteDelim): void {
+  const double = delim.ch === '"';
+  const last = double ? stack.lastDouble : stack.lastSingle;
+  if (delim.canClose) {
+    if (last >= stack.bottom) {
+      const opener = stack.delims[last];
+      opener.opened = true;
+      if (double) stack.lastDouble = opener.prev;
+      else stack.lastSingle = opener.prev;
+      return;
+    }
+    if (!delim.canOpen) return;
+  }
+  delim.prev = last;
+  const index = stack.delims.push(delim) - 1;
+  if (double) stack.lastDouble = index;
+  else stack.lastSingle = index;
+}
+
+/**
+ * Drops the delimiters from `from` up, first writing each paired opener into
+ * its node, one rebuild per node: flipping each in place as it paired copied
+ * the whole run per quote, quadratic on one long paragraph. Every delimiter
+ * dropped has a node, because the frame that owned its run was flushed first.
+ */
+function dropQuotes(stack: QuoteStack, from: number): void {
+  const { delims } = stack;
+  while (stack.lastDouble >= from) stack.lastDouble = delims[stack.lastDouble].prev;
+  while (stack.lastSingle >= from) stack.lastSingle = delims[stack.lastSingle].prev;
+  let i = from;
+  while (i < delims.length) {
+    const node = delims[i].node as { value: string };
+    let value = '';
+    let copied = 0;
+    // A node's delimiters are contiguous: its run ended when any child frame opened.
+    for (; i < delims.length && delims[i].node === node; i += 1) {
+      const delim = delims[i];
+      if (!delim.opened) continue;
+      value += node.value.slice(copied, delim.offset) + (delim.ch === '"' ? '“' : '‘');
+      copied = delim.offset + 1;
+    }
+    if (copied > 0) node.value = value + node.value.slice(copied);
+  }
+  delims.length = from;
+}
+
+/** Smart punctuation over `text` alone, as a whole paragraph; `before` is the character preceding it. */
+export function applySmartPunctuation(text: string, before: string | undefined): string {
+  const quotes: ScratchQuote[] = [];
+  const out = smartenText(text, quotes);
+  if (quotes.length === 0) return out;
+  const holder = { value: out };
+  const stack = newQuoteStack();
+  const beforeStart =
+    before === undefined || before.length === 0 ? 0x0a : (before.codePointAt(0) as number);
+  for (const quote of quotes) {
+    const role = quoteRole(
+      quote.inIndex === 0 ? beforeStart : codePointBefore(text, quote.inIndex),
+      codePointAfter(text, quote.inIndex + 1),
+    );
+    if (role === 0) continue;
+    resolveQuote(stack, {
+      ch: quote.ch,
+      canOpen: (role & CAN_OPEN) !== 0,
+      canClose: (role & CAN_CLOSE) !== 0,
+      frame: null,
+      node: holder,
+      offset: quote.outIndex,
+      prev: -1,
+      opened: false,
+    });
+  }
+  dropQuotes(stack, 0);
+  return holder.value;
 }
 
 /** A run divisible by 3 is all em dashes, else by 2 all en, else mixed. */
@@ -766,7 +1021,13 @@ function buildFrame(frame: Frame, parent: Frame, ctx: DecodeContext): void {
       const fenceChar = frame.detailA === 0 ? null : String.fromCharCode(frame.detailA);
       // Without `!located` the widener searches the line above and finds the
       // previous block's closing fence.
-      const { span: widened, closed } = W.widenCodeBlock(source, span, fenceChar, !located);
+      const { span: widened, closed } = W.widenCodeBlock(
+        source,
+        span,
+        fenceChar,
+        !located,
+        (frame.detailFlags & P.DETAIL_FENCE_CLOSED) !== 0,
+      );
       // Already decoded by md4c; see the Link case.
       const language = frame.stringA >= 0 ? ctx.strings.get(frame.stringA).trim() : '';
       push(parent, {
@@ -1015,8 +1276,14 @@ function buildFrame(frame: Frame, parent: Frame, ctx: DecodeContext): void {
 
     default:
       // Unknown node type (defensive: the enabled flags cannot produce one).
-      // Hoisting its children keeps their content rather than dropping it.
-      for (const child of children) push(parent, child);
+      // Children are hoisted, not dropped; a block container must not hold bare inlines.
+      if (parent.node === P.NodeType.Document || parent.node === P.NodeType.Blockquote) {
+        for (const block of wrapLooseInlines(children)) {
+          if (W.isAnchored(block.span)) push(parent, block);
+        }
+      } else {
+        for (const child of children) push(parent, child);
+      }
       return;
   }
 }

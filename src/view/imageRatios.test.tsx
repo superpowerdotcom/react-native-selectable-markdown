@@ -1,6 +1,10 @@
 import React, { StrictMode } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { SelectableMarkdown } from './SelectableMarkdown';
+import { StreamSession } from '../stream/StreamSession';
+import { presets } from '../engine/options';
+import type { Engine } from '../engine/Engine';
+import { nativeEngine } from '../engine/native';
 import { describeNative, linkNativeEngineAsDefault } from '../engine/native/__tests__/support';
 
 type SizeCall = {
@@ -126,5 +130,38 @@ describeNative('intrinsic image ratios', () => {
     await act(() => calls[0].fail(new Error('404')));
     const again = await render(<SelectableMarkdown source={doc(src)} images={IMAGES} />);
     expect(embedHeights(again)).toEqual([FALLBACK]);
+  });
+
+  test('a failed request is not repeated on later streaming snapshots', async () => {
+    const src = freshUrl();
+    const session = new StreamSession({ options: presets.llmChat });
+    const tree = await render(<SelectableMarkdown session={session} images={IMAGES} />);
+    await act(() => session.append(`![a](${src})\n\nText starts here`));
+    const calls = mockSizeCalls.filter((call) => call.src === src);
+    expect(calls).toHaveLength(1);
+    await act(() => calls[0].fail(new Error('404')));
+    for (let i = 0; i < 25; i += 1) {
+      await act(() => session.append(` word${i}`));
+    }
+    expect(mockSizeCalls.filter((call) => call.src === src)).toHaveLength(1);
+    expect(embedHeights(tree)).toEqual([FALLBACK]);
+  });
+
+  test('a src with a newline from an engine that skips the URL policy is not split into requests', async () => {
+    const src = `${freshUrl()}\nhttps://e.test/second.png`;
+    const engine: Engine = {
+      name: 'newline-src',
+      parse(source, options) {
+        const parsed = nativeEngine.parse(source, options);
+        const blocks = parsed.blocks.map((block) =>
+          block.kind === 'paragraph' && block.children[0]?.kind === 'image'
+            ? { ...block, children: [{ ...block.children[0], src }] }
+            : block,
+        );
+        return { ...parsed, blocks };
+      },
+    };
+    await render(<SelectableMarkdown source={doc(freshUrl())} images={IMAGES} engine={engine} />);
+    expect(mockSizeCalls).toEqual([]);
   });
 });

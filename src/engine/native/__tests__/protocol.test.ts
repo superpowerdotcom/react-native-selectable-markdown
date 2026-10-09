@@ -147,6 +147,7 @@ const MIRRORED: Readonly<Record<string, number>> = {
   kDetailTaskMask: P.DETAIL_TASK_MASK,
   kDetailAlignShift: P.DETAIL_ALIGN_SHIFT,
   kDetailAlignMask: P.DETAIL_ALIGN_MASK,
+  kDetailFenceClosed: P.DETAIL_FENCE_CLOSED,
 
   kExtTables: P.EXT_TABLES,
   kExtStrikethrough: P.EXT_STRIKETHROUGH,
@@ -609,5 +610,85 @@ describeNative('a buffer that reports failure is refused, not decoded', () => {
     h[P.HEADER_EVENT_COUNT] -= 2;
     expect(() => decodeFlatBuffer(SOURCE, buffer, OPTIONS)).toThrow(NativeProtocolError);
     expect(() => decodeFlatBuffer(SOURCE, buffer, OPTIONS)).toThrow(/still open/);
+  });
+});
+
+/** The shipped encoder cannot produce any of this; a decoder that trusted it would crash or return wrong spans. */
+describeNative('damage inside the event list and string table', () => {
+  const OPTIONS = resolveOptions(presets.commonmark);
+
+  function bufferFor(source: string): ArrayBuffer {
+    return nativeAddonOrNull()!.parse(source, 0, P.HTML_PARSED).slice(0);
+  }
+
+  function eventByteOffset(buffer: ArrayBuffer, i: number): number {
+    const h = new Uint32Array(buffer, 0, P.HEADER_SIZE / 4);
+    return h[P.HEADER_EVENTS_OFFSET] + i * P.EVENT_SIZE;
+  }
+
+  /** Without `node`, matches any node type. */
+  function findEvent(buffer: ArrayBuffer, kind: number, node?: number, from = 0): number {
+    const h = new Uint32Array(buffer, 0, P.HEADER_SIZE / 4);
+    const bytes = new Uint8Array(buffer);
+    for (let i = from; i < h[P.HEADER_EVENT_COUNT]; i += 1) {
+      const at = eventByteOffset(buffer, i);
+      if (bytes[at + P.EVENT_KIND] !== kind) continue;
+      if (node === undefined || bytes[at + P.EVENT_NODE] === node) return i;
+    }
+    throw new Error(`no event kind=${kind} node=${node ?? 'any'}`);
+  }
+
+  /** The event record as u32 words; index fields with `P.EVENT_* / 4`. */
+  function eventWords(buffer: ArrayBuffer, i: number): Uint32Array {
+    return new Uint32Array(buffer, eventByteOffset(buffer, i), P.EVENT_SIZE / 4);
+  }
+
+  test('an event range past the end of the source throws a protocol error', () => {
+    const source = 'hello world\n';
+    const buffer = bufferFor(source);
+    const words = eventWords(buffer, findEvent(buffer, P.EventKind.Text));
+    words[P.EVENT_END / 4] = source.length + 1000;
+    expect(() => decodeFlatBuffer(source, buffer, OPTIONS)).toThrow(NativeProtocolError);
+    expect(() => decodeFlatBuffer(source, buffer, OPTIONS)).toThrow(/UTF-16 units/);
+  });
+
+  test('a reversed event range throws rather than decoding backwards', () => {
+    const source = 'hello world\n';
+    const buffer = bufferFor(source);
+    const words = eventWords(buffer, findEvent(buffer, P.EventKind.Text));
+    const start = P.EVENT_START / 4;
+    const end = P.EVENT_END / 4;
+    [words[start], words[end]] = [words[end], words[start]];
+    expect(() => decodeFlatBuffer(source, buffer, OPTIONS)).toThrow(NativeProtocolError);
+  });
+
+  test('a string that is not UTF-8 decodes to U+FFFD instead of throwing', () => {
+    // `é` is C3 A9 in the string table; F5 is a lead byte no code point uses.
+    const source = '[a](https://e.com/é)\n';
+    const buffer = bufferFor(source);
+    const h = new Uint32Array(buffer, 0, P.HEADER_SIZE / 4);
+    const strings = new Uint8Array(buffer, h[P.HEADER_STRING_BYTES_OFFSET], h[P.HEADER_STRING_BYTES_LENGTH]);
+    const at = strings.findIndex((byte, i) => byte === 0xc3 && strings[i + 1] === 0xa9);
+    expect(at).toBeGreaterThan(-1);
+    strings[at] = 0xf5;
+    const doc = decodeFlatBuffer(source, buffer, resolveOptions(presets.llmChat));
+    const [link] = (doc.blocks[0] as { children: { href: string }[] }).children;
+    expect(link.href).toBe('https://e.com/��');
+  });
+
+  test('an unknown node type under the document wraps its inlines in a paragraph', () => {
+    const source = '# Title\n\nfirst paragraph\n';
+    const buffer = bufferFor(source);
+    const bytes = new Uint8Array(buffer);
+    const enter = findEvent(buffer, P.EventKind.BlockEnter, P.NodeType.Paragraph);
+    const leave = findEvent(buffer, P.EventKind.BlockLeave, P.NodeType.Paragraph, enter);
+    bytes[eventByteOffset(buffer, enter) + P.EVENT_NODE] = P.NodeType.Unknown;
+    bytes[eventByteOffset(buffer, leave) + P.EVENT_NODE] = P.NodeType.Unknown;
+    const doc = decodeFlatBuffer(source, buffer, OPTIONS);
+    expect(doc.blocks.map((b) => b.kind)).toEqual(['heading', 'paragraph']);
+    expect(doc.blocks[1]).toMatchObject({
+      span: { start: 9, end: 24 },
+      children: [{ kind: 'text', value: 'first paragraph' }],
+    });
   });
 });

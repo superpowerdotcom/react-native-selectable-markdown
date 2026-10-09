@@ -1,4 +1,6 @@
 import { parseDocument } from './Engine';
+import { applyHtmlSubset } from './htmlSubset';
+import { resolveOptions } from './options';
 import { describeNative, linkNativeEngineAsDefault } from './native/__tests__/support';
 import { projectRun } from '../selection/mapSelection';
 import { segmentRuns } from '../selection/runs';
@@ -35,12 +37,36 @@ describeNative('html: { allow }', () => {
     ]);
   });
 
+  test('only unlisted tags under other: raw leave the document untouched', () => {
+    const raw = parseDocument('a <span>*b*</span>\n', { html: 'raw' });
+    expect(applyHtmlSubset(raw, resolveOptions({ html: { allow: ['br'], other: 'raw' } }))).toBe(raw);
+  });
+
   test('a line opening with <br> keeps the text after it', () => {
     expect(parseDocument('<br>\nafter text\n', subset).blocks.map(shape)).toEqual([
       ['paragraph', [['text', 'after text']]],
     ]);
     // Without the allow-list, strip drops the whole HTML block, text included.
     expect(parseDocument('<br>\nafter text\n', { html: 'strip' }).blocks).toEqual([]);
+  });
+
+  test('inline nesting as deep as the source likes does not overflow the stack', () => {
+    const depth = 20_000;
+    const nested = `${'*'.repeat(depth)}x${'*'.repeat(depth)}`;
+    const doc = parseDocument(`<b>${nested}</b> <code>${nested}</code>\n`, {
+      html: { allow: ['b', 'code'] },
+    });
+    const [strong, , code] = (doc.blocks[0] as { children: AnyNode[] }).children;
+    expect(strong.kind).toBe('strong');
+    expect(code).toMatchObject({ kind: 'codeSpan', value: 'x' });
+  });
+
+  test('a long whitespace run before text in an HTML block costs linear time', () => {
+    const source = `<b>\n${' '.repeat(40_000)}x\n`;
+    const started = performance.now();
+    const doc = parseDocument(source, subset);
+    expect(performance.now() - started).toBeLessThan(50);
+    expect(doc.blocks.map(shape)).toEqual([['paragraph', [['text', `${' '.repeat(40_000)}x`]]]]);
   });
 
   test('spans stay exact, so the projection maps back to the source', () => {

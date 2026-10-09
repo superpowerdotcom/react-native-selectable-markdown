@@ -5281,6 +5281,7 @@ abort:
 #define MD_BLOCK_CONTAINER          (MD_BLOCK_CONTAINER_OPENER | MD_BLOCK_CONTAINER_CLOSER)
 #define MD_BLOCK_LOOSE_LIST         0x04
 #define MD_BLOCK_SETEXT_HEADER      0x08
+#define MD_BLOCK_FENCE_CLOSED       0x10    /* MD_BLOCK_CODE: a closing fence ended it (local patch 0001) */
 
 struct MD_BLOCK_tag {
     MD_BLOCKTYPE type  :  8;
@@ -5487,6 +5488,7 @@ md_process_leaf_block(MD_CTX* ctx, MD_BLOCK* block)
                 memset(&det.code, 0, sizeof(MD_BLOCK_CODE_DETAIL));
                 clean_fence_code_detail = TRUE;
                 MD_CHECK(md_setup_fenced_code_detail(ctx, block, &det.code, &info_build, &lang_build));
+                det.code.fence_closed = (block->flags & MD_BLOCK_FENCE_CLOSED) ? 1 : 0;  /* local patch 0001 */
             }
             break;
 
@@ -6592,6 +6594,11 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
                 if(md_is_closing_code_fence(ctx, CH(pivot_line->beg), off, &off)) {
                     line->type = MD_LINE_BLANK;
                     ctx->last_line_has_list_loosening_effect = FALSE;
+                    /* Local patch 0001: remember that a fence, not a container's
+                     * end, closed the block. md_process_line() ends the block on
+                     * this (retyped) blank line, so current_block is still it. */
+                    if(ctx->current_block != NULL  &&  ctx->current_block->type == MD_BLOCK_CODE)
+                        ctx->current_block->flags |= MD_BLOCK_FENCE_CLOSED;
                     break;
                 }
             }

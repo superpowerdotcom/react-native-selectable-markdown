@@ -77,8 +77,17 @@ jobs:
       - run: npm run check:swift
       - run: npm run check:swift:selftest
 
+  # Release-only; ci.yml does not run it. Packs the tarball into a fresh React
+  # Native app and builds it: Kotlin, the NDK and CMake seam, CocoaPods, and
+  # every Swift and Objective-C++ file in the pod. 0.13.1 shipped a Kotlin
+  # error that failed every Android build, which no gate here would have seen.
+  native-build:
+    name: Native app build
+    needs: preflight
+    uses: ./.github/workflows/native-build.yml
+
   release:
-    needs: macos-gates
+    needs: [macos-gates, native-build]
     runs-on: ubuntu-latest
     permissions:
       contents: write # attach the packed tarball to the GitHub release

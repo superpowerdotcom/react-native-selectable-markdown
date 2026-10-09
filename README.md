@@ -401,6 +401,8 @@ npm run conformance      # CommonMark score, written to conformance/report-nativ
 npm run bench:all
 npm run verify:pack      # the packed tarball loads
 npm run check:codegen && npm run check:fabric-cpp && npm run check:swift
+npm run check:app:android  # builds a fresh RN app with the packed tarball (JDK 17 + Android SDK)
+npm run check:app:ios      # the same through CocoaPods and xcodebuild (macOS)
 ```
 
 Without a compiler the native suites report as skipped, not passed. CI, the release workflow and `npm run release` all build the addon as a hard gate before the suite runs; `npm run release -- --skip-tests` opts out of the build and the suite together, and says so. See [native/node/README.md](native/node/README.md).

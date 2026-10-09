@@ -173,6 +173,30 @@ describeNative('smart punctuation through the engine', () => {
     expect((inlines(doc)[1] as { children: Inline[] }).children[0]).toMatchObject({ value: 'b” c' });
   });
 
+  test('quotes after an emphasis that paired across it still resolve', () => {
+    // Pairing used to splice the outer opener out, shifting the indices the emphasis restored on leave.
+    const doc = parse('"a *b" c* d"\n');
+    expect(inlines(doc)[0]).toMatchObject({ value: '“a ' });
+    expect((inlines(doc)[1] as { children: Inline[] }).children[0]).toMatchObject({ value: 'b” c' });
+    expect(inlines(doc)[2]).toMatchObject({ value: ' d”' });
+    const mixed = parse('\'a "b *c\' d* e" f\'\n');
+    expect(inlines(mixed)[0]).toMatchObject({ value: '‘a “b ' });
+    expect((inlines(mixed)[1] as { children: Inline[] }).children[0]).toMatchObject({ value: 'c’ d' });
+    expect(inlines(mixed)[2]).toMatchObject({ value: ' e” f’' });
+  });
+
+  test('an image alt and a blocked link label carry their opened quotes', () => {
+    // Both copy their label into a string when built, so the openers must be written by then.
+    expect(inlines(parse('!["a" *b*](https://e.com/i.png)\n'))[0]).toMatchObject({
+      kind: 'image',
+      alt: '“a” b',
+    });
+    expect(inlines(parse('["a" b](javascript:alert)\n'))[0]).toMatchObject({
+      kind: 'text',
+      value: '“a” b',
+    });
+  });
+
   test('an opener inside a resolved emphasis cannot pair past it', () => {
     // cmark drops every delimiter inside a resolved emphasis, so the `"` opened there is gone.
     const doc = parse('*a "b* c"\n');

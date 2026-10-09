@@ -1076,15 +1076,21 @@ did not prove what was claimed, §0.1 names the replacement.
 ### What is still not proven here, and what that means
 
 This shipped native code that was not executed on this machine: no simulator,
-no Android SDK, no example app, no `Pods/`. Reviewed, not verified:
+no Android SDK, no example app, no `Pods/`. `native-build.yml` now compiles all
+of it inside a fresh React Native app (below), which settles compilation and
+nothing about behaviour. Reviewed, not verified:
 
-- **Every line of Objective-C++ in the mounting layer.**
+- **The Objective-C++ mounting layer at runtime.**
   `RCTSelectableRunHostComponentView.mm`, `RNSMAttributedText.mm`,
   `RNSMTextKitStack.mm`, `RNSMRunTextMeasurer.mm` and
-  `SelectableMarkdownModule.mm`; `check:fabric-cpp` names each on every run.
+  `SelectableMarkdownModule.mm` compile in the iOS app build; none has run.
   `RNSMTextKitStack.mm` holds the single function iOS measure/draw agreement
   rests on.
-- **All Kotlin.** Two of §0.1's defects were Kotlin, found by reading.
+- **Kotlin at runtime.** It compiles in the Android app build, which also runs
+  the JVM unit tests; nothing else has run. Two of §0.1's defects were Kotlin,
+  found by reading. Two more were compile errors that shipped before the build
+  existed: 0.13.1's undefined `pressed`, and a `textClassifier` assignment that
+  every release carried and Kotlin 2 rejects.
 - **The measure/draw agreement tests of §4.3.** The single most important
   behavioural property, unexecuted.
 - **The clean-clone guard's effect.** It compiles; nothing here proves it
@@ -1093,10 +1099,10 @@ no Android SDK, no example app, no `Pods/`. Reviewed, not verified:
   not this class for its use of one — which is how §0.1's regression got in,
   and why the two source mutations in the self-test pin the tripwire rather
   than the behaviour.
-- **`pod install`.** Never run. The umbrella-header hazard of §2.2 surfaces
-  there.
-- **The Android CMake seam.** Its four configure-time assertions fire in an
-  app, the earliest any of it is exercised.
+- **The Android CMake seam's effect.** Its configure-time assertions pass in
+  the app build and the seam compiles into `libappmodules.so`; whether the app
+  registers the measuring descriptor rather than codegen's is visible only at
+  runtime.
 - **Recycling.** Only reachable in a running app with enough content to
   scroll.
 - **RN 0.73, 0.74, 0.76+.** Source-verified at the endpoints; built against
@@ -1106,18 +1112,24 @@ no Android SDK, no example app, no `Pods/`. Reviewed, not verified:
 - **The Android selection gap of §0.1.** Reproducible in Node; what a dropped
   `ActionMode` looks like to a user needs a device.
 
-**The gating prerequisite is an example app**: a minimal RN 0.82 app with
-`newArchEnabled` toggleable, plus `xcodebuild` and `./gradlew assembleDebug`
-smoke targets in CI. Until then the Fabric path is reviewed, not exercised.
+**The app build gates the release; an app that runs is not.** `native-build.yml`
+runs on a release tag, not on pull requests, and `npm publish` waits for it
+(`gh workflow run native-build.yml --ref <branch>` runs it before tagging). It
+packs the tarball, installs it into a fresh React Native app at the version
+this repository develops against, and builds it: `./gradlew assembleDebug`
+plus the library's JVM unit tests on ubuntu, `pod install` plus a simulator
+`xcodebuild` on macOS (`npm run check:app:android`, `check:app:ios` locally).
+The Fabric path is compiled, not exercised, until something runs it on a
+simulator or device.
 
 Everything that can run automatically does. `ci.yml` runs the JS gates and the
 codegen gate on ubuntu, the Fabric C++ gate and self-test plus the engine's own
 C++20 pass on ubuntu *and* macOS (only an Apple SDK can see the iOS header
-set), and the Swift gate on macOS. `release.yml` is three jobs: `preflight`
+set), and the Swift gate on macOS. `release.yml` is four jobs: `preflight`
 (tag versus `package.json`, lockfile mirrors the manifest, a `CHANGELOG.md`
 section for the tag — all cheap, no `npm ci`), `macos-gates` (both header sets
 and their self-test, the engine pass, `check:swift` and its self-test under
-`RNSM_REQUIRE_SWIFT=1`) and `release` (the ubuntu gates, the addon build,
+`RNSM_REQUIRE_SWIFT=1`), `native-build` (the Android and iOS app builds, which CI does not run) and `release` (the ubuntu gates, the addon build,
 `npm test`, `verify:pack`, the pathological budget, pack, GitHub release,
 `npm publish --provenance`). The macOS gates are no longer skipped on the
 grounds that CI already ran them: the trigger is `push: tags: ['v*']` with no

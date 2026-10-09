@@ -4,7 +4,10 @@ Versions follow [semver](https://semver.org/); pre-1.0, breaking changes land in
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-10-09
+
 - Fix (Android): `SelectableRunHostView.kt` referenced an undefined `pressed` in `pressableBounds`, so every app on 0.13.1 failed Kotlin compilation.
+- Fix (Android): `SelectableRunHostView.kt` assigned `textView.textClassifier`, which Kotlin 2 imports as read-only (`@NonNull` getter, `@Nullable` setter), so every release so far failed to compile under Kotlin 2.x, the default in React Native 0.82's app template.
 - Fix (engine): the closing-fence search after fenced code no longer backtracks exponentially on a line of `> ` markers (a 59-byte message took seconds, 35 markers took minutes), and no longer takes a later sibling's or a top-level fence as the closer of a block its container ended, which produced overlapping spans and an unanchored code block. md4c now reports whether a fence closed the block (vendored patch 0001, `kDetailFenceClosed` on the wire; the protocol version is unchanged).
 - Fix (engine): link tails are scanned by the link grammar instead of to the balancing bracket, so reference links each followed by a lone `(` or an unterminated title cost linear time (100 kB: 2.4 s to 92 ms).
 - Fix (engine): a thematic break inside a list item or blockquote (`- ***`, `> ***`) gets its real span instead of a zero-width one, and the span sweep no longer tolerates a zero-width rule.
@@ -16,7 +19,7 @@ Versions follow [semver](https://semver.org/); pre-1.0, breaking changes land in
 - Streaming: under `hideUriLikeLabels`, a label ending in a bare `scheme:` stays visible until its `/` arrives; `isUriLikeLabel('fhir:')` is false.
 - Fix (view): measuring a `height: 'auto'` embed no longer reprojects and re-renders every run; a failed `Image.getSize` is not retried on every streaming snapshot; decoration inset resolution is O(n log n) in marks (8,000-item list: 111 ms to 2 ms); non-finite theme numbers are dropped before the bridge.
 - iOS: a snapshot no longer pays a full attributed-string compare and copy before the splice.
-- Packaging: `dist/view/codeBlocks` resolves under the `react-native` condition; the podspec declares iOS 15.1, React Native 0.82's floor; `npm run release` and the release workflow refuse a BREAKING entry under a version that is not a minor bump; CI pins `node-gyp`.
+- Packaging: `dist/view/codeBlocks` resolves under the `react-native` condition; the podspec declares iOS 15.1, React Native 0.82's floor; `npm run release` and the release workflow refuse a BREAKING entry under a version that is not a minor bump; CI pins `node-gyp`. Before publishing, the release workflow installs the packed tarball into a fresh React Native app and builds it on Android (Gradle, plus the Kotlin unit tests) and iOS (CocoaPods, xcodebuild); `npm run check:app:android` and `check:app:ios` run the same build locally.
 - Docs: a standalone list is one `<Text>` whose markers copy (0.13.1's notes said otherwise); the selection-menu items never write the clipboard; `native/node` ships in the tarball; the theme has an `html` group and `html` takes an object form; open-ended HTML blocks under `'strip'`; corrected widening examples and test counts.
 
 ## [0.13.1] — 2026-10-02

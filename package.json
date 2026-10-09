@@ -1,6 +1,6 @@
 {
   "name": "react-native-selectable-markdown",
-  "version": "0.13.1",
+  "version": "0.14.0",
   "description": "Streaming-first CommonMark + GFM markdown renderer for React Native with document-grade text selection: every rendered character maps back to an exact UTF-16 range of the source.",
   "license": "MIT",
   "private": false,
@@ -349,6 +349,8 @@
     "check:fabric-cpp:selftest": "node scripts/check-fabric-cpp.mjs --selftest",
     "check:swift": "node scripts/check-swift.mjs",
     "check:swift:selftest": "node scripts/check-swift.mjs --selftest",
+    "check:app:android": "scripts/build-test-app.sh android",
+    "check:app:ios": "scripts/build-test-app.sh ios",
     "conformance": "node conformance/run-commonmark.mjs",
     "bench:throughput": "node bench/throughput.mjs",
     "bench:pathological": "node bench/pathological.mjs",

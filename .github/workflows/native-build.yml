@@ -1,0 +1,48 @@
+name: Native app build
+
+# A release gate, not a per-PR check: release.yml calls it and publishes only
+# if both builds pass. To build a branch before tagging it, run
+# `gh workflow run native-build.yml --ref <branch>` (or use the Actions tab).
+# scripts/build-test-app.sh does the work and runs the same way locally
+# (`npm run check:app:android`, `npm run check:app:ios`).
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Android app (Kotlin, NDK, CMake seam)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      # React Native 0.82's Gradle and AGP want JDK 17; the image default can move.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      # Caches ~/.gradle (wrapper, react-android, Kotlin); the app itself is regenerated.
+      - uses: gradle/actions/setup-gradle@v4
+      # npm pack runs prepare, which needs the dev dependencies.
+      - run: npm ci
+      - run: npm run check:app:android
+
+  ios:
+    name: iOS app (CocoaPods, Swift, Objective-C++)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run check:app:ios

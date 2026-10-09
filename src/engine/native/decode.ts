@@ -142,7 +142,7 @@ export function decodeFlatBuffer(
   const header = readHeader(buffer, source);
   const words = new Uint32Array(buffer, header.eventsOffset, header.eventCount * 6);
   const strings = new StringTable(buffer, header);
-  const ctx: DecodeContext = { source, options, strings, cursor: 0, quotes: [], quoteBottom: 0 };
+  const ctx: DecodeContext = { source, options, strings, cursor: 0, quotes: newQuoteStack() };
   const smart = options.smartPunctuation;
 
   const stack: Frame[] = [newFrame(P.NodeType.Document, -1, -1, 0, 0, -1, -1)];
@@ -180,9 +180,9 @@ export function decodeFlatBuffer(
         flushText(stack[stack.length - 1], ctx);
         const frame = newFrame(node, contentStart, contentEnd, detailFlags, detailA, stringA, stringB);
         if (smart) {
-          frame.quotesAtOpen = ctx.quotes.length;
-          frame.quoteBottomAtOpen = ctx.quoteBottom;
-          if (!isQuoteTransparent(node)) ctx.quoteBottom = ctx.quotes.length;
+          frame.quotesAtOpen = ctx.quotes.delims.length;
+          frame.quoteBottomAtOpen = ctx.quotes.bottom;
+          if (!isQuoteTransparent(node)) ctx.quotes.bottom = ctx.quotes.delims.length;
         }
         stack.push(frame);
         break;
@@ -195,12 +195,13 @@ export function decodeFlatBuffer(
         }
         const frame = stack.pop() as Frame;
         flushText(frame, ctx);
-        closeFrame(frame, stack[stack.length - 1], ctx);
         if (smart) {
           // Transparent emphasis too: cmark drops the delimiters a resolved emphasis encloses.
-          ctx.quotes.length = frame.quotesAtOpen;
-          ctx.quoteBottom = frame.quoteBottomAtOpen;
+          // Before the build, which copies a blocked link's or an image's label into a string.
+          dropQuotes(ctx.quotes, frame.quotesAtOpen);
+          ctx.quotes.bottom = frame.quoteBottomAtOpen;
         }
+        closeFrame(frame, stack[stack.length - 1], ctx);
         break;
       }
       case P.EventKind.Text: {
@@ -221,6 +222,7 @@ export function decodeFlatBuffer(
 
   const root = stack[0];
   flushText(root, ctx);
+  if (smart) dropQuotes(ctx.quotes, 0);
   return { source, blocks: root.children as Block[] };
 }
 
@@ -236,9 +238,7 @@ interface DecodeContext {
    * empty blocks like `## ` or a thematic break.
    */
   cursor: number;
-  /** cmark's `subj->delimiters`, quotes only; a closer never looks below `quoteBottom`. */
-  quotes: QuoteDelim[];
-  quoteBottom: number;
+  quotes: QuoteStack;
 }
 
 // ---------------------------------------------------------------------------
@@ -663,7 +663,7 @@ function flushText(frame: Frame, ctx: DecodeContext): void {
   };
   frame.children.push(node);
   // Only the top frame's run can be pending, so its quotes are the stack's node-less tail.
-  const quotes = ctx.quotes;
+  const quotes = ctx.quotes.delims;
   for (let i = quotes.length - 1; i >= 0 && quotes[i].node === null; i -= 1) {
     if (quotes[i].frame === frame) quotes[i].node = node;
   }
@@ -688,11 +688,33 @@ interface QuoteDelim {
   ch: '"' | "'";
   canOpen: boolean;
   canClose: boolean;
-  /** Holds the character: `node` once built, else `frame`'s pending run. */
+  /** Holds the character: `node` once built, else `frame`'s pending run, which becomes `node`. */
   frame: Frame | null;
   node: { value: string } | null;
   /** Stays valid: a flip never changes the value's length. */
   offset: number;
+  /** Index of the unpaired opener of the same character below this one, or -1. */
+  prev: number;
+  /** Paired by a later closer; `dropQuotes` writes the opening form into `node`. */
+  opened: boolean;
+}
+
+/**
+ * cmark's `subj->delimiters`, quotes only. Paired openers stay in `delims`
+ * until dropped, so indices are stable; the unpaired ones of each character
+ * form a chain through `prev`, which is all a closer has to look at.
+ */
+interface QuoteStack {
+  delims: QuoteDelim[];
+  /** A closer never pairs with an opener below this index. */
+  bottom: number;
+  /** The innermost unpaired `"` and `'` openers, or -1. */
+  lastDouble: number;
+  lastSingle: number;
+}
+
+function newQuoteStack(): QuoteStack {
+  return { delims: [], bottom: 0, lastDouble: -1, lastSingle: -1 };
 }
 
 /** A frame whose closers may still pair with openers outside it. */
@@ -705,7 +727,7 @@ function isQuoteTransparent(node: P.NodeType): boolean {
   );
 }
 
-/** Each quote is emitted closing; `openQuote` flips it when a later quote pairs with it. */
+/** Each quote is emitted closing; `dropQuotes` flips it when a later quote paired with it. */
 function smartenText(text: string, quotes: ScratchQuote[]): string {
   let i = 0;
   for (; i < text.length; i += 1) {
@@ -815,41 +837,66 @@ function recordQuote(
     codePointAfter(ctx.source, sourcePos + 1),
   );
   if (role === 0) return;
-  resolveQuote(ctx.quotes, ctx.quoteBottom, {
+  resolveQuote(ctx.quotes, {
     ch,
     canOpen: (role & CAN_OPEN) !== 0,
     canClose: (role & CAN_CLOSE) !== 0,
     frame,
     node: null,
     offset,
+    prev: -1,
+    opened: false,
   });
 }
 
-/** cmark's `process_emphasis` step for one quote delimiter. */
-function resolveQuote(stack: QuoteDelim[], bottom: number, delim: QuoteDelim): void {
+/**
+ * cmark's `process_emphasis` step for one quote delimiter. Only the chain's
+ * head can pair: scanning the stack instead was quadratic on `"a "a … b' b'`.
+ */
+function resolveQuote(stack: QuoteStack, delim: QuoteDelim): void {
+  const double = delim.ch === '"';
+  const last = double ? stack.lastDouble : stack.lastSingle;
   if (delim.canClose) {
-    for (let i = stack.length - 1; i >= bottom; i -= 1) {
-      const opener = stack[i];
-      if (opener.ch === delim.ch && opener.canOpen) {
-        openQuote(opener);
-        stack.splice(i, 1);
-        return;
-      }
+    if (last >= stack.bottom) {
+      const opener = stack.delims[last];
+      opener.opened = true;
+      if (double) stack.lastDouble = opener.prev;
+      else stack.lastSingle = opener.prev;
+      return;
     }
     if (!delim.canOpen) return;
   }
-  stack.push(delim);
+  delim.prev = last;
+  const index = stack.delims.push(delim) - 1;
+  if (double) stack.lastDouble = index;
+  else stack.lastSingle = index;
 }
 
-function openQuote(delim: QuoteDelim): void {
-  const left = delim.ch === '"' ? '“' : '‘';
-  if (delim.node !== null) {
-    const v = delim.node.value;
-    delim.node.value = v.slice(0, delim.offset) + left + v.slice(delim.offset + 1);
-  } else if (delim.frame !== null) {
-    const v = delim.frame.runValue;
-    delim.frame.runValue = v.slice(0, delim.offset) + left + v.slice(delim.offset + 1);
+/**
+ * Drops the delimiters from `from` up, first writing each paired opener into
+ * its node, one rebuild per node: flipping each in place as it paired copied
+ * the whole run per quote, quadratic on one long paragraph. Every delimiter
+ * dropped has a node, because the frame that owned its run was flushed first.
+ */
+function dropQuotes(stack: QuoteStack, from: number): void {
+  const { delims } = stack;
+  while (stack.lastDouble >= from) stack.lastDouble = delims[stack.lastDouble].prev;
+  while (stack.lastSingle >= from) stack.lastSingle = delims[stack.lastSingle].prev;
+  let i = from;
+  while (i < delims.length) {
+    const node = delims[i].node as { value: string };
+    let value = '';
+    let copied = 0;
+    // A node's delimiters are contiguous: its run ended when any child frame opened.
+    for (; i < delims.length && delims[i].node === node; i += 1) {
+      const delim = delims[i];
+      if (!delim.opened) continue;
+      value += node.value.slice(copied, delim.offset) + (delim.ch === '"' ? '“' : '‘');
+      copied = delim.offset + 1;
+    }
+    if (copied > 0) node.value = value + node.value.slice(copied);
   }
+  delims.length = from;
 }
 
 /** Smart punctuation over `text` alone, as a whole paragraph; `before` is the character preceding it. */
@@ -858,7 +905,7 @@ export function applySmartPunctuation(text: string, before: string | undefined):
   const out = smartenText(text, quotes);
   if (quotes.length === 0) return out;
   const holder = { value: out };
-  const stack: QuoteDelim[] = [];
+  const stack = newQuoteStack();
   const beforeStart =
     before === undefined || before.length === 0 ? 0x0a : (before.codePointAt(0) as number);
   for (const quote of quotes) {
@@ -867,15 +914,18 @@ export function applySmartPunctuation(text: string, before: string | undefined):
       codePointAfter(text, quote.inIndex + 1),
     );
     if (role === 0) continue;
-    resolveQuote(stack, 0, {
+    resolveQuote(stack, {
       ch: quote.ch,
       canOpen: (role & CAN_OPEN) !== 0,
       canClose: (role & CAN_CLOSE) !== 0,
       frame: null,
       node: holder,
       offset: quote.outIndex,
+      prev: -1,
+      opened: false,
     });
   }
+  dropQuotes(stack, 0);
   return holder.value;
 }
 
